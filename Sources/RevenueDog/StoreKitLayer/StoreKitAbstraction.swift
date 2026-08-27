@@ -195,9 +195,41 @@ struct SK2Provider: StoreKitProvider {
     }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
-        // M2：铁律 P1/P3/P6（先落盘 → confirmIn: → 只等 updates 流）。
-        throw PurchasesError.notImplemented("StoreKitProvider.purchase(product:appAccountToken:)",
-                                            milestone: "M2")
+        guard let sk2Product = (product as? SK2Product)?.underlying else {
+            throw PurchasesError(code: .productNotAvailableForPurchaseError,
+                                 message: "非 StoreKit 商品无法购买：\(product.productIdentifier)")
+        }
+        var options: Set<Product.PurchaseOption> = []
+        if let appAccountToken { options.insert(.appAccountToken(appAccountToken)) }
+
+        // TODO(M2 硬化 / 坑矩阵 R7)：接入 confirmIn: UI context 注入（iOS 18.2+ / SwiftUI 17+），
+        // 基线用 purchase(options:)。
+        let result: Product.PurchaseResult
+        do {
+            result = try await sk2Product.purchase(options: options)
+        } catch StoreKit.Product.PurchaseError.purchaseNotAllowed {
+            throw PurchasesError(code: .purchaseNotAllowedError, message: "设备不允许购买")
+        } catch let error as StoreKitError {
+            if case .userCancelled = error { return .userCancelled } // 坑 #18：throw 形态的取消
+            throw PurchasesError(code: .storeProblemError, message: "StoreKit 购买失败", underlyingError: error)
+        }
+
+        switch result {
+        case .success(let verification):
+            guard let transaction = SK2Transaction(verificationResult: verification) else {
+                // 坑矩阵裁决 #20：unverified 一律丢弃 + 埋点，不进上报管道
+                throw PurchasesError(code: .storeProblemError, message: "交易未通过 StoreKit 验签，已丢弃")
+            }
+            return .success(transaction)
+        case .userCancelled:
+            return .userCancelled
+        case .pending:
+            return .pending
+        @unknown default:
+            // 坑矩阵裁决 #43：未知 case 容忍 + 埋点
+            Log.warn("未知 PurchaseResult case，按 pending 处理", category: "storekit")
+            return .pending
+        }
     }
 }
 
@@ -235,9 +267,24 @@ actor FakeStoreKitProvider: StoreKitProvider {
         updatesStream
     }
 
-    func unfinishedTransactions() async -> [any StoreTransactionType] { [] }
+    private var unfinished: [any StoreTransactionType] = []
+    /// 测试脚本：下一次 purchase() 的行为。
+    private var nextPurchaseOutcome: (@Sendable (String) -> StorePurchaseOutcome)?
+
+    func setUnfinished(_ transactions: [any StoreTransactionType]) {
+        unfinished = transactions
+    }
+
+    func scriptPurchase(_ outcome: @escaping @Sendable (String) -> StorePurchaseOutcome) {
+        nextPurchaseOutcome = outcome
+    }
+
+    func unfinishedTransactions() async -> [any StoreTransactionType] { unfinished }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
-        throw PurchasesError.notImplemented("FakeStoreKitProvider.purchase", milestone: "M2")
+        guard let script = nextPurchaseOutcome else {
+            throw PurchasesError(code: .storeProblemError, message: "FakeStoreKitProvider：未编排购买脚本")
+        }
+        return script(product.productIdentifier)
     }
 }

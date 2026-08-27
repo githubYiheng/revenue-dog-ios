@@ -221,12 +221,17 @@ public final class Purchases {
         let deviceCache = DeviceCache(storage: dependencies.cacheStorage)
         let pending = PendingPurchaseStore(directory: dependencies.pendingPurchasesDirectory)
 
+        // 台账放注入目录的子目录（pending 枚举只认根级 *.json，不会误读）→ 与实例同生命周期，测试天然隔离
+        let ledgerFileURL = dependencies.pendingPurchasesDirectory
+            .appendingPathComponent("_ledger", isDirectory: true)
+            .appendingPathComponent("synced-transactions.json", isDirectory: false)
         self.orchestrator = PurchasesOrchestrator(configuration: configuration,
                                                   identity: identity,
                                                   httpClient: httpClient,
                                                   deviceCache: deviceCache,
                                                   pendingPurchases: pending,
-                                                  storeKit: dependencies.storeKit)
+                                                  storeKit: dependencies.storeKit,
+                                                  ledgerFileURL: ledgerFileURL)
 
         // 同步可读的 appUserID：显式传入就用它，否则先给一个匿名 ID，
         // 启动 Task 里再与持久化结果对齐（避免 configure 之后立刻读到空值）。
@@ -311,14 +316,16 @@ public final class Purchases {
         return try await orchestrator.offerings()
     }
 
-    /// M2：购买链路（铁律 P1–P8）。
+    /// M2：购买链路（铁律 P1–P8）。awaitStart 保证 updates 监听已挂（宿主首个调用就是 purchase 也安全）。
     public func purchase(package: Package) async throws -> PurchaseResult {
-        try await orchestrator.purchase(package: package)
+        await awaitStart()
+        return try await orchestrator.purchase(package: package)
     }
 
     /// M2：购买链路（铁律 P1–P8）。
     public func purchase(product: StoreProduct) async throws -> PurchaseResult {
-        try await orchestrator.purchase(product: product)
+        await awaitStart()
+        return try await orchestrator.purchase(product: product)
     }
 
     /// M3：显式用户动作触发（会弹框）。

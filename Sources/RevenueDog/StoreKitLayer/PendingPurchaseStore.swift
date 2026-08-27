@@ -46,6 +46,8 @@ struct PendingPurchaseContext: Codable, Sendable, Equatable {
     let createdAt: Date
     /// 重放次数 —— 用于退避与「反复失败」告警。
     var replayCount: Int
+    /// 交易 JWS 原文（rekey 到 transactionId 时写入）：崩溃在「拿到交易后、上报成功前」也能凭它重放。
+    var jws: String?
 
     init(key: String,
          productIdentifier: String,
@@ -55,7 +57,8 @@ struct PendingPurchaseContext: Codable, Sendable, Equatable {
          accountToken: String? = nil,
          initiationSource: InitiationSource = .purchase,
          createdAt: Date = Date(),
-         replayCount: Int = 0) {
+         replayCount: Int = 0,
+         jws: String? = nil) {
         self.key = key
         self.productIdentifier = productIdentifier
         self.appUserID = appUserID
@@ -65,6 +68,7 @@ struct PendingPurchaseContext: Codable, Sendable, Equatable {
         self.initiationSource = initiationSource
         self.createdAt = createdAt
         self.replayCount = replayCount
+        self.jws = jws
     }
 }
 
@@ -155,9 +159,9 @@ actor PendingPurchaseStore {
             .sorted { $0.createdAt < $1.createdAt }
     }
 
-    /// 交易 id 就位后把 key 从 productId 迁到 transactionId（同一笔上下文换个键）。
+    /// 交易 id 就位后把 key 从「发起键」迁到 transactionId，并写入 JWS（同一笔上下文换键）。
     @discardableResult
-    func rekey(from oldKey: String, to newKey: String) throws -> PendingPurchaseContext? {
+    func rekey(from oldKey: String, to newKey: String, jws: String? = nil) throws -> PendingPurchaseContext? {
         guard let existing = context(forKey: oldKey) else { return nil }
         let context = PendingPurchaseContext(key: newKey,
                                              productIdentifier: existing.productIdentifier,
@@ -167,10 +171,26 @@ actor PendingPurchaseStore {
                                              accountToken: existing.accountToken,
                                              initiationSource: existing.initiationSource,
                                              createdAt: existing.createdAt,
-                                             replayCount: existing.replayCount)
+                                             replayCount: existing.replayCount,
+                                             jws: jws ?? existing.jws)
         try save(context)
         remove(forKey: oldKey)
         return context
+    }
+
+    /// 匹配「发起键」上下文（坑矩阵裁决 #15/#16）：同商品取**最早**且 `createdAt <= purchaseDate` 的一笔。
+    /// 复合发起键 = `pending:<productId>#<seq>`，同商品并发购买互不覆盖。
+    static func initiationKey(productIdentifier: String) -> String {
+        "pending:\(productIdentifier)#\(UUID().uuidString.prefix(8))"
+    }
+
+    func matchInitiation(productIdentifier: String, purchaseDate: Date) -> PendingPurchaseContext? {
+        all()
+            .filter {
+                $0.key.hasPrefix("pending:\(productIdentifier)#")
+                    && $0.createdAt <= purchaseDate.addingTimeInterval(60) // 时钟余量 1 分钟
+            }
+            .first
     }
 
     /// 重放计数 +1 并回写。
