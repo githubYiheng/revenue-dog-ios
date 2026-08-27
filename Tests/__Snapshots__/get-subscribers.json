@@ -1,0 +1,17 @@
+{
+  "body" : null,
+  "headers" : {
+    "Accept" : "application/json",
+    "Authorization" : "<redacted>",
+    "X-Installation-Method" : "swift-package-manager",
+    "X-Is-Backgrounded" : "false",
+    "X-Is-Debug-Build" : "true",
+    "X-Is-Sandbox" : "false",
+    "X-Platform" : "iOS",
+    "X-Platform-Flavor" : "native",
+    "X-StoreKit-Version" : "2",
+    "X-Version" : "0.1.0"
+  },
+  "method" : "GET",
+  "path" : "/v1/subscribers/%24RCAnonymousID%3A0123456789abcdef0123456789abcdef"
+}

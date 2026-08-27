@@ -1,0 +1,188 @@
+//
+//  PendingPurchaseStore.swift
+//  购买上下文抗崩溃持久化（设计 §3 铁律 P3）。
+//
+//  P3：购买上下文**先落盘再发起购买**，成功或终态错误才删；前台恢复时串行重放未完成项。
+//
+//  落盘位置：Application Support（绝不 Documents）。
+//  文件名：sha256(key) —— key 是 transactionId（拿到之后）或 productId（发起购买时还没有 tx id）。
+//  哈希文件名的作用：产品/交易 ID 不进文件系统明文，且长度/字符集恒定合法。
+//
+
+import Foundation
+import CryptoKit
+
+// MARK: - 购买发起来源
+
+/// 契约 §2.1：`initiation_source ∈ purchase / restore / queue`。禁 public enum → struct + static。
+public struct InitiationSource: Sendable, Hashable, Codable, CustomStringConvertible {
+
+    public let rawValue: String
+
+    public init(rawValue: String) { self.rawValue = rawValue }
+
+    public static let purchase = InitiationSource(rawValue: "purchase")
+    public static let restore = InitiationSource(rawValue: "restore")
+    public static let queue = InitiationSource(rawValue: "queue")
+
+    public var description: String { rawValue }
+}
+
+// MARK: - 上下文
+
+/// 一笔待完成购买的全部上下文。崩溃/杀进程后靠它把交易补回后端。
+struct PendingPurchaseContext: Codable, Sendable, Equatable {
+
+    /// 存储键：拿到 transactionId 就用它；发起购买那一刻只有 productId。
+    let key: String
+    let productIdentifier: String
+    let appUserID: String
+    /// 展示该商品的 offering（契约 §2.1 `presented_offering_identifier`）。
+    let presentedOfferingIdentifier: String?
+    let presentedPackageIdentifier: String?
+    /// 我们写进 `appAccountToken` 的 32 hex 令牌。
+    let accountToken: String?
+    let initiationSource: InitiationSource
+    let createdAt: Date
+    /// 重放次数 —— 用于退避与「反复失败」告警。
+    var replayCount: Int
+
+    init(key: String,
+         productIdentifier: String,
+         appUserID: String,
+         presentedOfferingIdentifier: String? = nil,
+         presentedPackageIdentifier: String? = nil,
+         accountToken: String? = nil,
+         initiationSource: InitiationSource = .purchase,
+         createdAt: Date = Date(),
+         replayCount: Int = 0) {
+        self.key = key
+        self.productIdentifier = productIdentifier
+        self.appUserID = appUserID
+        self.presentedOfferingIdentifier = presentedOfferingIdentifier
+        self.presentedPackageIdentifier = presentedPackageIdentifier
+        self.accountToken = accountToken
+        self.initiationSource = initiationSource
+        self.createdAt = createdAt
+        self.replayCount = replayCount
+    }
+}
+
+// MARK: - Store
+
+actor PendingPurchaseStore {
+
+    private let directory: URL
+
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
+    private let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }()
+
+    init(directory: URL) {
+        self.directory = directory
+    }
+
+    static func defaultDirectory() throws -> URL {
+        try SDKFileLocations.subdirectory(named: "PendingPurchases")
+    }
+
+    // MARK: 纯函数
+
+    /// 文件名 = sha256(key) 的小写 hex。
+    static func fileName(forKey key: String) -> String {
+        SHA256.hash(data: Data(key.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined() + ".json"
+    }
+
+    nonisolated func url(forKey key: String) -> URL {
+        directory.appendingPathComponent(Self.fileName(forKey: key), isDirectory: false)
+    }
+
+    // MARK: 读写
+
+    /// 落盘（原子写）。**必须在 `product.purchase()` 之前完成**（铁律 P3）。
+    func save(_ context: PendingPurchaseContext) throws {
+        do {
+            try SDKFileLocations.ensureDirectory(directory)
+            let data = try encoder.encode(context)
+            try data.write(to: url(forKey: context.key), options: .atomic)
+            Log.debug("落盘购买上下文 key=\(context.key) product=\(context.productIdentifier)",
+                      category: "pending")
+        } catch {
+            throw PurchasesError(code: .unknownError,
+                                 message: "购买上下文落盘失败（key=\(context.key)）",
+                                 underlyingError: error)
+        }
+    }
+
+    func context(forKey key: String) -> PendingPurchaseContext? {
+        guard let data = try? Data(contentsOf: url(forKey: key)) else { return nil }
+        do {
+            return try decoder.decode(PendingPurchaseContext.self, from: data)
+        } catch {
+            Log.warn("购买上下文解码失败，丢弃（key=\(key)）: \(error)", category: "pending")
+            remove(forKey: key)
+            return nil
+        }
+    }
+
+    /// 删除。**只在后端 200 落库成功或终态错误后调用**（铁律 P2/P3）。
+    func remove(forKey key: String) {
+        try? FileManager.default.removeItem(at: url(forKey: key))
+    }
+
+    /// 枚举全部未完成项（按落盘时间升序，前台恢复时**串行**重放）。
+    func all() -> [PendingPurchaseContext] {
+        let urls = (try? FileManager.default.contentsOfDirectory(at: directory,
+                                                                 includingPropertiesForKeys: nil,
+                                                                 options: [.skipsHiddenFiles])) ?? []
+        return urls
+            .filter { $0.pathExtension == "json" }
+            .compactMap { url -> PendingPurchaseContext? in
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                return try? decoder.decode(PendingPurchaseContext.self, from: data)
+            }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// 交易 id 就位后把 key 从 productId 迁到 transactionId（同一笔上下文换个键）。
+    @discardableResult
+    func rekey(from oldKey: String, to newKey: String) throws -> PendingPurchaseContext? {
+        guard let existing = context(forKey: oldKey) else { return nil }
+        let context = PendingPurchaseContext(key: newKey,
+                                             productIdentifier: existing.productIdentifier,
+                                             appUserID: existing.appUserID,
+                                             presentedOfferingIdentifier: existing.presentedOfferingIdentifier,
+                                             presentedPackageIdentifier: existing.presentedPackageIdentifier,
+                                             accountToken: existing.accountToken,
+                                             initiationSource: existing.initiationSource,
+                                             createdAt: existing.createdAt,
+                                             replayCount: existing.replayCount)
+        try save(context)
+        remove(forKey: oldKey)
+        return context
+    }
+
+    /// 重放计数 +1 并回写。
+    @discardableResult
+    func incrementReplayCount(forKey key: String) throws -> PendingPurchaseContext? {
+        guard var context = context(forKey: key) else { return nil }
+        context.replayCount += 1
+        try save(context)
+        return context
+    }
+
+    func removeAll() {
+        for context in all() { remove(forKey: context.key) }
+    }
+}
