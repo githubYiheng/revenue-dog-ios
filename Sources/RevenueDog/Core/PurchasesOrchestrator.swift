@@ -8,6 +8,21 @@
 
 import Foundation
 
+#if canImport(StoreKit)
+import StoreKit
+#endif
+
+/// `POST /v1/subscribers/identify` 请求体（M3；服务端形状我方定义）。
+private struct IdentifyBody: Encodable {
+    let appUserID: String?
+    let newAppUserID: String
+
+    enum CodingKeys: String, CodingKey {
+        case appUserID = "app_user_id"
+        case newAppUserID = "new_app_user_id"
+    }
+}
+
 actor PurchasesOrchestrator {
 
     let configuration: Configuration
@@ -191,18 +206,22 @@ actor PurchasesOrchestrator {
         get async { await identity.isAnonymous }
     }
 
-    /// logIn。`created` 来自 `GET /v1/subscribers/{id}` 的 201（契约 §2.2）。
+    /// logIn（M3：对接服务端 identify 合并端点，四分支矩阵在服务端裁决）。
+    /// 顺序：先服务端合并成功、再切本地身份 —— 服务端失败时本地身份不动。
     func logIn(_ newAppUserID: String) async throws -> (customerInfo: CustomerInfo, created: Bool) {
         let previous = try? await identity.appUserID
         guard previous != newAppUserID else {
             let info = try await customerInfo(fetchPolicy: .cachedOrFetched)
             return (info, false)
         }
+        let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID))
+        let response = try await httpClient.perform(.postIdentify, body: body, as: CustomerInfoWireModel.self)
         try await identity.logIn(newAppUserID)
         if let previous { await deviceCache.clearMemoryCache(appUserID: previous) }
-        let response = try await fetchCustomerInfo(appUserID: newAppUserID)
-        await publish(response.info)
-        return (response.info, response.created)
+        let info = CustomerInfo(wireModel: response.body)
+        await deviceCache.cache(customerInfo: info, appUserID: newAppUserID)
+        await publish(info)
+        return (info, response.statusCode == 201)
     }
 
     func logOut() async throws -> CustomerInfo {
@@ -299,6 +318,7 @@ actor PurchasesOrchestrator {
 
     // MARK: - 事件多播
 
+    /// M3 完整语义：订阅即回放最近一次已知值（RC customerInfoStream 同款），后续去重推送。
     func customerInfoStream() -> AsyncStream<CustomerInfo> {
         let id = UUID()
         let (stream, continuation) = AsyncStream<CustomerInfo>.makeStream(bufferingPolicy: .bufferingNewest(1))
@@ -306,7 +326,18 @@ actor PurchasesOrchestrator {
             Task { await self?.removeContinuation(id) }
         }
         customerInfoContinuations[id] = continuation
+        // 立即回放：优先最近一次 publish 的值，冷启动回落磁盘缓存
+        Task { [weak self] in
+            if let current = await self?.currentKnownCustomerInfo() {
+                continuation.yield(current)
+            }
+        }
         return stream
+    }
+
+    private func currentKnownCustomerInfo() async -> CustomerInfo? {
+        if let lastPublished { return lastPublished }
+        return await cachedCustomerInfo()
     }
 
     func setCustomerInfoObserver(_ observer: (@Sendable (CustomerInfo) -> Void)?) {
@@ -317,8 +348,14 @@ actor PurchasesOrchestrator {
         customerInfoContinuations.removeValue(forKey: id)
     }
 
+    /// 最近一次 publish 的值（stream 订阅回放 + 去重基准）。
+    private var lastPublished: CustomerInfo?
+
     /// 设计 §6 铁律 1/2：锁（actor 状态）内取出、锁外调用；观察者通知异步派发。
+    /// M3：连续相同值去重（stream 消费者不吃重复帧）。
     private func publish(_ customerInfo: CustomerInfo) async {
+        guard customerInfo != lastPublished else { return }
+        lastPublished = customerInfo
         let continuations = Array(customerInfoContinuations.values)
         let observer = customerInfoObserver
         Task.detached {
@@ -407,12 +444,81 @@ actor PurchasesOrchestrator {
         }
     }
 
+    /// restore（用户显式动作，会弹 Apple ID 框）。契约 C（裁决 C2-C）：
+    /// 端上只传「最新一笔交易 JWS + AppTransaction」，全量历史由后端凭锚点回填。
     func restorePurchases() async throws -> CustomerInfo {
-        throw PurchasesError.notImplemented("Purchases.restorePurchases()", milestone: "M3")
+        try await syncInternal(userInitiated: true)
     }
 
+    /// 静默同步（不弹框），语义同 restore。
     func syncPurchases() async throws -> CustomerInfo {
-        throw PurchasesError.notImplemented("Purchases.syncPurchases()", milestone: "M3")
+        try await syncInternal(userInitiated: false)
+    }
+
+    private func syncInternal(userInitiated: Bool) async throws -> CustomerInfo {
+        guard let storeKit else {
+            return try await customerInfo(fetchPolicy: .fetchCurrent)
+        }
+        if userInitiated {
+            do {
+                try await storeKit.syncStoreAccount() // AppStore.sync()：弹框
+            } catch {
+                if isUserCancelled(error) {
+                    throw PurchasesError(code: .purchaseCancelledError, message: "用户取消了恢复购买", underlyingError: error)
+                }
+                // 其余 sync 失败 best-effort 继续：本地已有的交易仍可上报
+                Log.warn("AppStore.sync 失败，继续用本地交易恢复：\(error)", category: "restore")
+            }
+        }
+
+        // 候选：currentEntitlements ∪ unfinished，取 purchaseDate 最新且带 JWS 的一笔（#26 排序纪律）
+        let entitlements = await storeKit.currentEntitlementTransactions()
+        let unfinished = await storeKit.unfinishedTransactions()
+        let latest = (entitlements + unfinished)
+            .filter { $0.jwsRepresentation != nil }
+            .sorted { $0.purchaseDate > $1.purchaseDate }
+            .first
+
+        guard let latest, let jws = latest.jwsRepresentation else {
+            // 无任何本地交易 = 没有可恢复的 —— 只刷新服务端视图
+            return try await customerInfo(fetchPolicy: .fetchCurrent)
+        }
+
+        // AppTransaction：优先启动预取缓存，缺则现取（P7：失败不阻断）
+        if appTransactionJWS == nil, let info = await storeKit.appTransactionInfo() {
+            appTransactionJWS = info.jwsRepresentation
+            StoreEnvironmentCache.setAppTransactionEnvironment(info.environment)
+        }
+
+        let appUserID = try await identity.appUserID
+        // 瞬态上下文（不落盘）：restore 不是购买，失败由用户重试/下次 sync 兜底
+        let context = PendingPurchaseContext(key: latest.transactionIdentifier,
+                                             productIdentifier: latest.productIdentifier,
+                                             appUserID: appUserID,
+                                             initiationSource: .restore,
+                                             jws: jws)
+        let result = await poster.post(jws: jws,
+                                       transaction: latest,
+                                       productIdentifier: latest.productIdentifier,
+                                       appUserID: appUserID,
+                                       context: context,
+                                       appTransactionJWS: appTransactionJWS)
+        switch result {
+        case .success(let posted):
+            await ledger?.record(latest.transactionIdentifier)
+            await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
+            await publish(posted.customerInfo)
+            return posted.customerInfo
+        case .failure(.finishable(let error)), .failure(.retryable(let error)):
+            throw error
+        }
+    }
+
+    private func isUserCancelled(_ error: any Error) -> Bool {
+        #if canImport(StoreKit)
+        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
+        #endif
+        return (error as? PurchasesError)?.code == .purchaseCancelledError
     }
 
     func setAttributes(_ attributes: [String: String?]) async {

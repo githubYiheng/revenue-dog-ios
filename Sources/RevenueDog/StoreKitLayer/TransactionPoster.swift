@@ -44,6 +44,7 @@ actor TransactionPoster {
         productIdentifier: String,
         appUserID: String,
         context: PendingPurchaseContext?,
+        appTransactionJWS: String? = nil,
     ) async -> Result<PostReceiptResult, PostReceiptFailure> {
         let body = ReceiptBody(
             fetchToken: jws,
@@ -52,6 +53,7 @@ actor TransactionPoster {
             presentedOfferingIdentifier: context?.presentedOfferingIdentifier,
             initiationSource: (context?.initiationSource ?? .queue).rawValue,
             observerMode: completedBy == .myApp,
+            appTransaction: appTransactionJWS,
         )
         let data: Data
         do {
@@ -123,6 +125,8 @@ private struct ReceiptBody: Encodable {
     let presentedOfferingIdentifier: String?
     let initiationSource: String
     let observerMode: Bool
+    /// restore 契约 C（裁决 C2-C）：AppTransaction JWS，后端凭它拉全量历史。
+    let appTransaction: String?
 
     enum CodingKeys: String, CodingKey {
         case fetchToken = "fetch_token"
@@ -131,5 +135,6 @@ private struct ReceiptBody: Encodable {
         case presentedOfferingIdentifier = "presented_offering_identifier"
         case initiationSource = "initiation_source"
         case observerMode = "observer_mode"
+        case appTransaction = "app_transaction"
     }
 }

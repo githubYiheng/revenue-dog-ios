@@ -106,6 +106,9 @@ protocol StoreKitProvider: Sendable {
     /// `Storefront.current?.countryCode`（裁决 #123：storefront 归因不依赖交易字段）。
     func storefrontCountryCode() async -> String?
 
+    /// `AppStore.sync()` —— restore 的用户显式弹框同步（M3）。取消/失败原样抛。
+    func syncStoreAccount() async throws
+
     /// 发起购买（铁律 P6：UI context 自动探测 + `PurchaseUIContext` 显式注入，见下）。
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome
 }
@@ -261,6 +264,10 @@ struct SK2Provider: StoreKitProvider {
 
     func storefrontCountryCode() async -> String? {
         await Storefront.current?.countryCode
+    }
+
+    func syncStoreAccount() async throws {
+        try await AppStore.sync()
     }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
@@ -432,6 +439,17 @@ actor FakeStoreKitProvider: StoreKitProvider {
     func appTransactionInfo() async -> AppTransactionInfo? { appTransaction }
 
     func storefrontCountryCode() async -> String? { storefront }
+
+    /// 测试脚本：syncStoreAccount 行为（nil = 成功；否则抛出该错误）。
+    private var syncError: (any Error)?
+    private(set) var syncCallCount = 0
+
+    func scriptSyncError(_ error: (any Error)?) { syncError = error }
+
+    func syncStoreAccount() async throws {
+        syncCallCount += 1
+        if let syncError { throw syncError }
+    }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
         guard let script = nextPurchaseOutcome else {

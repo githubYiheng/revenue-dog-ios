@@ -333,12 +333,18 @@ public final class Purchases {
 
     /// M3：显式用户动作触发（会弹框）。
     public func restorePurchases() async throws -> CustomerInfo {
-        try await orchestrator.restorePurchases()
+        await awaitStart()
+        let info = try await orchestrator.restorePurchases()
+        cachedCustomerInfo = info
+        return info
     }
 
     /// M3：静默同步。
     public func syncPurchases() async throws -> CustomerInfo {
-        try await orchestrator.syncPurchases()
+        await awaitStart()
+        let info = try await orchestrator.syncPurchases()
+        cachedCustomerInfo = info
+        return info
     }
 
     // MARK: - 属性与归因（M3）

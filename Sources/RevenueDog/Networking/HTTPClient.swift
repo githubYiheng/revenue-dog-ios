@@ -52,11 +52,13 @@ enum Endpoint: Sendable, Equatable {
     case postAttributes(appUserID: String)
     /// `POST /v1/receipts` —— 上报购买（契约 §2.1）—— M2。
     case postReceipt
+    /// `POST /v1/subscribers/identify` —— logIn 合并（服务端四分支矩阵）—— M3。
+    case postIdentify
 
     var method: HTTPMethod {
         switch self {
         case .getCustomerInfo, .getOfferings: return .get
-        case .postAttributes, .postReceipt: return .post
+        case .postAttributes, .postReceipt, .postIdentify: return .post
         }
     }
 
@@ -71,6 +73,8 @@ enum Endpoint: Sendable, Equatable {
             return "/v1/subscribers/\(Endpoint.encodePathComponent(appUserID))/attributes"
         case .postReceipt:
             return "/v1/receipts"
+        case .postIdentify:
+            return "/v1/subscribers/identify"
         }
     }
 
@@ -88,6 +92,10 @@ enum Endpoint: Sendable, Equatable {
                                   authScope: .publicKey, sendsPlatformHeader: false)
         case .postReceipt:
             // 契约 §1.6：同一 fetch_token 重复上报收敛为同一笔交易 → 幂等，可重试。
+            return EndpointPolicy(isRetryable: true, usesETag: false,
+                                  authScope: .publicKey, sendsPlatformHeader: true)
+        case .postIdentify:
+            // 四分支矩阵确定性收敛（重复 identify 落「同一 customer」早退分支）→ 幂等，可重试。
             return EndpointPolicy(isRetryable: true, usesETag: false,
                                   authScope: .publicKey, sendsPlatformHeader: true)
         }
