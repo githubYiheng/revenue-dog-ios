@@ -11,6 +11,12 @@ import Foundation
 #if canImport(StoreKit)
 import StoreKit
 #endif
+#if canImport(UIKit) && !os(watchOS)
+import UIKit
+#endif
+#if canImport(AppKit) && !canImport(UIKit)
+import AppKit
+#endif
 
 // MARK: - 交易
 
@@ -68,6 +74,14 @@ enum StorePurchaseOutcome: Sendable {
     case pending
 }
 
+/// `AppTransaction` 的 SDK 侧只读摘要（坑 #36 / 铁律 P7：获取失败绝不阻断购买流程）。
+struct AppTransactionInfo: Sendable, Equatable {
+    /// AppTransaction 的 JWS 原文 —— restore 契约 C 的 `app_transaction` 载荷。
+    let jwsRepresentation: String?
+    /// `AppStore.Environment` 原文（`Production` / `Sandbox` / `Xcode`）。
+    let environment: String?
+}
+
 // MARK: - Provider
 
 /// StoreKit 能力面。业务层只认这个协议，永远不直接碰 StoreKit 类型。
@@ -78,11 +92,38 @@ protocol StoreKitProvider: Sendable {
     /// `Transaction.updates` —— **唯一消费者**（设计 §3 / 铁律 P1、P5）。
     func transactionUpdates() -> AsyncStream<any StoreTransactionType>
 
-    /// `Transaction.unfinished`。铁律 P4：关键读取要带 5×300ms 重试（FB13133387），M2 实现。
+    /// `Transaction.unfinished` 单次读取。可见性重试（铁律 P4：5×300ms，FB13133387）
+    /// 由调用方（orchestrator 重放路径）编排 —— 单次读取语义保持纯粹。
     func unfinishedTransactions() async -> [any StoreTransactionType]
 
-    /// 发起购买。M2 实现（铁律 P6：必须带 UI context）。
+    /// `Transaction.currentEntitlements` 单次读取（裁决 #2 的另一半：
+    /// 已 finish 但可能从未上报成功的权益型交易，unfinished 里看不到）。
+    func currentEntitlementTransactions() async -> [any StoreTransactionType]
+
+    /// `AppTransaction.shared`（#36 / P7）：任何失败返回 nil，绝不 throw。
+    func appTransactionInfo() async -> AppTransactionInfo?
+
+    /// `Storefront.current?.countryCode`（裁决 #123：storefront 归因不依赖交易字段）。
+    func storefrontCountryCode() async -> String?
+
+    /// 发起购买（铁律 P6：UI context 自动探测 + `PurchaseUIContext` 显式注入，见下）。
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome
+}
+
+// MARK: - 购买 UI context（铁律 P6 / 坑 #23）
+
+/// 宿主可显式注入购买确认弹窗的 UI 载体；不注入则 SDK 自动探测。
+/// iPad 多任务 / visionOS 多场景下建议显式注入，避免弹错位置。
+@MainActor
+public enum PurchaseUIContext {
+    #if canImport(UIKit) && !os(watchOS)
+    /// 返回承载购买确认弹窗的 scene；nil = 交回自动探测。
+    public static var sceneProvider: (() -> UIScene?)?
+    #endif
+    #if canImport(AppKit) && !canImport(UIKit)
+    /// macOS：返回承载购买确认弹窗的窗口；nil = 交回自动探测。
+    public static var windowProvider: (() -> NSWindow?)?
+    #endif
 }
 
 // MARK: - StoreKit 2 适配层
@@ -194,6 +235,34 @@ struct SK2Provider: StoreKitProvider {
         return result
     }
 
+    func currentEntitlementTransactions() async -> [any StoreTransactionType] {
+        var result: [any StoreTransactionType] = []
+        for await item in StoreKit.Transaction.currentEntitlements {
+            if let transaction = SK2Transaction(verificationResult: item) {
+                result.append(transaction)
+            }
+        }
+        return result
+    }
+
+    func appTransactionInfo() async -> AppTransactionInfo? {
+        // P7：AppTransaction.shared 会 throw（首次可能触发网络/弹 Apple ID 登录），
+        // 任何失败一律吞掉返回 nil —— 绝不允许它阻断购买/启动流程。
+        guard let result = try? await AppTransaction.shared else { return nil }
+        switch result {
+        case .verified(let appTransaction):
+            return AppTransactionInfo(jwsRepresentation: result.jwsRepresentation,
+                                      environment: appTransaction.environment.rawValue)
+        case .unverified(_, let error):
+            Log.warn("AppTransaction 未通过验签，忽略：\(error)", category: "storekit")
+            return nil
+        }
+    }
+
+    func storefrontCountryCode() async -> String? {
+        await Storefront.current?.countryCode
+    }
+
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
         guard let sk2Product = (product as? SK2Product)?.underlying else {
             throw PurchasesError(code: .productNotAvailableForPurchaseError,
@@ -202,11 +271,9 @@ struct SK2Provider: StoreKitProvider {
         var options: Set<Product.PurchaseOption> = []
         if let appAccountToken { options.insert(.appAccountToken(appAccountToken)) }
 
-        // TODO(M2 硬化 / 坑矩阵 R7)：接入 confirmIn: UI context 注入（iOS 18.2+ / SwiftUI 17+），
-        // 基线用 purchase(options:)。
         let result: Product.PurchaseResult
         do {
-            result = try await sk2Product.purchase(options: options)
+            result = try await Self.performPurchase(sk2Product, options: options)
         } catch StoreKit.Product.PurchaseError.purchaseNotAllowed {
             throw PurchasesError(code: .purchaseNotAllowedError, message: "设备不允许购买")
         } catch let error as StoreKitError {
@@ -231,6 +298,55 @@ struct SK2Provider: StoreKitProvider {
             return .pending
         }
     }
+
+    // MARK: 铁律 P6：UI context（坑 #23 / #87 四件套模板的首个真实用例）
+    //
+    // 「新 SK2 API 接入模板」（裁决 86/87/88）四件套：
+    //   1. `#if compiler(>=X)`   —— API 只存在于新工具链 SDK 时加（本例 confirmIn 系
+    //      iOS 17 SDK 起有，而本包要求 swift-tools 6.0 = Xcode 16+，故无需 compiler 门）；
+    //   2. `if #available(...)`  —— 运行期版本门控；
+    //   3. 平台排除              —— `#if canImport(UIKit) && !os(watchOS)` / AppKit 分支；
+    //   4. 无参兜底              —— 全部失败回落 `purchase(options:)`。
+    // 多 Xcode 版本编译矩阵：CI 待部署 SOP 落地（M2 出门备注）。
+    //
+    // 事实核对（2026-08-28 对照 iOS 26.5 SDK swiftinterface）：
+    // - `purchase(confirmIn: some UIScene)` = iOS 17.0+/tvOS 17.0+/visionOS 1.0+，@MainActor；
+    // - `purchase(confirmIn: NSWindow)` = macOS 侧变体；
+    // - 矩阵 #23 提到的 `StoreKitError.invalidPresentationContext` **不存在于任何现行 SDK**
+    //   （已在矩阵附录记裁决修正）：无 scene 场景走自动探测尽力，探测不到回落无参形态。
+    @MainActor
+    private static func performPurchase(_ product: Product,
+                                        options: Set<Product.PurchaseOption>) async throws -> Product.PurchaseResult {
+        #if canImport(UIKit) && !os(watchOS)
+        if #available(iOS 17.0, tvOS 17.0, *) {
+            if let scene = PurchaseUIContext.sceneProvider?() ?? Self.detectScene() {
+                return try await product.purchase(confirmIn: scene, options: options)
+            }
+        }
+        return try await product.purchase(options: options)
+        #elseif canImport(AppKit)
+        if #available(macOS 15.2, *) {
+            if let window = PurchaseUIContext.windowProvider?()
+                ?? NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow {
+                return try await product.purchase(confirmIn: window, options: options)
+            }
+        }
+        return try await product.purchase(options: options)
+        #else
+        return try await product.purchase(options: options)
+        #endif
+    }
+
+    #if canImport(UIKit) && !os(watchOS)
+    /// RC 实证：偶发只有 `foregroundInactive` / `background` scene —— 按优先级降级探测。
+    @MainActor
+    private static func detectScene() -> UIScene? {
+        let scenes = UIApplication.shared.connectedScenes
+        return scenes.first { $0.activationState == .foregroundActive }
+            ?? scenes.first { $0.activationState == .foregroundInactive }
+            ?? scenes.first
+    }
+    #endif
 }
 
 #endif
@@ -252,7 +368,9 @@ actor FakeStoreKitProvider: StoreKitProvider {
     }
 
     func setProducts(_ products: [any StoreProductType]) {
-        productsByIdentifier = Dictionary(uniqueKeysWithValues: products.map { ($0.productIdentifier, $0) })
+        // #125 纪律：重复键不 crash（后写胜出）
+        productsByIdentifier = Dictionary(products.map { ($0.productIdentifier, $0) },
+                                          uniquingKeysWith: { _, new in new })
     }
 
     func emit(_ transaction: any StoreTransactionType) {
@@ -268,23 +386,58 @@ actor FakeStoreKitProvider: StoreKitProvider {
     }
 
     private var unfinished: [any StoreTransactionType] = []
+    /// P4 测试脚本：逐次调用返回的 unfinished 序列（耗尽后停在最后一组）。
+    private var unfinishedSequence: [[any StoreTransactionType]]?
+    private(set) var unfinishedCallCount = 0
+    private var currentEntitlements: [any StoreTransactionType] = []
+    private var appTransaction: AppTransactionInfo?
+    private var storefront: String?
     /// 测试脚本：下一次 purchase() 的行为。
     private var nextPurchaseOutcome: (@Sendable (String) -> StorePurchaseOutcome)?
+    /// purchase() 收到的 appAccountToken 序列（#22 接线断言用）。
+    private(set) var capturedAppAccountTokens: [UUID?] = []
 
     func setUnfinished(_ transactions: [any StoreTransactionType]) {
         unfinished = transactions
+        unfinishedSequence = nil
     }
+
+    func setUnfinishedSequence(_ sequence: [[any StoreTransactionType]]) {
+        unfinishedSequence = sequence
+    }
+
+    func setCurrentEntitlements(_ transactions: [any StoreTransactionType]) {
+        currentEntitlements = transactions
+    }
+
+    func setAppTransaction(_ info: AppTransactionInfo?) { appTransaction = info }
+    func setStorefront(_ countryCode: String?) { storefront = countryCode }
 
     func scriptPurchase(_ outcome: @escaping @Sendable (String) -> StorePurchaseOutcome) {
         nextPurchaseOutcome = outcome
     }
 
-    func unfinishedTransactions() async -> [any StoreTransactionType] { unfinished }
+    func unfinishedTransactions() async -> [any StoreTransactionType] {
+        unfinishedCallCount += 1
+        if var sequence = unfinishedSequence {
+            let batch = sequence.isEmpty ? [] : sequence.removeFirst()
+            if !sequence.isEmpty { unfinishedSequence = sequence } // 耗尽后停在最后一组
+            return batch
+        }
+        return unfinished
+    }
+
+    func currentEntitlementTransactions() async -> [any StoreTransactionType] { currentEntitlements }
+
+    func appTransactionInfo() async -> AppTransactionInfo? { appTransaction }
+
+    func storefrontCountryCode() async -> String? { storefront }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
         guard let script = nextPurchaseOutcome else {
             throw PurchasesError(code: .storeProblemError, message: "FakeStoreKitProvider：未编排购买脚本")
         }
+        capturedAppAccountTokens.append(appAccountToken)
         return script(product.productIdentifier)
     }
 }

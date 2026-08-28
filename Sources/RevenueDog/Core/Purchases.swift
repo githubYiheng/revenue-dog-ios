@@ -162,6 +162,8 @@ public final class Purchases {
         var transport: any HTTPTransport
         var pendingPurchasesDirectory: URL
         var storeKit: (any StoreKitProvider)?
+        /// P4 轮询等待的调度器；测试注入 NoDelayScheduler。
+        var delayScheduler: any DelayScheduler = TaskDelayScheduler()
 
         static func live(configuration: Configuration) -> Dependencies {
             let pendingDirectory = (try? PendingPurchaseStore.defaultDirectory())
@@ -231,7 +233,8 @@ public final class Purchases {
                                                   deviceCache: deviceCache,
                                                   pendingPurchases: pending,
                                                   storeKit: dependencies.storeKit,
-                                                  ledgerFileURL: ledgerFileURL)
+                                                  ledgerFileURL: ledgerFileURL,
+                                                  delayScheduler: dependencies.delayScheduler)
 
         // 同步可读的 appUserID：显式传入就用它，否则先给一个匿名 ID，
         // 启动 Task 里再与持久化结果对齐（避免 configure 之后立刻读到空值）。

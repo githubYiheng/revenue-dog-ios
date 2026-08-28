@@ -18,8 +18,12 @@ actor PurchasesOrchestrator {
     private let pendingPurchases: PendingPurchaseStore
     private let storeKit: (any StoreKitProvider)?
     private let poster: TransactionPoster
-    /// `.myApp` 模式的已同步台账（#10）；`.revenueDog` 模式为 nil（finish 即标记）。
+    private let delayScheduler: any DelayScheduler
+    /// 已同步台账（#10 / #2）：`.myApp` 用它防止宿主未 finish 的重投重复上报；
+    /// 两种模式都用它给 currentEntitlements 启动扫描去重（已 finish 交易每次启动都可见）。
     private let ledger: SyncedTransactionLedger?
+    /// AppTransaction JWS（#36 / P7）：启动期异步获取缓存，restore（M3）上行 `app_transaction` 用。
+    private(set) var appTransactionJWS: String?
     /// 内存级同交易去重（purchase() 直接结果与 updates 流可能双到）。
     private var inFlightTransactionIDs: Set<String> = []
 
@@ -36,18 +40,19 @@ actor PurchasesOrchestrator {
          deviceCache: DeviceCache,
          pendingPurchases: PendingPurchaseStore,
          storeKit: (any StoreKitProvider)?,
-         ledgerFileURL: URL? = nil) {
+         ledgerFileURL: URL? = nil,
+         delayScheduler: any DelayScheduler = TaskDelayScheduler()) {
         self.configuration = configuration
         self.identity = identity
         self.httpClient = httpClient
         self.deviceCache = deviceCache
         self.pendingPurchases = pendingPurchases
         self.storeKit = storeKit
+        self.delayScheduler = delayScheduler
         self.poster = TransactionPoster(httpClient: httpClient,
                                         completedBy: configuration.purchasesCompletedBy)
-        self.ledger = configuration.purchasesCompletedBy == .myApp
-            ? (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL())).map { SyncedTransactionLedger(fileURL: $0) }
-            : nil
+        self.ledger = (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL()))
+            .map { SyncedTransactionLedger(fileURL: $0) }
     }
 
     // MARK: - 生命周期
@@ -73,10 +78,22 @@ actor PurchasesOrchestrator {
         let appUserID = try await identity.bootstrap(configuredAppUserID: configuration.appUserID)
         Log.info("RevenueDog 已配置，appUserID=\(appUserID)（匿名=\(IdentityManager.isAnonymous(appUserID))）")
 
-        // 坑矩阵裁决 #2：Apple 的启动补投只有一次 —— 挂完监听后并行跑一次
-        // 未完成上下文重放 + unfinished 扫描，把两半都接住。
-        Task { [weak self] in await self?.replayPendingPurchases() }
+        // 启动重放由门面 `Purchases.start()` 在 start() 之后 await 一次（单一调用点，
+        // 修复门禁核验发现的「冷启动双重重放」）；这里只做环境快照预取。
+        Task { [weak self] in await self?.prefetchStoreEnvironment() }
         return appUserID
+    }
+
+    /// 启动期异步预取（全部 best-effort，失败静默）：
+    /// - AppTransaction（#36 / P7）：JWS 缓存给 restore；environment 喂沙盒判定（#98）
+    /// - Storefront（#123）：X-Storefront 诊断头
+    private func prefetchStoreEnvironment() async {
+        guard let storeKit else { return }
+        if let info = await storeKit.appTransactionInfo() {
+            appTransactionJWS = info.jwsRepresentation
+            StoreEnvironmentCache.setAppTransactionEnvironment(info.environment)
+        }
+        StoreEnvironmentCache.setStorefront(await storeKit.storefrontCountryCode())
     }
 
     /// 单一处理通道（裁决 C2-A）：purchase() 直接结果与 updates 流都汇入这里。
@@ -99,6 +116,13 @@ actor PurchasesOrchestrator {
         guard let jws = transaction.jwsRepresentation else {
             Log.warn("交易缺少 JWS，无法上报（tx=\(txID)）", category: "purchase")
             return nil
+        }
+
+        // 坑 #21：「成功购买」却带过去的 expirationDate = StoreKit 自身异常。埋点 warn，不阻断（P8：权益以后端为准）。
+        if let expiration = transaction.expirationDate,
+           transaction.revocationDate == nil, expiration < Date() {
+            Log.warn("购买/投递的交易 expirationDate 已在过去（tx=\(txID)，expires=\(expiration)）——疑似 StoreKit 异常，继续上报以后端裁决为准",
+                     category: "storekit")
         }
 
         // 上下文配对：优先 txID 键（重放），否则按商品匹配发起键（#15/#16）并 rekey + 写入 JWS
@@ -136,9 +160,8 @@ actor PurchasesOrchestrator {
                 // 上报成功但 finish 未获准（如一次性交易未在响应确认）：保留上下文，finish 义务不丢
                 _ = try? await pendingPurchases.incrementReplayCount(forKey: txID)
             }
-            if configuration.purchasesCompletedBy == .myApp, let ledger {
-                await ledger.record(txID)
-            }
+            // 台账记录不分模式（#2）：currentEntitlements 启动扫描靠它识别「已上报过」的已 finish 交易
+            await ledger?.record(txID)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
             await publish(posted.customerInfo)
             return posted.customerInfo
@@ -335,6 +358,11 @@ actor PurchasesOrchestrator {
         }
         let appUserID = try await identity.appUserID
 
+        // #22：服务端签发的 account_token（缓存 CustomerInfo 携带，契约决策 21）→ Apple appAccountToken。
+        // 辅助归户链，best-effort：无缓存/形状不合法就不带（后端权威仍是 originalTransactionId ↔ appUserID）。
+        let accountToken = await deviceCache.cachedCustomerInfo(appUserID: appUserID)?.accountToken
+        let appAccountToken = accountToken.flatMap(IdentityManager.accountTokenToUUID)
+
         // P3：上下文先落盘再发起购买（复合发起键 #15）
         let initiationKey = PendingPurchaseStore.initiationKey(productIdentifier: productIdentifier)
         let context = PendingPurchaseContext(key: initiationKey,
@@ -342,12 +370,13 @@ actor PurchasesOrchestrator {
                                              appUserID: appUserID,
                                              presentedOfferingIdentifier: presentedOfferingIdentifier,
                                              presentedPackageIdentifier: presentedPackageIdentifier,
+                                             accountToken: accountToken,
                                              initiationSource: .purchase)
         try await pendingPurchases.save(context)
 
         let outcome: StorePurchaseOutcome
         do {
-            outcome = try await storeKit.purchase(product: product, appAccountToken: nil)
+            outcome = try await storeKit.purchase(product: product, appAccountToken: appAccountToken)
         } catch {
             // 购买未发生（弹窗前失败）：清理发起键，原样抛出
             await pendingPurchases.remove(forKey: initiationKey)
@@ -390,10 +419,13 @@ actor PurchasesOrchestrator {
         Log.notImplemented("Purchases.setAttributes(_:)", milestone: "M3")
     }
 
-    /// 前台恢复时串行重放未完成购买（铁律 P3）。
-    /// 两类：有 JWS 的直接补报（无交易对象 → 不 finish，等下次启动 unfinished 扫描配对后 finish）；
-    /// 只有发起键的（崩溃在弹窗前后）→ 交给 unfinished 扫描配对。
+    /// 启动/前台恢复时串行重放未完成购买（铁律 P3），并做启动补投扫描（裁决 #2 两半）。
+    /// 两类上下文：有 JWS 的直接补报（无交易对象 → 不 finish，finish 义务由本轮 unfinished
+    /// 扫描配对完成）；只有发起键的（崩溃在弹窗前后）→ 交给 unfinished 扫描配对。
     func replayPendingPurchases() async {
+        // 有 finish 义务待清的交易键（.revenueDog：JWS 补报成功但无交易对象可 finish）
+        var awaitingFinish: Set<String> = []
+
         let pending = await pendingPurchases.all()
         for context in pending where context.jws != nil {
             let result = await poster.post(jws: context.jws!,
@@ -403,12 +435,13 @@ actor PurchasesOrchestrator {
                                            context: context)
             switch result {
             case .success(let posted):
-                // 无交易对象可 finish：上下文保留 finish 义务，交给启动 unfinished 扫描（P4）
                 await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: context.appUserID)
                 await publish(posted.customerInfo)
                 if configuration.purchasesCompletedBy == .myApp {
                     await pendingPurchases.remove(forKey: context.key)
                     await ledger?.record(context.key)
+                } else {
+                    awaitingFinish.insert(context.key) // key 已 rekey 为 transactionId
                 }
             case .failure(.finishable):
                 await pendingPurchases.remove(forKey: context.key)
@@ -416,10 +449,50 @@ actor PurchasesOrchestrator {
                 _ = try? await pendingPurchases.incrementReplayCount(forKey: context.key)
             }
         }
-        // 启动补投只有一次（#2）：主动扫 unfinished 把漏网交易汇入统一通道
+
+        // 启动补投只有一次（#2 前半）：扫 unfinished 把漏网交易汇入统一通道。
+        // 铁律 P4（FB13133387）：unfinished 可见性最终一致 —— 还有 finish 义务未清时
+        // 轮询重读，最多 5 次 × 300ms（RC 实证参数）。#26：SK 序列一律按 purchaseDate 排序。
         if let storeKit {
-            for transaction in await storeKit.unfinishedTransactions() {
-                await handle(transaction: transaction)
+            var attempt = 0
+            var seen: Set<String> = []
+            while true {
+                attempt += 1
+                let unfinished = await storeKit.unfinishedTransactions()
+                    .sorted { $0.purchaseDate < $1.purchaseDate }
+                for transaction in unfinished {
+                    let txID = transaction.transactionIdentifier
+                    if seen.contains(txID) && !awaitingFinish.contains(txID) { continue }
+                    seen.insert(txID)
+                    if await handle(transaction: transaction) != nil {
+                        awaitingFinish.remove(txID)
+                    }
+                }
+                if awaitingFinish.isEmpty || attempt >= 5 { break }
+                try? await delayScheduler.sleep(seconds: 0.3)
+            }
+            if !awaitingFinish.isEmpty {
+                Log.warn("unfinished 轮询 5 次后仍有 \(awaitingFinish.count) 笔 finish 义务未清，留待下次启动",
+                         category: "purchase")
+            }
+        }
+
+        // #2 后半：currentEntitlements 扫描 —— 已 finish 但可能从未上报成功的权益型交易
+        // （别处设备购买 / 兑换码 / 历史上报失败后被宿主 finish）在 unfinished 里看不到。
+        await scanCurrentEntitlements()
+    }
+
+    /// currentEntitlements 启动扫描（裁决 #2 后半）。台账去重：已上报过的不重发
+    /// （已 finish 交易每次启动都在 currentEntitlements 里，无台账会变成每启动一 POST）。
+    private func scanCurrentEntitlements() async {
+        guard let storeKit else { return }
+        let entitlements = await storeKit.currentEntitlementTransactions()
+            .sorted { $0.purchaseDate < $1.purchaseDate } // #26
+        for transaction in entitlements {
+            let txID = transaction.transactionIdentifier
+            if let ledger, await ledger.contains(txID) { continue }
+            if await handle(transaction: transaction) != nil {
+                await ledger?.record(txID)
             }
         }
     }

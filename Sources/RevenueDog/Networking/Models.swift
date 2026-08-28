@@ -401,6 +401,8 @@ struct SubscriberWireModel: Codable, Sendable, Equatable {
     var nonSubscriptions: [String: [NonSubscriptionWireModel]]
     @IgnoreDecodeErrors var originalApplicationVersion: String?
     let originalPurchaseDate: WireDateValue
+    /// 服务端签发的 32hex 账户令牌（契约决策 21）：购买时转 UUID 形状写 `appAccountToken`（#22）。
+    @IgnoreDecodeErrors var accountToken: String?
     /// 只在 secret key 请求时返回；SDK（public key）永远拿不到，保留字段以便宽容解码。
     @DefaultDecodable<DecodableDefaults.EmptyDictionary<SubscriberAttributeWireModel>>
     var subscriberAttributes: [String: SubscriberAttributeWireModel]
@@ -415,6 +417,7 @@ struct SubscriberWireModel: Codable, Sendable, Equatable {
         case nonSubscriptions = "non_subscriptions"
         case originalApplicationVersion = "original_application_version"
         case originalPurchaseDate = "original_purchase_date"
+        case accountToken = "account_token"
         case subscriberAttributes = "subscriber_attributes"
     }
 }
@@ -642,6 +645,8 @@ public struct CustomerInfo: Sendable, Hashable, Codable {
     public let activeSubscriptionProductIdentifiers: Set<String>
     /// 非订阅交易 id（M2 消耗型 finish 判定要用：响应里见到 transactionId 才 finish）。
     public let nonSubscriptionTransactionIdentifiers: Set<String>
+    /// 服务端签发的账户令牌（32hex）；购买时转 UUID 写 `appAccountToken`（#22 辅助归户链）。
+    let accountToken: String?
 
     init(wireModel: CustomerInfoWireModel, now: Date = Date()) {
         let subscriber = wireModel.subscriber
@@ -655,6 +660,7 @@ public struct CustomerInfo: Sendable, Hashable, Codable {
         self.requestDate = requestDate
         self.originalApplicationVersion = subscriber.originalApplicationVersion
         self.originalPurchaseDate = subscriber.originalPurchaseDate.date
+        self.accountToken = subscriber.accountToken
 
         var entitlements: [String: EntitlementInfo] = [:]
         for (identifier, wire) in subscriber.entitlements {

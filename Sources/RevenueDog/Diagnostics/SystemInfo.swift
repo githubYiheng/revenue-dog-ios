@@ -45,6 +45,9 @@ struct SystemInfo: Sendable, Equatable {
     var installationMethod: String
     /// `X-Preferred-Locales`：逗号分隔。
     var preferredLocales: [String]
+    /// `X-Storefront`：商店国家码（裁决 #123：走 `Storefront.current`，不依赖交易字段）。
+    /// 启动期异步取到前为 nil —— 头按需省略。
+    var storefront: String? = nil
 
     static let sdkVersionString = "0.1.0"
 
@@ -78,9 +81,13 @@ struct SystemInfo: Sendable, Equatable {
         return machine.isEmpty ? "unknown" : machine
     }
 
-    /// 沙盒判定：App Store 收据文件名为 `sandboxReceipt` 即沙盒环境。
-    /// 保守取值：拿不到 Bundle 信息时（如单测宿主）按 **非沙盒** 处理，避免误把生产标成 sandbox。
+    /// 沙盒判定。优先 `AppTransaction.environment`（纯 SK2 正道，坑 #98；启动期异步缓存），
+    /// 未就绪时回落收据文件名判定（`sandboxReceipt`）。
+    /// 保守取值：两路都拿不到时按 **非沙盒** 处理，避免误把生产标成 sandbox。
     static var currentIsSandbox: Bool {
+        if let environment = StoreEnvironmentCache.appTransactionEnvironment {
+            return environment != "Production" // Sandbox / Xcode 都算沙盒侧
+        }
         #if targetEnvironment(simulator)
         return true
         #else
@@ -113,13 +120,14 @@ struct SystemInfo: Sendable, Equatable {
             isBackgrounded: isBackgrounded,
             isDebugBuild: currentIsDebugBuild,
             installationMethod: installationMethodString,
-            preferredLocales: Array(Locale.preferredLanguages.prefix(5))
+            preferredLocales: Array(Locale.preferredLanguages.prefix(5)),
+            storefront: StoreEnvironmentCache.storefront
         )
     }
 
     /// 诊断头全集（设计 §5 的 8 个必发头 + 契约 §1.3 宽容接受的补充头）。
     var headers: [String: String] {
-        [
+        var all = [
             "X-Platform": platform,
             "X-Platform-Version": platformVersion,
             "X-Platform-Device": platformDevice,
@@ -135,7 +143,29 @@ struct SystemInfo: Sendable, Equatable {
             "X-Installation-Method": installationMethod,
             "X-Preferred-Locales": preferredLocales.joined(separator: ","),
         ]
+        if let storefront { all["X-Storefront"] = storefront }
+        return all
     }
+}
+
+/// StoreKit 环境快照缓存（storefront / AppTransaction 环境）。
+/// 启动期由 orchestrator 异步填充；取不到就保持 nil，读取方各自降级。
+enum StoreEnvironmentCache {
+    #if canImport(os)
+    private static let state = OSAllocatedUnfairLock<(storefront: String?, env: String?)>(initialState: (nil, nil))
+
+    static var storefront: String? { state.withLock { $0.storefront } }
+    static var appTransactionEnvironment: String? { state.withLock { $0.env } }
+    static func setStorefront(_ value: String?) { state.withLock { $0.storefront = value } }
+    static func setAppTransactionEnvironment(_ value: String?) { state.withLock { $0.env = value } }
+    #else
+    nonisolated(unsafe) private static var _storefront: String?
+    nonisolated(unsafe) private static var _env: String?
+    static var storefront: String? { _storefront }
+    static var appTransactionEnvironment: String? { _env }
+    static func setStorefront(_ value: String?) { _storefront = value }
+    static func setAppTransactionEnvironment(_ value: String?) { _env = value }
+    #endif
 }
 
 /// 应用前后台状态提供者。
