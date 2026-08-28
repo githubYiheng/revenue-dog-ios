@@ -84,7 +84,7 @@ struct M2HardeningTests {
         #expect(!flag.value)
 
         // 第二程（冷启动）：JWS 补报成功，但 unfinished 前两轮为空（FB13133387 场景），第三轮才可见
-        let (_, transport2, provider2, _) = await makeHardened(directory: dir) { provider, transport in
+        let (_, _, provider2, _) = await makeHardened(directory: dir) { provider, transport in
             await provider.setUnfinishedSequence([[], [], [tx]])
             await transport.enqueue(.json(subscriberJSON())) // JWS 补报
             await transport.enqueue(.json(subscriberJSON())) // 轮询命中后的配对上报
