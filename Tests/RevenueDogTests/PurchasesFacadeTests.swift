@@ -7,6 +7,9 @@ import Foundation
 import Testing
 @testable import RevenueDog
 
+// 单例串行域（见 Support/SingletonSerialDomain.swift）：本 suite 碰 Purchases 静态单例，
+// 必须与其它同类 suite 串行，不能靠 suite 内 `.serialized`。
+extension PurchasesSingletonDomain {
 @MainActor
 @Suite("Purchases 门面（M1 接线）", .serialized)
 final class PurchasesFacadeTests {
@@ -100,4 +103,5 @@ final class PurchasesFacadeTests {
         await #expect(throws: PurchasesError.self) { _ = try await self.purchases.restorePurchases() }
         await #expect(throws: PurchasesError.self) { _ = try await self.purchases.syncPurchases() }
     }
+}
 }

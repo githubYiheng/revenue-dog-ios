@@ -45,6 +45,7 @@ actor TransactionPoster {
         appUserID: String,
         context: PendingPurchaseContext?,
         appTransactionJWS: String? = nil,
+        attributes: [SubscriberAttribute] = [],
     ) async -> Result<PostReceiptResult, PostReceiptFailure> {
         let body = ReceiptBody(
             fetchToken: jws,
@@ -54,6 +55,9 @@ actor TransactionPoster {
             initiationSource: (context?.initiationSource ?? .queue).rawValue,
             observerMode: completedBy == .myApp,
             appTransaction: appTransactionJWS,
+            // 属性随收据「搭车」上报（RC 同款省请求手法，见 06-rc-ios-sdk-internals §2.3；
+            // 契约 §2.1 的 `attributes` 字段，服务端 receipts.ts 用同一套 LWW UPSERT 落库）。
+            attributes: attributes.isEmpty ? nil : attributes.wireMap,
         )
         let data: Data
         do {
@@ -127,6 +131,8 @@ private struct ReceiptBody: Encodable {
     let observerMode: Bool
     /// restore 契约 C（裁决 C2-C）：AppTransaction JWS，后端凭它拉全量历史。
     let appTransaction: String?
+    /// 搭车上报的 subscriber attributes（契约 §2.1 `attributes`）。空时整字段省略。
+    let attributes: [String: SubscriberAttributeWire]?
 
     enum CodingKeys: String, CodingKey {
         case fetchToken = "fetch_token"
@@ -136,5 +142,6 @@ private struct ReceiptBody: Encodable {
         case initiationSource = "initiation_source"
         case observerMode = "observer_mode"
         case appTransaction = "app_transaction"
+        case attributes
     }
 }

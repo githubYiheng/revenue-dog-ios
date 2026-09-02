@@ -2,11 +2,17 @@
 //  Purchases.swift
 //  公开门面（设计 §1）。内部全 actor（PurchasesOrchestrator）。
 //
-//  M1 骨架：configure / 身份 / customerInfo / offerings 可用；
-//  购买链路（M2）、restore/sync/属性/归因（M3）为显式占位，调用会抛 notImplementedError。
+//  M1 configure / 身份 / customerInfo / offerings、M2 购买链路、
+//  M3 restore/sync / 属性 setter 与同步时机 / ASA 归因采集均已落地。
 //
 
 import Foundation
+
+#if canImport(UIKit) && !os(watchOS)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 // MARK: - Configuration（builder 风格）
 
@@ -164,6 +170,10 @@ public final class Purchases {
         var storeKit: (any StoreKitProvider)?
         /// P4 轮询等待的调度器；测试注入 NoDelayScheduler。
         var delayScheduler: any DelayScheduler = TaskDelayScheduler()
+        /// ASA 归因端状态（install_id + 已采集标记）。测试注入 InMemory 版避免污染 UserDefaults。
+        var attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage()
+        /// AdServices token 取值面（坑 #83/#84：协议隔离，模拟器/无框架平台优雅降级）。
+        var adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()
 
         static func live(configuration: Configuration) -> Dependencies {
             let pendingDirectory = (try? PendingPurchaseStore.defaultDirectory())
@@ -209,12 +219,18 @@ public final class Purchases {
 
     private let orchestrator: PurchasesOrchestrator
     private var startTask: Task<Void, Never>?
+    /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
+    /// （Swift 6 下 @MainActor 类的 deinit 不能安全触碰隔离状态，所以不写在 deinit 里）。
+    private let lifecycleObservers = NotificationObserverBox()
+    /// 属性写入的串行链。setter 是 fire-and-forget，若各自起一个 Task，
+    /// **同一个键连写两次时执行顺序不保证** —— 后调用的可能先落盘，用户看到的就是「改回去了」。
+    /// 串成一条链后「调用顺序 = 落盘顺序」（LWW 的语义前提）。
+    private var attributeWriteChain: Task<Void, Never> = Task {}
 
     private init(configuration: Configuration, dependencies: Dependencies) {
         Log.setLevel(configuration.logLevel)
 
         self.configuration = configuration
-        self.attribution = Attribution()
 
         let identity = IdentityManager(storage: dependencies.identityStorage)
         let httpClient = HTTPClient(apiKey: configuration.apiKey,
@@ -227,14 +243,22 @@ public final class Purchases {
         let ledgerFileURL = dependencies.pendingPurchasesDirectory
             .appendingPathComponent("_ledger", isDirectory: true)
             .appendingPathComponent("synced-transactions.json", isDirectory: false)
-        self.orchestrator = PurchasesOrchestrator(configuration: configuration,
+        // 属性缓冲同理放注入目录的子目录（pending 枚举只认根级 *.json）→ 测试天然隔离
+        let attributesDirectory = dependencies.pendingPurchasesDirectory
+            .appendingPathComponent("_attributes", isDirectory: true)
+        let orchestrator = PurchasesOrchestrator(configuration: configuration,
                                                   identity: identity,
                                                   httpClient: httpClient,
                                                   deviceCache: deviceCache,
                                                   pendingPurchases: pending,
                                                   storeKit: dependencies.storeKit,
                                                   ledgerFileURL: ledgerFileURL,
-                                                  delayScheduler: dependencies.delayScheduler)
+                                                  delayScheduler: dependencies.delayScheduler,
+                                                  attributesDirectory: attributesDirectory,
+                                                  attributionState: dependencies.attributionState,
+                                                  adServicesTokenProvider: dependencies.adServicesTokenProvider)
+        self.orchestrator = orchestrator
+        self.attribution = Attribution(orchestrator: orchestrator)
 
         // 同步可读的 appUserID：显式传入就用它，否则先给一个匿名 ID，
         // 启动 Task 里再与持久化结果对齐（避免 configure 之后立刻读到空值）。
@@ -243,6 +267,7 @@ public final class Purchases {
 
     private func start() {
         AppStateProvider.refresh()
+        observeAppLifecycle()
         // 铁律 P1：configure 内**同步**创建监听 Task。
         startTask = Task { [orchestrator] in
             await orchestrator.setCustomerInfoObserver { [weak self] customerInfo in
@@ -257,6 +282,45 @@ public final class Purchases {
             }
             await orchestrator.replayPendingPurchases()
         }
+    }
+
+    /// 前后台切换观察（设计 §5「属性同步时机：前后台切换 + 购买时」）。
+    ///
+    /// 用 `queue: nil` 同步派发再自行跳 MainActor —— `OperationQueue.main` 的 block
+    /// 要主 run loop 转起来才执行，SPM 单测进程里不保证有。
+    private func observeAppLifecycle() {
+        #if canImport(UIKit) && !os(watchOS)
+        let background: Notification.Name? = UIApplication.didEnterBackgroundNotification
+        let foreground: Notification.Name? = UIApplication.didBecomeActiveNotification
+        #elseif canImport(AppKit)
+        let background: Notification.Name? = NSApplication.didResignActiveNotification
+        let foreground: Notification.Name? = NSApplication.didBecomeActiveNotification
+        #else
+        let background: Notification.Name? = nil
+        let foreground: Notification.Name? = nil
+        #endif
+        guard let background, let foreground else { return }
+        lifecycleObservers.observe(background) { [weak self] in
+            Task { @MainActor in self?.applicationDidEnterBackground() }
+        }
+        lifecycleObservers.observe(foreground) { [weak self] in
+            Task { @MainActor in self?.applicationDidBecomeActive() }
+        }
+    }
+
+    /// 进入后台：刷新 `X-Is-Backgrounded` 快照 + 冲一次属性缓冲（设计 §5）。
+    func applicationDidEnterBackground() {
+        AppStateProvider.setBackgrounded(true)
+        Task { [orchestrator] in await orchestrator.syncAttributesIfNeeded() }
+    }
+
+    func applicationDidBecomeActive() {
+        AppStateProvider.setBackgrounded(false)
+    }
+
+    /// 等待 SDK 启动期初始化（供 `Attribution` 这类不持有 startTask 的协作方使用）。
+    static func awaitConfigured() async {
+        await instance?.startTask?.value
     }
 
     private func receive(_ customerInfo: CustomerInfo) {
@@ -347,28 +411,104 @@ public final class Purchases {
         return info
     }
 
-    // MARK: - 属性与归因（M3）
+    // MARK: - 属性与归因（M3，契约 §2.4）
 
+    /// 写入**自定义**属性（键必须字母开头、≤40 字符、`[A-Za-z0-9_-]`）。
+    ///
+    /// - 空串 = 删除该属性（墓碑，服务端存 NULL）。
+    /// - `$` 前缀是保留键，这里一律拒绝并打日志 —— 保留键请走下面的专用 setter，
+    ///   免得宿主拼错键名后整批 400（服务端 `attributes.ts` 对非法键整批拒绝）。
+    /// - 写入只落本地缓冲，**不立刻发请求**；同步时机 = 进入后台 / 购买上报（搭车）/
+    ///   logIn 合并前后 / `syncAttributesIfNeeded()`（设计 §5）。
     public func setAttributes(_ attributes: [String: String]) {
-        Task { [orchestrator] in
-            await orchestrator.setAttributes(attributes.mapValues { Optional($0) })
+        let reserved = attributes.keys.filter { SubscriberAttributeKeys.isReserved($0) }
+        if !reserved.isEmpty {
+            Log.warn("setAttributes 收到保留键（`$` 前缀），已忽略：\(reserved.sorted()) —— 请用专用 setter",
+                     category: "attributes")
         }
+        let custom = attributes.filter { !SubscriberAttributeKeys.isReserved($0.key) }
+        guard !custom.isEmpty else { return }
+        enqueueAttributeWrite(custom.mapValues { Optional($0) })
     }
 
-    public func setEmail(_ email: String?) { setReservedAttribute("$email", email) }
-    public func setPhoneNumber(_ phoneNumber: String?) { setReservedAttribute("$phoneNumber", phoneNumber) }
-    public func setDisplayName(_ displayName: String?) { setReservedAttribute("$displayName", displayName) }
-    public func setPushToken(_ token: String?) { setReservedAttribute("$apnsTokens", token) }
-    public func setAdjustID(_ value: String?) { setReservedAttribute("$adjustId", value) }
-    public func setAppsflyerID(_ value: String?) { setReservedAttribute("$appsflyerId", value) }
-    public func setMixpanelDistinctID(_ value: String?) { setReservedAttribute("$mixpanelDistinctId", value) }
-    public func setFirebaseAppInstanceID(_ value: String?) { setReservedAttribute("$firebaseAppInstanceId", value) }
-    public func setOnesignalID(_ value: String?) { setReservedAttribute("$onesignalId", value) }
-    public func setMediaSource(_ value: String?) { setReservedAttribute("$mediaSource", value) }
-    public func setCampaign(_ value: String?) { setReservedAttribute("$campaign", value) }
+    /// 立刻把待同步属性冲到服务端（宿主显式触发点；设计 §5 同步时机之一）。
+    public func syncAttributesIfNeeded() async {
+        await awaitStart()
+        await attributeWriteChain.value   // 先把排队中的 setter 落盘，别把最后一条漏在队列里
+        await orchestrator.syncAttributesIfNeeded()
+    }
+
+    /// 当前身份下**待同步**的属性缓冲（诊断/测试读视图，不对外公开）。
+    /// 先等属性写入链排空，读到的才是「所有已调用的 setter 都落盘之后」的状态。
+    func unsyncedAttributes() async -> [SubscriberAttribute] {
+        await awaitStart()
+        await attributeWriteChain.value
+        return await orchestrator.unsyncedAttributes()
+    }
+
+    // 保留键 setter（契约 §2.4 保留键全集 + 决策 12 的归因键）。`nil` / 空串 = 删除。
+
+    public func setEmail(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.email, value) }
+    public func setPhoneNumber(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.phoneNumber, value) }
+    public func setDisplayName(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.displayName, value) }
+    /// APNs device token（`$apnsTokens`）。传 `Data` 的重载见下。
+    public func setPushToken(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.apnsTokens, value) }
+    /// `didRegisterForRemoteNotificationsWithDeviceToken` 的 `Data` 直接喂进来（转小写 hex）。
+    public func setPushToken(_ token: Data?) {
+        setPushToken(token.map { $0.map { String(format: "%02x", $0) }.joined() })
+    }
+    public func setFCMToken(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.fcmTokens, value) }
+    public func setATTConsentStatus(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.attConsentStatus, value) }
+    public func setIDFA(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.idfa, value) }
+    public func setIDFV(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.idfv, value) }
+    public func setDeviceVersion(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.deviceVersion, value) }
+    public func setAppleRefundHandlingPreference(_ value: String?) {
+        setReservedAttribute(SubscriberAttributeKeys.appleRefundHandlingPreference, value)
+    }
+
+    // 归因 / 三方 SDK 保留键
+    public func setAdjustID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.adjustID, value) }
+    public func setAppsflyerID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.appsflyerID, value) }
+    public func setAmplitudeDeviceID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.amplitudeDeviceID, value) }
+    public func setAmplitudeUserID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.amplitudeUserID, value) }
+    public func setBrazeAliasName(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.brazeAliasName, value) }
+    public func setBrazeAliasLabel(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.brazeAliasLabel, value) }
+    public func setCleverTapID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.clevertapID, value) }
+    public func setFBAnonymousID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.fbAnonID, value) }
+    public func setMparticleID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.mparticleID, value) }
+    public func setOnesignalID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.onesignalID, value) }
+    public func setAirshipChannelID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.airshipChannelID, value) }
+    public func setIterableUserID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.iterableUserID, value) }
+    public func setIterableCampaignID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.iterableCampaignID, value) }
+    public func setIterableTemplateID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.iterableTemplateID, value) }
+    public func setFirebaseAppInstanceID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.firebaseAppInstanceID, value) }
+    public func setMixpanelDistinctID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.mixpanelDistinctID, value) }
+    public func setKochavaDeviceID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.kochavaDeviceID, value) }
+    public func setTenjinID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.tenjinID, value) }
+    public func setPostHogUserID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.posthogUserID, value) }
+    public func setCustomerioID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.customerioID, value) }
+    public func setAppstackID(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.appstackID, value) }
+
+    // 通用归因维度（决策 12 清单）
+    public func setMediaSource(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.mediaSource, value) }
+    public func setCampaign(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.campaign, value) }
+    public func setAdGroup(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.adGroup, value) }
+    public func setAd(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.ad, value) }
+    public func setKeyword(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.keyword, value) }
+    public func setCreative(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.creative, value) }
 
     private func setReservedAttribute(_ key: String, _ value: String?) {
-        Task { [orchestrator] in await orchestrator.setAttributes([key: value]) }
+        enqueueAttributeWrite([key: value])
+    }
+
+    /// 把一次属性写入挂到串行链尾（保证「调用顺序 = 落盘顺序」）。
+    private func enqueueAttributeWrite(_ attributes: [String: String?]) {
+        let previous = attributeWriteChain
+        attributeWriteChain = Task { [orchestrator] in
+            await previous.value
+            await self.awaitStart()
+            await orchestrator.setAttributes(attributes)
+        }
     }
 
     // MARK: - 日志
@@ -385,10 +525,48 @@ public final class Purchases {
 
 public final class Attribution: Sendable {
 
-    init() {}
+    private let orchestrator: PurchasesOrchestrator
 
-    /// AdServices token 采集（设计 §8：token 采集后交 `POST /v1/attribution/adservices`）。
+    init(orchestrator: PurchasesOrchestrator) {
+        self.orchestrator = orchestrator
+    }
+
+    /// 开启 AdServices 归因 token 采集（设计 §8）。
+    ///
+    /// 语义：**只采一次**（持久化标记跨启动生效）；采集失败按 Apple 官方节奏
+    /// 5s × 3 次重试；模拟器 / 无 `AdServices.framework` 的平台优雅跳过并打日志；
+    /// 无论成功与否都会带 `install_id` 打一次 `POST /v1/attribution/adservices`
+    /// （失败时带 `error_code`，让后端能区分「没广告归因」与「没拿到 token」）。
+    ///
+    /// 坑 #83：**fire-and-forget**，绝不阻塞 `configure()` / `purchase()`。
     public func enableAdServicesAttributionTokenCollection() {
-        Log.notImplemented("Attribution.enableAdServicesAttributionTokenCollection()", milestone: "M3")
+        Task { [orchestrator] in
+            await Purchases.awaitConfigured()
+            await orchestrator.collectAdServicesAttributionTokenIfNeeded()
+        }
+    }
+}
+
+// MARK: - 通知观察者盒子
+
+/// `NotificationCenter` 观察者的生命周期容器。持有者释放时自动摘除，
+/// 避免测试里反复 configure 留下越积越多的僵尸观察者。
+final class NotificationObserverBox: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var tokens: [any NSObjectProtocol] = []
+
+    func observe(_ name: Notification.Name, handler: @escaping @Sendable () -> Void) {
+        // queue: nil = 在发帖线程同步派发；handler 自己跳到 MainActor。
+        let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in
+            handler()
+        }
+        lock.lock()
+        tokens.append(token)
+        lock.unlock()
+    }
+
+    deinit {
+        for token in tokens { NotificationCenter.default.removeObserver(token) }
     }
 }

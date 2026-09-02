@@ -401,6 +401,8 @@ actor FakeStoreKitProvider: StoreKitProvider {
     private var storefront: String?
     /// 测试脚本：下一次 purchase() 的行为。
     private var nextPurchaseOutcome: (@Sendable (String) -> StorePurchaseOutcome)?
+    /// 可挂起版脚本（优先级高于同步版）。
+    private var nextPurchaseOutcomeAsync: (@Sendable (String) async -> StorePurchaseOutcome)?
     /// purchase() 收到的 appAccountToken 序列（#22 接线断言用）。
     private(set) var capturedAppAccountTokens: [UUID?] = []
 
@@ -422,6 +424,11 @@ actor FakeStoreKitProvider: StoreKitProvider {
 
     func scriptPurchase(_ outcome: @escaping @Sendable (String) -> StorePurchaseOutcome) {
         nextPurchaseOutcome = outcome
+    }
+
+    /// 可挂起的购买脚本（用来编排「同商品并发购买、结果乱序返回」这类时序，坑 #15）。
+    func scriptPurchaseAsync(_ outcome: @escaping @Sendable (String) async -> StorePurchaseOutcome) {
+        nextPurchaseOutcomeAsync = outcome
     }
 
     func unfinishedTransactions() async -> [any StoreTransactionType] {
@@ -452,10 +459,13 @@ actor FakeStoreKitProvider: StoreKitProvider {
     }
 
     func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
+        capturedAppAccountTokens.append(appAccountToken)
+        if let asyncScript = nextPurchaseOutcomeAsync {
+            return await asyncScript(product.productIdentifier)
+        }
         guard let script = nextPurchaseOutcome else {
             throw PurchasesError(code: .storeProblemError, message: "FakeStoreKitProvider：未编排购买脚本")
         }
-        capturedAppAccountTokens.append(appAccountToken)
         return script(product.productIdentifier)
     }
 }

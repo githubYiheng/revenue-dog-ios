@@ -34,6 +34,16 @@ actor PurchasesOrchestrator {
     private let storeKit: (any StoreKitProvider)?
     private let poster: TransactionPoster
     private let delayScheduler: any DelayScheduler
+    /// 属性本地缓冲（设计 §1「属性与归因」；坑 #51 一属性一文件）。
+    private let attributesStore: SubscriberAttributesStore
+    /// ASA 归因端状态（install_id 幂等键 + 已采集标记，裁决 D2）。
+    private let attributionState: any AttributionStateStorage
+    /// AdServices token 取值面（协议隔离，坑 #83/#84）。
+    private let adServicesTokenProvider: any AdServicesTokenProvider
+    /// 属性同步的单飞闸：同时只允许一次 POST /attributes 在途，避免前后台抖动打出重复请求。
+    private var isSyncingAttributes = false
+    /// ASA 采集在本进程内只启动一次（跨进程的一次性由 `attributionState` 持久化保证）。
+    private var didStartAdServicesCollection = false
     /// 已同步台账（#10 / #2）：`.myApp` 用它防止宿主未 finish 的重投重复上报；
     /// 两种模式都用它给 currentEntitlements 启动扫描去重（已 finish 交易每次启动都可见）。
     private let ledger: SyncedTransactionLedger?
@@ -56,7 +66,10 @@ actor PurchasesOrchestrator {
          pendingPurchases: PendingPurchaseStore,
          storeKit: (any StoreKitProvider)?,
          ledgerFileURL: URL? = nil,
-         delayScheduler: any DelayScheduler = TaskDelayScheduler()) {
+         delayScheduler: any DelayScheduler = TaskDelayScheduler(),
+         attributesDirectory: URL,
+         attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage(),
+         adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()) {
         self.configuration = configuration
         self.identity = identity
         self.httpClient = httpClient
@@ -64,6 +77,9 @@ actor PurchasesOrchestrator {
         self.pendingPurchases = pendingPurchases
         self.storeKit = storeKit
         self.delayScheduler = delayScheduler
+        self.attributesStore = SubscriberAttributesStore(directory: attributesDirectory)
+        self.attributionState = attributionState
+        self.adServicesTokenProvider = adServicesTokenProvider
         self.poster = TransactionPoster(httpClient: httpClient,
                                         completedBy: configuration.purchasesCompletedBy)
         self.ledger = (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL()))
@@ -162,13 +178,17 @@ actor PurchasesOrchestrator {
             ? context!.appUserID
             : ((try? await identity.appUserID) ?? "")
 
+        // 设计 §5「属性同步时机：前后台切换 + 购买时」：待同步属性随收据搭车（省一次请求）
+        let pendingAttributes = await attributesStore.unsynced(appUserID: appUserID)
         let result = await poster.post(jws: jws,
                                        transaction: transaction,
                                        productIdentifier: transaction.productIdentifier,
                                        appUserID: appUserID,
-                                       context: context)
+                                       context: context,
+                                       attributes: pendingAttributes)
         switch result {
         case .success(let posted):
+            await attributesStore.markSynced(pendingAttributes, appUserID: appUserID)
             if posted.finished || configuration.purchasesCompletedBy == .myApp {
                 await pendingPurchases.remove(forKey: txID)
             } else {
@@ -214,12 +234,20 @@ actor PurchasesOrchestrator {
             let info = try await customerInfo(fetchPolicy: .cachedOrFetched)
             return (info, false)
         }
+        // 坑 #52 前半：logIn 前先把旧身份的属性刷出去，保证旧用户的属性不丢。
+        await syncAttributesIfNeeded()
         let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID))
         let response = try await httpClient.perform(.postIdentify, body: body, as: CustomerInfoWireModel.self)
         try await identity.logIn(newAppUserID)
         if let previous { await deviceCache.clearMemoryCache(appUserID: previous) }
         let info = CustomerInfo(wireModel: response.body)
         await deviceCache.cache(customerInfo: info, appUserID: newAppUserID)
+        // 坑 #52 后半：**只有旧身份是匿名**时才把属性迁到新身份（两个真实用户之间不迁移），
+        // 迁移后立刻同步一次（合并后同步时机，任务书 M3 属性项）。
+        if let previous {
+            await attributesStore.migrateIfOldIsAnonymous(from: previous, to: newAppUserID)
+        }
+        await syncAttributesIfNeeded()
         await publish(info)
         return (info, response.statusCode == 201)
     }
@@ -432,6 +460,15 @@ actor PurchasesOrchestrator {
             return PurchaseResult(customerInfo: info, transactionIdentifier: nil, userCancelled: false)
 
         case .success(let transaction):
+            // 坑 **#15**（同 productID **并发**购买配对张冠李戴）：交易 id 一到手就立刻把
+            // **本次**的发起键 rekey 成 transactionId —— 这是端上唯一确知「哪笔上下文属于哪笔交易」
+            // 的时刻。之后无论走 purchase 直接结果还是 updates 双路投递，handle() 的
+            // `context(forKey: txID)` 都会精确命中，不再退化到「按 productId 取最早一条」的启发式
+            // （那条启发式在同商品并发时会把 A 的归因发给 B）。
+            // 残余边界：`.pending`（Ask-to-Buy/SCA）没有交易可 rekey，仍靠 matchInitiation 启发式。
+            _ = try? await pendingPurchases.rekey(from: initiationKey,
+                                                  to: transaction.transactionIdentifier,
+                                                  jws: transaction.jwsRepresentation)
             // 单一处理通道（C2-A）：直接结果与 updates 汇入同一 handle()
             if let info = await handle(transaction: transaction) {
                 return PurchaseResult(customerInfo: info,
@@ -497,14 +534,17 @@ actor PurchasesOrchestrator {
                                              appUserID: appUserID,
                                              initiationSource: .restore,
                                              jws: jws)
+        let pendingAttributes = await attributesStore.unsynced(appUserID: appUserID)
         let result = await poster.post(jws: jws,
                                        transaction: latest,
                                        productIdentifier: latest.productIdentifier,
                                        appUserID: appUserID,
                                        context: context,
-                                       appTransactionJWS: appTransactionJWS)
+                                       appTransactionJWS: appTransactionJWS,
+                                       attributes: pendingAttributes)
         switch result {
         case .success(let posted):
+            await attributesStore.markSynced(pendingAttributes, appUserID: appUserID)
             await ledger?.record(latest.transactionIdentifier)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
             await publish(posted.customerInfo)
@@ -521,8 +561,137 @@ actor PurchasesOrchestrator {
         return (error as? PurchasesError)?.code == .purchaseCancelledError
     }
 
-    func setAttributes(_ attributes: [String: String?]) async {
-        Log.notImplemented("Purchases.setAttributes(_:)", milestone: "M3")
+    // MARK: - 属性（M3，设计 §1 / §5；契约 §2.4）
+
+    /// 写入属性缓冲（按当前 appUserID 分桶）。**不立刻发请求** —— 同步时机见
+    /// `syncAttributesIfNeeded()` 的调用点：进入后台 / 购买上报（搭车）/ logIn 合并前后 / 宿主显式调用。
+    /// 返回被拒绝的键（键名非法 / value 超 500 / 触及 50 自定义上限）。
+    @discardableResult
+    func setAttributes(_ attributes: [String: String?]) async -> [String] {
+        guard let appUserID = try? await identity.appUserID else {
+            Log.warn("setAttributes 在身份就绪前被调用，已丢弃 \(attributes.count) 条", category: "attributes")
+            return Array(attributes.keys)
+        }
+        return await attributesStore.set(attributes, appUserID: appUserID)
+    }
+
+    /// 待同步属性的读视图（测试与诊断用）。
+    func unsyncedAttributes() async -> [SubscriberAttribute] {
+        guard let appUserID = try? await identity.appUserID else { return [] }
+        return await attributesStore.unsynced(appUserID: appUserID)
+    }
+
+    /// 同步待发属性到 `POST /v1/subscribers/{id}/attributes`（契约 §2.4）。
+    ///
+    /// - 单飞：同时只允许一次在途，重复触发直接返回（前后台抖动不会打出重复请求）。
+    /// - **坑 #127**：4xx（404/408/429 除外）一律视为「已同步」——RC 原文
+    ///   「all 4xx (except 404) are considered as successfully synced … continuing to retry
+    ///   won't yield any different results」。属性 400 多半是键名/值非法，重试永远不会变好，
+    ///   继续挂在待发队列只会每次前后台都白发一遍。5xx / 网络错误保持未同步等下次时机。
+    ///   （可重试性判定本身仍由 §5 的 `Is-Retryable` 协议在 HTTPClient 层说了算，
+    ///   这里只处理「HTTPClient 已经放弃之后」的标记语义。）
+    /// - 返回是否真的成功落库。
+    @discardableResult
+    func syncAttributesIfNeeded() async -> Bool {
+        guard !isSyncingAttributes else { return false }
+        guard let appUserID = try? await identity.appUserID else { return false }
+        let pending = await attributesStore.unsynced(appUserID: appUserID)
+        guard !pending.isEmpty else { return false }
+
+        isSyncingAttributes = true
+        defer { isSyncingAttributes = false }
+
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(SubscriberAttributesBody(attributes: pending.wireMap))
+        } catch {
+            Log.warn("属性请求体编码失败：\(error)", category: "attributes")
+            return false
+        }
+
+        do {
+            // 用 performRaw：2xx 即代表服务端已落库；响应体（完整 Subscriber）解码失败
+            // 不该把「已经写成功的属性」退回待发队列。
+            let raw = try await httpClient.performRaw(.postAttributes(appUserID: appUserID), body: data)
+            await attributesStore.markSynced(pending, appUserID: appUserID)
+            if let wire = try? JSONDecoder().decode(CustomerInfoWireModel.self, from: raw.body) {
+                let info = CustomerInfo(wireModel: wire)
+                await deviceCache.cache(customerInfo: info, appUserID: appUserID)
+                await publish(info)
+            }
+            return true
+        } catch let error as PurchasesError {
+            if let status = error.httpStatusCode,
+               (400...499).contains(status), status != 404, status != 408, status != 429 {
+                Log.warn("属性同步被服务端确定性拒绝（HTTP \(status)）：\(error.description) —— 标记已同步不再重试（#127）",
+                         category: "attributes")
+                await attributesStore.markSynced(pending, appUserID: appUserID)
+                return false
+            }
+            Log.warn("属性同步暂时失败，保留待发：\(error.description)", category: "attributes")
+            return false
+        } catch {
+            Log.warn("属性同步失败：\(error)", category: "attributes")
+            return false
+        }
+    }
+
+    // MARK: - ASA 归因采集（M3，设计 §8；核实 asa-adservices.md）
+
+    /// AdServices token 采集 + 上报。**只采一次**（持久化标记），失败按官方 5s×3 重试，
+    /// 采集不到（模拟器 / 旧机型 / 无网）时上报 `error_code` 而不是静默丢弃（核实 §4.4）。
+    ///
+    /// 坑 #83：整条链路 fire-and-forget，绝不阻塞 `configure()` / `purchase()`。
+    func collectAdServicesAttributionTokenIfNeeded() async {
+        guard !didStartAdServicesCollection else { return }
+        didStartAdServicesCollection = true
+        guard await attributionState.adServicesCollected() == false else {
+            Log.debug("AdServices 归因已采集过，跳过（一次性标记）", category: "attribution")
+            return
+        }
+
+        // install_id：ASA 上报的幂等键（裁决 D2 —— 不能用 token，ATT 变化会生成新 token）。
+        // 32 位小写 hex，满足服务端 `^[A-Za-z0-9_-]{8,64}$`。
+        let installID: String
+        if let stored = await attributionState.installID() {
+            installID = stored
+        } else {
+            installID = IdentityManager.uuid32()
+            await attributionState.setInstallID(installID)
+        }
+
+        let collector = AdServicesTokenCollector(provider: adServicesTokenProvider,
+                                                 scheduler: delayScheduler)
+        let outcome = await collector.collect()
+
+        let body: AdServicesAttributionBody
+        switch outcome {
+        case .success(let token):
+            body = AdServicesAttributionBody(installID: installID,
+                                             token: token,
+                                             errorCode: nil,
+                                             collectedAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+                                             appUserID: try? await identity.appUserID)
+        case .failure(let error):
+            body = AdServicesAttributionBody(installID: installID,
+                                             token: nil,
+                                             errorCode: error.wireCode,
+                                             collectedAtMs: Int64(Date().timeIntervalSince1970 * 1000),
+                                             appUserID: try? await identity.appUserID)
+        }
+
+        do {
+            let data = try JSONEncoder().encode(body)
+            _ = try await httpClient.performRaw(.postAdServicesAttribution, body: data)
+            // 上报成功才落一次性标记：上报失败下次启动重来（token TTL 24h，重取一次更合理）。
+            await attributionState.setAdServicesCollected(true)
+            Log.info("AdServices 归因已上报（install_id=\(installID)，token=\(body.token != nil)）",
+                     category: "attribution")
+        } catch {
+            // 允许下次启动重试 —— 但本进程内不再重来（didStartAdServicesCollection 已置位）。
+            didStartAdServicesCollection = false
+            Log.warn("AdServices 归因上报失败，留待下次启动：\(error)", category: "attribution")
+        }
     }
 
     /// 启动/前台恢复时串行重放未完成购买（铁律 P3），并做启动补投扫描（裁决 #2 两半）。

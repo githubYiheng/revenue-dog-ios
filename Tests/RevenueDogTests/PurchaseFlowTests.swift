@@ -95,6 +95,9 @@ private func waitUntil(timeoutMs: Int = 2000, _ condition: @Sendable () async ->
 
 // MARK: - 用例
 
+// 单例串行域（见 Support/SingletonSerialDomain.swift）：本 suite 碰 Purchases 静态单例，
+// 必须与其它同类 suite 串行，不能靠 suite 内 `.serialized`。
+extension PurchasesSingletonDomain {
 @MainActor
 @Suite("购买闭环（M2）", .serialized)
 struct PurchaseFlowTests {
@@ -266,4 +269,5 @@ struct PurchaseFlowTests {
         let secondCount = await transport.capturedRequests.filter { $0.url?.path == "/v1/receipts" }.count
         #expect(secondCount == firstCount)
     }
+}
 }

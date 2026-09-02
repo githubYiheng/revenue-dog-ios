@@ -57,6 +57,9 @@ private func waitFor(timeoutMs: Int = 2000, _ condition: @Sendable () async -> B
     return await condition()
 }
 
+// 单例串行域（见 Support/SingletonSerialDomain.swift）：本 suite 碰 Purchases 静态单例，
+// 必须与其它同类 suite 串行，不能靠 suite 内 `.serialized`。
+extension PurchasesSingletonDomain {
 @MainActor
 @Suite("M2 硬化", .serialized)
 struct M2HardeningTests {
@@ -190,4 +193,5 @@ struct M2HardeningTests {
         #expect(request?.value(forHTTPHeaderField: "X-Storefront") == "USA")
         #expect(request?.value(forHTTPHeaderField: "X-Is-Sandbox") == "true")
     }
+}
 }

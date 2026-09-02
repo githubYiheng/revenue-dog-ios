@@ -54,11 +54,16 @@ enum Endpoint: Sendable, Equatable {
     case postReceipt
     /// `POST /v1/subscribers/identify` —— logIn 合并（服务端四分支矩阵）—— M3。
     case postIdentify
+    /// `POST /v1/attribution/adservices` —— ASA token 上报 —— M3。
+    ///
+    /// ⚠️ 契约 §5.3 写的是 `/v1/attribution/adservices-token` 且自标「形状未定稿」；
+    /// 以服务端 `workers/api/src/attribution.ts` + 契约附录 A 决策 20 为准 → `/v1/attribution/adservices`。
+    case postAdServicesAttribution
 
     var method: HTTPMethod {
         switch self {
         case .getCustomerInfo, .getOfferings: return .get
-        case .postAttributes, .postReceipt, .postIdentify: return .post
+        case .postAttributes, .postReceipt, .postIdentify, .postAdServicesAttribution: return .post
         }
     }
 
@@ -75,6 +80,8 @@ enum Endpoint: Sendable, Equatable {
             return "/v1/receipts"
         case .postIdentify:
             return "/v1/subscribers/identify"
+        case .postAdServicesAttribution:
+            return "/v1/attribution/adservices"
         }
     }
 
@@ -96,6 +103,10 @@ enum Endpoint: Sendable, Equatable {
                                   authScope: .publicKey, sendsPlatformHeader: true)
         case .postIdentify:
             // 四分支矩阵确定性收敛（重复 identify 落「同一 customer」早退分支）→ 幂等，可重试。
+            return EndpointPolicy(isRetryable: true, usesETag: false,
+                                  authScope: .publicKey, sendsPlatformHeader: true)
+        case .postAdServicesAttribution:
+            // 服务端按 install_id 做 UPSERT（裁决 D2：install_id 是幂等键）→ 幂等，可重试。
             return EndpointPolicy(isRetryable: true, usesETag: false,
                                   authScope: .publicKey, sendsPlatformHeader: true)
         }

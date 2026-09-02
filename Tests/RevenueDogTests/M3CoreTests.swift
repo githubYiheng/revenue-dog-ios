@@ -45,6 +45,9 @@ private func makeM3(
     return (purchases, transport, provider)
 }
 
+// 单例串行域（见 Support/SingletonSerialDomain.swift）：本 suite 碰 Purchases 静态单例，
+// 必须与其它同类 suite 串行，不能靠 suite 内 `.serialized`。
+extension PurchasesSingletonDomain {
 @MainActor
 @Suite("M3 核心语义", .serialized)
 struct M3CoreTests {
@@ -169,6 +172,7 @@ struct M3CoreTests {
         #expect(await frames.count == 1) // 无重复帧
         collector.cancel()
     }
+}
 }
 
 private actor FrameRecorder {

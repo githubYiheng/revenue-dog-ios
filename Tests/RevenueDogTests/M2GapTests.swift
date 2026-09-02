@@ -146,6 +146,9 @@ private func receiptBodies(_ requests: [URLRequest]) -> [[String: Any]] {
 
 // MARK: - 用例
 
+// 单例串行域（见 Support/SingletonSerialDomain.swift）：本 suite 碰 Purchases 静态单例，
+// 必须与其它同类 suite 串行，不能靠 suite 内 `.serialized`。
+extension PurchasesSingletonDomain {
 @MainActor
 @Suite("M2 门禁补测", .serialized)
 struct M2GapTests {
@@ -367,6 +370,74 @@ struct M2GapTests {
         #expect(leftovers.isEmpty) // 两笔上下文都按各自的键收尾，没有互相覆盖后残留
     }
 
+    // MARK: #15（并发） —— 同 productID 并发两次购买，交易乱序到达也不串归因
+
+    @Test("#15：同 productID **并发**两次购买，第二笔先返回 → 两笔归因仍各归各的")
+    func concurrentPurchasesOfSameProductKeepDistinctAttribution() async throws {
+        let directory = gapTempDirectory()
+        let transport = MockTransport()
+        await transport.enqueue(.json(gapSubscriberJSON()))   // 单条 stub 会被反复复用
+        let (purchases, provider) = makeGapPurchases(transport: transport, directory: directory)
+        _ = try await purchases.customerInfo()
+
+        let firstFlag = FinishFlag()
+        let secondFlag = FinishFlag()
+        let gate = ConcurrentPurchaseGate()
+
+        // 时序编排：第一笔的 storeKit.purchase 挂住，直到第二笔整条链路（含上报）走完 ——
+        // 于是「后发起的 B 先被 handle」，正是 #15 描述的乱序场景。
+        await provider.scriptPurchaseAsync { productID in
+            let index = await gate.enter()
+            if index == 1 {
+                await gate.waitForSecond()
+                return .success(FakeTransaction(transactionIdentifier: "tx-conc-1",
+                                                originalTransactionIdentifier: "tx-conc-1",
+                                                productIdentifier: productID,
+                                                purchaseDate: Date(),
+                                                expirationDate: Date().addingTimeInterval(3600),
+                                                jwsRepresentation: "h.conc1.s",
+                                                finishFlag: firstFlag))
+            }
+            return .success(FakeTransaction(transactionIdentifier: "tx-conc-2",
+                                            originalTransactionIdentifier: "tx-conc-2",
+                                            productIdentifier: productID,
+                                            purchaseDate: Date(),
+                                            expirationDate: Date().addingTimeInterval(3600),
+                                            jwsRepresentation: "h.conc2.s",
+                                            finishFlag: secondFlag))
+        }
+
+        let taskA = Task { @MainActor in
+            try await purchases.purchase(package: gapPackage(offering: "offer-A"))
+        }
+        // 等 A 的上下文确实先落盘（A 进了脚本 = save 已完成），再发起 B
+        let aStarted = await gapWaitFor { await gate.entered >= 1 }
+        #expect(aStarted)
+        let taskB = Task { @MainActor in
+            try await purchases.purchase(package: gapPackage(offering: "offer-B"))
+        }
+
+        let resultB = try await taskB.value
+        #expect(resultB.transactionIdentifier == "tx-conc-2")
+        await gate.markSecondFinished()
+        let resultA = try await taskA.value
+        #expect(resultA.transactionIdentifier == "tx-conc-1")
+
+        let bodies = receiptBodies(await transport.capturedRequests)
+        #expect(bodies.count == 2)
+        // 关键断言：B 先上报，带的必须是 B 自己的 offering（旧实现会捡到 A 的上下文 → offer-A）
+        let byToken = Dictionary(bodies.compactMap { body -> (String, [String: Any])? in
+            guard let token = body["fetch_token"] as? String else { return nil }
+            return (token, body)
+        }, uniquingKeysWith: { first, _ in first })
+        #expect(byToken["h.conc2.s"]?["presented_offering_identifier"] as? String == "offer-B")
+        #expect(byToken["h.conc1.s"]?["presented_offering_identifier"] as? String == "offer-A")
+
+        #expect(firstFlag.value && secondFlag.value)
+        let leftovers = await PendingPurchaseStore(directory: directory).all()
+        #expect(leftovers.isEmpty) // 两笔上下文各自收尾，没有互相覆盖后残留
+    }
+
     // MARK: #55 / #7 —— stale 缓存路径永不触发 finish
 
     @Test("#55/#7：后端 5xx 回落 stale 缓存 —— finish 调用数恒为 0")
@@ -443,5 +514,26 @@ struct M2GapTests {
 
         let bodies = receiptBodies(await transport.capturedRequests)
         #expect(bodies.map { $0["fetch_token"] as? String } == ["h.live1.s", "h.live2.s"])
+    }
+}
+}
+
+/// #15 并发用例的时序闸门：保证「A 先落上下文、B 先被处理」。
+private actor ConcurrentPurchaseGate {
+
+    private(set) var entered = 0
+    private var secondFinished = false
+
+    func enter() -> Int {
+        entered += 1
+        return entered
+    }
+
+    func markSecondFinished() { secondFinished = true }
+
+    func waitForSecond() async {
+        while !secondFinished {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
     }
 }
