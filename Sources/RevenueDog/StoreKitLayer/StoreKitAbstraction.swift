@@ -110,7 +110,19 @@ protocol StoreKitProvider: Sendable {
     func syncStoreAccount() async throws
 
     /// 发起购买（铁律 P6：UI context 自动探测 + `PurchaseUIContext` 显式注入，见下）。
-    func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome
+    ///
+    /// - Parameter onPurchaseResult: **M-4 购买结果钩子**（迁移方案 v2.1 §5 M-4）。
+    ///   `Product.purchase()` 一返回就**同步**调用一次，`success` / `userCancelled` / `pending`
+    ///   三种结果全都回调 —— 此刻 Dog 还没上报后端、更没 `finish()`，
+    ///   满足 RC「`recordPurchase(_:)` 之后由调用方自己 finish」的硬性要求
+    ///   （verify/rc-sdk-observer-mode.md §8.1 判断 5）。
+    ///   载荷用 `any Sendable` 承运：StoreKit 类型不许渗进业务层（设计 §2 协议隔离），
+    ///   还原成 `Product.PurchaseResult` 在 `RuntimeSettings.dispatchPurchaseResult` 里做。
+    ///   **例外**：`StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18）根本没有
+    ///   `Product.PurchaseResult` 可交，不回调 —— RC 侧同样无从记录，语义一致。
+    func purchase(product: any StoreProductType,
+                  appAccountToken: UUID?,
+                  onPurchaseResult: (@Sendable (any Sendable) -> Void)?) async throws -> StorePurchaseOutcome
 }
 
 // MARK: - 购买 UI context（铁律 P6 / 坑 #23）
@@ -270,7 +282,9 @@ struct SK2Provider: StoreKitProvider {
         try await AppStore.sync()
     }
 
-    func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
+    func purchase(product: any StoreProductType,
+                  appAccountToken: UUID?,
+                  onPurchaseResult: (@Sendable (any Sendable) -> Void)?) async throws -> StorePurchaseOutcome {
         guard let sk2Product = (product as? SK2Product)?.underlying else {
             throw PurchasesError(code: .productNotAvailableForPurchaseError,
                                  message: "非 StoreKit 商品无法购买：\(product.productIdentifier)")
@@ -287,6 +301,11 @@ struct SK2Provider: StoreKitProvider {
             if case .userCancelled = error { return .userCancelled } // 坑 #18：throw 形态的取消
             throw PurchasesError(code: .storeProblemError, message: "StoreKit 购买失败", underlyingError: error)
         }
+
+        // M-4：原始结果一到手就交给宿主（**早于**验签丢弃、早于上报、早于 finish）。
+        // 放在 switch 之前 = 三种 case 全都回调，且 unverified 被我们丢弃的那笔
+        // RC 侧仍能收到（谁认不认那笔交易是各自后端的事）。
+        onPurchaseResult?(result)
 
         switch result {
         case .success(let verification):
@@ -405,6 +424,10 @@ actor FakeStoreKitProvider: StoreKitProvider {
     private var nextPurchaseOutcomeAsync: (@Sendable (String) async -> StorePurchaseOutcome)?
     /// purchase() 收到的 appAccountToken 序列（#22 接线断言用）。
     private(set) var capturedAppAccountTokens: [UUID?] = []
+    /// M-4 测试脚本：本次 purchase() 要交给钩子的「原始结果」载荷。
+    /// 单测里塞真的 `Product.PurchaseResult`（`.userCancelled` / `.pending` 可直接构造），
+    /// 走的是与生产完全同一条派发路径。nil = 不回调（模拟 throw 形态取消）。
+    private var scriptedRawPurchaseResult: (any Sendable)?
 
     func setUnfinished(_ transactions: [any StoreTransactionType]) {
         unfinished = transactions
@@ -429,6 +452,11 @@ actor FakeStoreKitProvider: StoreKitProvider {
     /// 可挂起的购买脚本（用来编排「同商品并发购买、结果乱序返回」这类时序，坑 #15）。
     func scriptPurchaseAsync(_ outcome: @escaping @Sendable (String) async -> StorePurchaseOutcome) {
         nextPurchaseOutcomeAsync = outcome
+    }
+
+    /// M-4：编排本次 purchase() 回调给钩子的原始结果载荷。
+    func scriptRawPurchaseResult(_ value: (any Sendable)?) {
+        scriptedRawPurchaseResult = value
     }
 
     func unfinishedTransactions() async -> [any StoreTransactionType] {
@@ -458,14 +486,20 @@ actor FakeStoreKitProvider: StoreKitProvider {
         if let syncError { throw syncError }
     }
 
-    func purchase(product: any StoreProductType, appAccountToken: UUID?) async throws -> StorePurchaseOutcome {
+    func purchase(product: any StoreProductType,
+                  appAccountToken: UUID?,
+                  onPurchaseResult: (@Sendable (any Sendable) -> Void)?) async throws -> StorePurchaseOutcome {
         capturedAppAccountTokens.append(appAccountToken)
+        let outcome: StorePurchaseOutcome
         if let asyncScript = nextPurchaseOutcomeAsync {
-            return await asyncScript(product.productIdentifier)
-        }
-        guard let script = nextPurchaseOutcome else {
+            outcome = await asyncScript(product.productIdentifier)
+        } else if let script = nextPurchaseOutcome {
+            outcome = script(product.productIdentifier)
+        } else {
             throw PurchasesError(code: .storeProblemError, message: "FakeStoreKitProvider：未编排购买脚本")
         }
-        return script(product.productIdentifier)
+        // M-4：与 SK2Provider 同一时序 —— 结果到手就回调，返回给 orchestrator 之前。
+        if let scriptedRawPurchaseResult { onPurchaseResult?(scriptedRawPurchaseResult) }
+        return outcome
     }
 }

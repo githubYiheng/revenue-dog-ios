@@ -16,16 +16,22 @@ import StoreKit
 private struct IdentifyBody: Encodable {
     let appUserID: String?
     let newAppUserID: String
+    /// 决策 20：携带设备 install_id，服务端在四分支收敛后把 ASA 归因行重链到登入后的 customer（纯切换分支也覆盖）。
+    let installID: String?
 
     enum CodingKeys: String, CodingKey {
         case appUserID = "app_user_id"
         case newAppUserID = "new_app_user_id"
+        case installID = "install_id"
     }
 }
 
 actor PurchasesOrchestrator {
 
     let configuration: Configuration
+    /// 运行时可写设置（M-2a `purchasesCompletedBy` / M-4 购买结果钩子）。
+    /// `configuration.purchasesCompletedBy` 只是**初始值**，运行期一律读这里。
+    let settings: RuntimeSettings
 
     private let identity: IdentityManager
     private let httpClient: HTTPClient
@@ -51,6 +57,8 @@ actor PurchasesOrchestrator {
     private(set) var appTransactionJWS: String?
     /// 内存级同交易去重（purchase() 直接结果与 updates 流可能双到）。
     private var inFlightTransactionIDs: Set<String> = []
+    /// M-2b 前台重扫的单飞闸（前后台抖动不叠加扫描）。
+    private var isForegroundRescanning = false
 
     /// customerInfoStream 的多播出口（设计 §6 铁律 2：观察者通知一律异步派发）。
     private var customerInfoContinuations: [UUID: AsyncStream<CustomerInfo>.Continuation] = [:]
@@ -60,6 +68,7 @@ actor PurchasesOrchestrator {
     private var didStart = false
 
     init(configuration: Configuration,
+         settings: RuntimeSettings,
          identity: IdentityManager,
          httpClient: HTTPClient,
          deviceCache: DeviceCache,
@@ -71,6 +80,7 @@ actor PurchasesOrchestrator {
          attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage(),
          adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()) {
         self.configuration = configuration
+        self.settings = settings
         self.identity = identity
         self.httpClient = httpClient
         self.deviceCache = deviceCache
@@ -80,8 +90,7 @@ actor PurchasesOrchestrator {
         self.attributesStore = SubscriberAttributesStore(directory: attributesDirectory)
         self.attributionState = attributionState
         self.adServicesTokenProvider = adServicesTokenProvider
-        self.poster = TransactionPoster(httpClient: httpClient,
-                                        completedBy: configuration.purchasesCompletedBy)
+        self.poster = TransactionPoster(httpClient: httpClient)
         self.ledger = (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL()))
             .map { SyncedTransactionLedger(fileURL: $0) }
     }
@@ -138,8 +147,14 @@ actor PurchasesOrchestrator {
         inFlightTransactionIDs.insert(txID)
         defer { inFlightTransactionIDs.remove(txID) }
 
+        // M-2a（迁移方案 v2.1 §5）：**进行中的购买沿用发起时的模式**做 finish 决策 ——
+        // 发起时已把模式快照进 `PendingPurchaseContext`；没有快照的（updates 补投 / 续订 /
+        // 别处购买 / 老版本上下文）用当前运行时值，即「切换立即对新交易生效」。
+        var context = await pendingPurchases.context(forKey: txID)
+        let completedBy = context?.completedBy ?? settings.purchasesCompletedBy
+
         // .myApp 台账（#10）：已同步过且宿主没 finish 的重投直接跳过
-        if configuration.purchasesCompletedBy == .myApp, let ledger,
+        if completedBy == .myApp, let ledger,
            await ledger.contains(txID) {
             return nil
         }
@@ -156,8 +171,7 @@ actor PurchasesOrchestrator {
                      category: "storekit")
         }
 
-        // 上下文配对：优先 txID 键（重放），否则按商品匹配发起键（#15/#16）并 rekey + 写入 JWS
-        var context = await pendingPurchases.context(forKey: txID)
+        // 上下文配对：txID 键（重放）已在上面读过；没读到就按商品匹配发起键（#15/#16）并 rekey + 写入 JWS
         if context == nil,
            let matched = await pendingPurchases.matchInitiation(productIdentifier: transaction.productIdentifier,
                                                                 purchaseDate: transaction.purchaseDate) {
@@ -169,7 +183,8 @@ actor PurchasesOrchestrator {
                                                  productIdentifier: transaction.productIdentifier,
                                                  appUserID: (try? await identity.appUserID) ?? "",
                                                  initiationSource: .queue,
-                                                 jws: jws)
+                                                 jws: jws,
+                                                 completedBy: completedBy) // M-2a：重放沿用同一模式
             try? await pendingPurchases.save(minimal)
             context = minimal
         }
@@ -185,11 +200,12 @@ actor PurchasesOrchestrator {
                                        productIdentifier: transaction.productIdentifier,
                                        appUserID: appUserID,
                                        context: context,
+                                       completedBy: completedBy,
                                        attributes: pendingAttributes)
         switch result {
         case .success(let posted):
             await attributesStore.markSynced(pendingAttributes, appUserID: appUserID)
-            if posted.finished || configuration.purchasesCompletedBy == .myApp {
+            if posted.finished || completedBy == .myApp {
                 await pendingPurchases.remove(forKey: txID)
             } else {
                 // 上报成功但 finish 未获准（如一次性交易未在响应确认）：保留上下文，finish 义务不丢
@@ -203,7 +219,7 @@ actor PurchasesOrchestrator {
         case .failure(.finishable(let error)):
             // 确定性拒绝：重试无意义 —— finish（.revenueDog 模式）并删除上下文
             Log.warn("交易被后端确定性拒绝（tx=\(txID)）：\(error.description)", category: "purchase")
-            if configuration.purchasesCompletedBy == .revenueDog {
+            if completedBy == .revenueDog {
                 await transaction.finish()
             }
             await pendingPurchases.remove(forKey: txID)
@@ -236,7 +252,8 @@ actor PurchasesOrchestrator {
         }
         // 坑 #52 前半：logIn 前先把旧身份的属性刷出去，保证旧用户的属性不丢。
         await syncAttributesIfNeeded()
-        let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID))
+        let installID = await attributionState.installID()
+        let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID, installID: installID))
         let response = try await httpClient.perform(.postIdentify, body: body, as: CustomerInfoWireModel.self)
         try await identity.logIn(newAppUserID)
         if let previous { await deviceCache.clearMemoryCache(appUserID: previous) }
@@ -409,7 +426,11 @@ actor PurchasesOrchestrator {
     private func purchase(productIdentifier: String,
                           presentedOfferingIdentifier: String?,
                           presentedPackageIdentifier: String?) async throws -> PurchaseResult {
-        guard configuration.purchasesCompletedBy == .revenueDog else {
+        // M-2a：**动态读**运行时值（热切立即生效，对齐 RC `purchasesAreCompletedBy` 的做法，
+        // verify/rc-sdk-observer-mode.md §8.1 判断 6）。读一次并贯穿本次购买 ——
+        // 这一读就是「发起时快照」的取值点。
+        let completedBy = settings.purchasesCompletedBy
+        guard completedBy == .revenueDog else {
             throw PurchasesError(code: .configurationError,
                                  message: "purchasesCompletedBy == .myApp 时购买由宿主发起，SDK 只观察")
         }
@@ -436,12 +457,19 @@ actor PurchasesOrchestrator {
                                              presentedOfferingIdentifier: presentedOfferingIdentifier,
                                              presentedPackageIdentifier: presentedPackageIdentifier,
                                              accountToken: accountToken,
-                                             initiationSource: .purchase)
+                                             initiationSource: .purchase,
+                                             completedBy: completedBy) // M-2a：发起时模式快照
         try await pendingPurchases.save(context)
 
         let outcome: StorePurchaseOutcome
         do {
-            outcome = try await storeKit.purchase(product: product, appAccountToken: appAccountToken)
+            // M-4：把购买结果钩子交给 StoreKit 层 —— `Product.purchase()` 一返回就同步回调，
+            // 早于上报、早于 finish（迁移方案 v2.1 §5 M-4；档 2 宿主转交 RC `recordPurchase`）。
+            outcome = try await storeKit.purchase(product: product,
+                                                  appAccountToken: appAccountToken,
+                                                  onPurchaseResult: { [settings] raw in
+                                                      settings.dispatchPurchaseResult(raw)
+                                                  })
         } catch {
             // 购买未发生（弹窗前失败）：清理发起键，原样抛出
             await pendingPurchases.remove(forKey: initiationKey)
@@ -540,6 +568,8 @@ actor PurchasesOrchestrator {
                                        productIdentifier: latest.productIdentifier,
                                        appUserID: appUserID,
                                        context: context,
+                                       // restore/sync 不是「进行中的购买」，用当前运行时模式（M-2a）
+                                       completedBy: settings.purchasesCompletedBy,
                                        appTransactionJWS: appTransactionJWS,
                                        attributes: pendingAttributes)
         switch result {
@@ -703,16 +733,19 @@ actor PurchasesOrchestrator {
 
         let pending = await pendingPurchases.all()
         for context in pending where context.jws != nil {
+            // M-2a：重放沿用**这笔购买发起时**的模式快照；没有快照的用当前运行时值。
+            let completedBy = context.completedBy ?? settings.purchasesCompletedBy
             let result = await poster.post(jws: context.jws!,
                                            transaction: nil,
                                            productIdentifier: context.productIdentifier,
                                            appUserID: context.appUserID,
-                                           context: context)
+                                           context: context,
+                                           completedBy: completedBy)
             switch result {
             case .success(let posted):
                 await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: context.appUserID)
                 await publish(posted.customerInfo)
-                if configuration.purchasesCompletedBy == .myApp {
+                if completedBy == .myApp {
                     await pendingPurchases.remove(forKey: context.key)
                     await ledger?.record(context.key)
                 } else {
@@ -755,6 +788,69 @@ actor PurchasesOrchestrator {
         // #2 后半：currentEntitlements 扫描 —— 已 finish 但可能从未上报成功的权益型交易
         // （别处设备购买 / 兑换码 / 历史上报失败后被宿主 finish）在 unfinished 里看不到。
         await scanCurrentEntitlements()
+    }
+
+    /// **M-2b：观察者模式的前台激活重扫**（迁移方案 v2.1 §1 档 1）。
+    ///
+    /// 依据 `verify/storekit2-multi-listener.md` §1 结论 3 / §4：Apple **只保证**
+    /// `purchase()` 发起方经 `Product.PurchaseResult.success(_:)` 拿到那笔交易，
+    /// **不保证它也进 `Transaction.updates`** —— 档 1 里购买是 RC 发起的，
+    /// Dog 作为观察方只挂 `updates` 就会系统性漏掉「本机刚买的那笔」。
+    /// 所以观察者模式必须保留「前台激活时轮询快照序列 + 台账去重」（RC 自己也是这么兜的）。
+    ///
+    /// 复用**同一条**启动扫描路径 `replayPendingPurchases()`
+    /// （= 待重放上下文 + `Transaction.unfinished` + `Transaction.currentEntitlements`），
+    /// 不写第二套；去重全靠台账（#10 / #2），已上报过的不会重发。
+    func rescanOnForegroundIfObserving() async {
+        // 只在观察者模式做：`.revenueDog` 下 Dog 自己发起购买、自己 finish，
+        // updates + 启动扫描已经覆盖，前台再扫是纯浪费。
+        guard settings.purchasesCompletedBy == .myApp else { return }
+        // 单飞：前后台反复抖动不叠加扫描（每次扫描要遍历快照序列 + 读台账）。
+        guard !isForegroundRescanning else { return }
+        isForegroundRescanning = true
+        defer { isForegroundRescanning = false }
+        await replayPendingPurchases()
+    }
+
+    // MARK: - 权益 diff 上报（M-3 客户端半边，迁移方案 v2.1 §5）
+
+    /// 见 `Purchases.reportEntitlementDiff(rcActive:rcRequestDate:rcSDKVersion:)` 的公开文档。
+    func reportEntitlementDiff(rcActive: [String: Date?],
+                               rcRequestDate: Date?,
+                               rcSDKVersion: String?) async throws -> EntitlementDiffResult {
+        let appUserID = try await identity.appUserID
+
+        // Dog 侧快照取**本地缓存**（不发网）—— 上报 diff 本身不该改变被观测对象：
+        // 每次比对都强刷会让 Dog 侧永远比 RC 侧新，一致率虚高。完全没缓存时才拉一次。
+        let dogInfo: CustomerInfo?
+        if let cached = await deviceCache.cachedCustomerInfo(appUserID: appUserID) {
+            dogInfo = cached
+        } else {
+            dogInfo = try? await customerInfo(fetchPolicy: .cachedOrFetched)
+        }
+
+        let dogActive = (dogInfo?.entitlements.active ?? [:]).mapValues { $0.expirationDate }
+        let system = SystemInfo.current(isBackgrounded: AppStateProvider.isBackgrounded)
+        let body = EntitlementDiffBody(
+            appUserID: appUserID,
+            observedAtMs: Int64((Date().timeIntervalSince1970 * 1000).rounded()),
+            rc: EntitlementDiffBody.Side(active: EntitlementDiffBody.activeMap(rcActive),
+                                         requestDateMs: rcRequestDate.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) },
+                                         sdkVersion: rcSDKVersion,
+                                         includesSDKVersion: true),
+            dog: EntitlementDiffBody.Side(active: EntitlementDiffBody.activeMap(dogActive),
+                                          requestDateMs: dogInfo?.requestDate.map { Int64(($0.timeIntervalSince1970 * 1000).rounded()) },
+                                          sdkVersion: nil,
+                                          includesSDKVersion: false),
+            context: EntitlementDiffBody.Context(appVersion: system.clientVersion,
+                                                 osVersion: system.platformVersion),
+        )
+
+        let data = try await httpClient.encode(body)
+        // 匹配由**服务端**算，客户端不判 —— SDK 只解析并透出结果。
+        let response = try await httpClient.perform(.postEntitlementDiff, body: data,
+                                                    as: EntitlementDiffResult.self)
+        return response.body
     }
 
     /// currentEntitlements 启动扫描（裁决 #2 后半）。台账去重：已上报过的不重发

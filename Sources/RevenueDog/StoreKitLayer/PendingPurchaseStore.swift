@@ -48,6 +48,13 @@ struct PendingPurchaseContext: Codable, Sendable, Equatable {
     var replayCount: Int
     /// 交易 JWS 原文（rekey 到 transactionId 时写入）：崩溃在「拿到交易后、上报成功前」也能凭它重放。
     var jws: String?
+    /// **发起这笔购买时**的完成者模式快照（迁移方案 v2.1 §5 M-2a）。
+    ///
+    /// `purchasesCompletedBy` 运行时可写之后，「谁 finish」不能再在交易回流时才现读 ——
+    /// 否则宿主在购买弹窗还开着的时候翻开关，这笔在途购买就会换一套 finish 语义
+    /// （最坏情况：Dog 发起、Dog 上报，却因为切到 `.myApp` 而永不 finish → 交易挂着）。
+    /// 落盘保证跨崩溃重放也用同一份快照。nil = 老版本写下的上下文 / 非 Dog 发起 → 回落当前运行时值。
+    let completedBy: PurchasesCompletedBy?
 
     init(key: String,
          productIdentifier: String,
@@ -58,7 +65,9 @@ struct PendingPurchaseContext: Codable, Sendable, Equatable {
          initiationSource: InitiationSource = .purchase,
          createdAt: Date = Date(),
          replayCount: Int = 0,
-         jws: String? = nil) {
+         jws: String? = nil,
+         completedBy: PurchasesCompletedBy? = nil) {
+        self.completedBy = completedBy
         self.key = key
         self.productIdentifier = productIdentifier
         self.appUserID = appUserID
@@ -172,7 +181,8 @@ actor PendingPurchaseStore {
                                              initiationSource: existing.initiationSource,
                                              createdAt: existing.createdAt,
                                              replayCount: existing.replayCount,
-                                             jws: jws ?? existing.jws)
+                                             jws: jws ?? existing.jws,
+                                             completedBy: existing.completedBy) // M-2a：换键不换模式快照
         try save(context)
         remove(forKey: oldKey)
         return context

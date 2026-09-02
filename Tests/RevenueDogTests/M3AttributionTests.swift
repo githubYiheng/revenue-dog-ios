@@ -259,5 +259,27 @@ extension PurchasesSingletonDomain {
             // 采集还挂在 provider 里，归因请求一条都没发 —— 证明购买没被它拖住
             #expect(await transport.requests(path: adServicesPath).isEmpty)
         }
+
+        @Test("决策 20：logIn 的 identify 请求携带持久化的 install_id；无 install_id 时不带键")
+        func identifyCarriesInstallID() async throws {
+            let state = InMemoryAttributionStateStorage()
+            await state.setInstallID("0123456789abcdef0123456789abcdef")
+            let transport = PathRoutedTransport()
+            let (purchases, _) = makeASA(provider: FakeAdServicesTokenProvider(outcomes: []),
+                                         transport: transport, state: state)
+            _ = try? await purchases.customerInfo(fetchPolicy: .cachedOnly) // 等启动收敛
+            _ = try await purchases.logIn("carol")
+            let identify = await transport.requests(path: "/v1/subscribers/identify").last
+            #expect(jsonBody(identify)["install_id"] as? String == "0123456789abcdef0123456789abcdef")
+
+            let transport2 = PathRoutedTransport()
+            let (purchases2, _) = makeASA(provider: FakeAdServicesTokenProvider(outcomes: []),
+                                          transport: transport2, state: InMemoryAttributionStateStorage())
+            _ = try? await purchases2.customerInfo(fetchPolicy: .cachedOnly)
+            _ = try await purchases2.logIn("dave")
+            let identify2 = await transport2.requests(path: "/v1/subscribers/identify").last
+            #expect(identify2 != nil)
+            #expect(jsonBody(identify2)["install_id"] == nil)
+        }
     }
 }

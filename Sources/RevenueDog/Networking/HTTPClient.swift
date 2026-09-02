@@ -59,11 +59,14 @@ enum Endpoint: Sendable, Equatable {
     /// ⚠️ 契约 §5.3 写的是 `/v1/attribution/adservices-token` 且自标「形状未定稿」；
     /// 以服务端 `workers/api/src/attribution.ts` + 契约附录 A 决策 20 为准 → `/v1/attribution/adservices`。
     case postAdServicesAttribution
+    /// `POST /v1/diagnostics/entitlement-diff` —— 档 1 权益一致率上报（迁移方案 v2.1 §5 M-3）。
+    case postEntitlementDiff
 
     var method: HTTPMethod {
         switch self {
         case .getCustomerInfo, .getOfferings: return .get
-        case .postAttributes, .postReceipt, .postIdentify, .postAdServicesAttribution: return .post
+        case .postAttributes, .postReceipt, .postIdentify, .postAdServicesAttribution,
+             .postEntitlementDiff: return .post
         }
     }
 
@@ -82,6 +85,8 @@ enum Endpoint: Sendable, Equatable {
             return "/v1/subscribers/identify"
         case .postAdServicesAttribution:
             return "/v1/attribution/adservices"
+        case .postEntitlementDiff:
+            return "/v1/diagnostics/entitlement-diff"
         }
     }
 
@@ -108,6 +113,13 @@ enum Endpoint: Sendable, Equatable {
         case .postAdServicesAttribution:
             // 服务端按 install_id 做 UPSERT（裁决 D2：install_id 是幂等键）→ 幂等，可重试。
             return EndpointPolicy(isRetryable: true, usesETag: false,
+                                  authScope: .publicKey, sendsPlatformHeader: true)
+        case .postEntitlementDiff:
+            // **不可重试**：每次上报是一条独立观测样本，没有幂等键；网络抖动重发会把
+            // 同一次观测计成多条，直接污染日聚合的「权益一致率」（档 1 出口条件的分母）。
+            // 丢一次样本无所谓 —— 宿主在 RC `customerInfoStream` 每次更新时都会再报
+            // （接线模板 dual-sdk-integration.md §5），服务端还有每用户每天 cap 兜底。
+            return EndpointPolicy(isRetryable: false, usesETag: false,
                                   authScope: .publicKey, sendsPlatformHeader: true)
         }
     }

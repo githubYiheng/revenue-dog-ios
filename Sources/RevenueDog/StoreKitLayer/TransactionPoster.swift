@@ -30,20 +30,23 @@ enum PostReceiptFailure: Error, Sendable {
 actor TransactionPoster {
 
     private let httpClient: HTTPClient
-    private let completedBy: PurchasesCompletedBy
 
-    init(httpClient: HTTPClient, completedBy: PurchasesCompletedBy) {
+    init(httpClient: HTTPClient) {
         self.httpClient = httpClient
-        self.completedBy = completedBy
     }
 
     /// 上报一笔交易。成功返回 CustomerInfo 并按铁律裁决 finish；失败返回处置指令。
+    ///
+    /// - Parameter completedBy: 本笔交易的**有效**完成者模式。M-2a 起 `purchasesCompletedBy`
+    ///   运行时可写，模式不再是 poster 的常量：Dog 自己发起的购买用「发起时快照」，
+    ///   其余（updates 补投 / 续订 / 别处购买）用当前运行时值。由调用方（orchestrator）解析后传入。
     func post(
         jws: String,
         transaction: (any StoreTransactionType)?,
         productIdentifier: String,
         appUserID: String,
         context: PendingPurchaseContext?,
+        completedBy: PurchasesCompletedBy,
         appTransactionJWS: String? = nil,
         attributes: [SubscriberAttribute] = [],
     ) async -> Result<PostReceiptResult, PostReceiptFailure> {
@@ -73,7 +76,8 @@ actor TransactionPoster {
             let info = CustomerInfo(wireModel: response.body)
             let finished = await finishIfAllowed(transaction: transaction,
                                                  productIdentifier: productIdentifier,
-                                                 customerInfo: info)
+                                                 customerInfo: info,
+                                                 completedBy: completedBy)
             return .success(PostReceiptResult(customerInfo: info, finished: finished))
         } catch let error as PurchasesError {
             return .failure(classify(error))
@@ -89,6 +93,7 @@ actor TransactionPoster {
         transaction: (any StoreTransactionType)?,
         productIdentifier: String,
         customerInfo: CustomerInfo,
+        completedBy: PurchasesCompletedBy,
     ) async -> Bool {
         guard completedBy == .revenueDog else { return false } // .myApp：宿主自管 finish
         guard let transaction else { return false }            // 重放路径无交易对象（仅 JWS）时不 finish

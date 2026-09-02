@@ -8,6 +8,10 @@
 
 import Foundation
 
+#if canImport(StoreKit)
+import StoreKit
+#endif
+
 #if canImport(UIKit) && !os(watchOS)
 import UIKit
 #elseif canImport(AppKit)
@@ -23,6 +27,9 @@ public struct Configuration: Sendable {
     /// nil = 匿名启动。
     public private(set) var appUserID: String?
     /// `.revenueDog` = SDK 负责 finish；`.myApp` = 宿主自管 finish（裁决 C4）。
+    ///
+    /// ⚠️ M-2a 起这只是**初始值**：运行期的权威开关是 `Purchases.shared.purchasesCompletedBy`
+    /// （运行时可写、热切立即生效）。判断「当前是谁在 finish」一律读门面属性，不要读这里。
     public private(set) var purchasesCompletedBy: PurchasesCompletedBy
     /// 后端 Base URL（契约 §1.1 `https://{API_HOST}/v1` 的 host 部分）。
     public private(set) var baseURL: URL
@@ -65,7 +72,10 @@ public struct Configuration: Sendable {
 }
 
 /// 谁负责 `finish()`（裁决 C4）。禁 public enum → struct + static。
-public struct PurchasesCompletedBy: Sendable, Hashable, CustomStringConvertible {
+///
+/// `Codable`：M-2a 把「发起购买那一刻的模式」快照进 `PendingPurchaseContext` 落盘，
+/// 保证跨崩溃重放时在途购买仍按发起时的模式做 finish 决策。
+public struct PurchasesCompletedBy: Sendable, Hashable, Codable, CustomStringConvertible {
 
     public let rawValue: String
 
@@ -217,6 +227,8 @@ public final class Purchases {
 
     public let attribution: Attribution
 
+    /// 运行时可写设置盒（M-2a / M-4）。`nonisolated` 可达 —— 见下面两个公开属性。
+    private let settings: RuntimeSettings
     private let orchestrator: PurchasesOrchestrator
     private var startTask: Task<Void, Never>?
     /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
@@ -231,6 +243,8 @@ public final class Purchases {
         Log.setLevel(configuration.logLevel)
 
         self.configuration = configuration
+        let settings = RuntimeSettings(purchasesCompletedBy: configuration.purchasesCompletedBy)
+        self.settings = settings
 
         let identity = IdentityManager(storage: dependencies.identityStorage)
         let httpClient = HTTPClient(apiKey: configuration.apiKey,
@@ -247,6 +261,7 @@ public final class Purchases {
         let attributesDirectory = dependencies.pendingPurchasesDirectory
             .appendingPathComponent("_attributes", isDirectory: true)
         let orchestrator = PurchasesOrchestrator(configuration: configuration,
+                                                  settings: settings,
                                                   identity: identity,
                                                   httpClient: httpClient,
                                                   deviceCache: deviceCache,
@@ -264,6 +279,61 @@ public final class Purchases {
         // 启动 Task 里再与持久化结果对齐（避免 configure 之后立刻读到空值）。
         self.appUserID = configuration.appUserID ?? IdentityManager.generateAnonymousAppUserID()
     }
+
+    // MARK: - 迁移开关与钩子（迁移方案 v2.1 §5 M-2a / M-4）
+
+    /// **谁负责 `finish()` —— 运行时可写、热切立即生效。**
+    ///
+    /// 双 SDK 共存期的权威开关（migration-strategy §1 档 1 ⇄ 档 2）。语义：
+    /// - 切换**立即**对之后发起的购买、以及之后观察到的交易生效；
+    /// - **进行中的购买沿用其发起时的模式**做 finish 决策（发起时已落盘快照）——
+    ///   否则宿主在购买弹窗还开着的时候翻开关，那笔交易就会挂着永不 finish；
+    /// - 观察者台账（坑 #10 / 裁决 #2）两种模式共用，切换不影响去重。
+    ///
+    /// `nonisolated`：与 RC 的 `Purchases.shared.purchasesAreCompletedBy` 同款同步可写
+    /// （verify/rc-sdk-observer-mode.md §8.1 判断 6）。开关翻转必须是**一个原子动作**：
+    /// 同一处同时切 RC 的 `purchasesAreCompletedBy`、Dog 的本属性、以及 UI 层购买入口
+    /// （同上 §8.2 建议 4）。接线模板见 docs/plan/dual-sdk-integration.md §3。
+    public nonisolated var purchasesCompletedBy: PurchasesCompletedBy {
+        get { settings.purchasesCompletedBy }
+        set {
+            let old = settings.purchasesCompletedBy
+            guard old != newValue else { return }
+            settings.purchasesCompletedBy = newValue
+            Log.info("purchasesCompletedBy 热切：\(old) → \(newValue)（在途购买沿用发起时的模式）",
+                     category: "purchase")
+        }
+    }
+
+    #if canImport(StoreKit)
+    /// **M-4 购买结果钩子**：Dog 自己发起的每次 `Product.purchase()` 返回后、
+    /// **Dog 调 `finish()` 之前**同步回调；`success` / `userCancelled` / `pending` 全都回调。
+    ///
+    /// 用途（档 2）：宿主原样转交 RC —— `try await RevenueCat.Purchases.shared.recordPurchase(result)`。
+    /// RC 在观察者模式下**必须**拿到这个回调，否则只剩「前台激活时读 `Transaction.all`、
+    /// 一次只报最新 1 条、其余永久静默丢弃」的脆弱兜底
+    /// （verify/rc-sdk-observer-mode.md §8.1 判断 3，`[源码]` 强）。
+    /// RC 收下之后 **finish 仍由 Dog 负责**（同上 判断 5）。
+    ///
+    /// 时序保证：回调在 SDK 上报后端之前、`finish()` 之前发生 —— 有单测上锁。
+    /// **不回调的唯一情形**：`StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18），
+    /// 它根本没有 `Product.PurchaseResult` 可交。
+    ///
+    /// 回调在发起购买的那条 Task 上**同步**执行，请只做转交、别做重活（RC 的
+    /// `recordPurchase` 是 async，宿主自行起 Task；见 dual-sdk-integration.md §4）。
+    ///
+    /// 为什么做成运行时可写属性、而不是 `Configuration.with(purchaseResultHandler:)`：
+    /// 1. 钩子必须能**随开关一起热切/热卸** —— 档 2 回滚到档 1 时 Dog 不再发起购买，
+    ///    钩子要能立刻摘掉，避免 RC 侧重复记账；`Configuration` 是 configure 时冻结的值。
+    /// 2. 与本次同样改成运行时可写的 `purchasesCompletedBy` 放在同一处，
+    ///    「一个原子动作切完权威」才写得出来（见上）。
+    /// 3. `Configuration` 是公开可读的 `Sendable` 值类型（`purchases.configuration`），
+    ///    往里塞闭包会让配置不再可比较、不可快照。
+    public nonisolated var purchaseResultHandler: (@Sendable (Product.PurchaseResult) -> Void)? {
+        get { settings.purchaseResultHandler }
+        set { settings.purchaseResultHandler = newValue }
+    }
+    #endif
 
     private func start() {
         AppStateProvider.refresh()
@@ -316,6 +386,15 @@ public final class Purchases {
 
     func applicationDidBecomeActive() {
         AppStateProvider.setBackgrounded(false)
+        // M-2b（迁移方案 v2.1 §1 档 1）：观察者模式下前台激活重扫
+        // `Transaction.unfinished ∪ currentEntitlements`，台账去重后上报。
+        // 依据 verify/storekit2-multi-listener.md §1 结论 3：**观察方不能指望从 `updates`
+        // 看到购买方 `purchase()` 返回的那笔**（Apple 只保证走 `PurchaseResult`）。
+        // 先 await 启动流程，避免与启动扫描叠加、也避免身份未就绪就上报。
+        Task { [weak self] in
+            await self?.awaitStart()
+            await self?.orchestrator.rescanOnForegroundIfObserving()
+        }
     }
 
     /// 等待 SDK 启动期初始化（供 `Attribution` 这类不持有 startTask 的协作方使用）。
@@ -374,6 +453,37 @@ public final class Purchases {
 
     public func invalidateCustomerInfoCache() {
         Task { [orchestrator] in await orchestrator.invalidateCustomerInfoCache() }
+    }
+
+    // MARK: - 权益 diff 上报（M-3 客户端半边，迁移方案 v2.1 §5）
+
+    /// 把 RC 与 Dog 的 `entitlements.active` 两份快照上报
+    /// `POST /v1/diagnostics/entitlement-diff`，服务端按日聚合成「按用户逐个的权益一致率」——
+    /// 档 1（观察者期）的**核心指标**与出口条件（migration-strategy §1 档 1）。
+    ///
+    /// - **匹配由服务端算，客户端不判**：端上只如实提供两份快照。端上判等会把
+    ///   「时钟偏移 / 3 天 grace / 缓存延迟」这些本该在服务端归因的差异提前吃掉。
+    /// - Dog 侧快照取**本地缓存**的 CustomerInfo（不发网）；完全没有缓存时才拉一次。
+    ///   上报 diff 不该改变被观测对象。
+    /// - 建议调用点：RC `customerInfoStream` 每次更新时调一次
+    ///   （接线模板 docs/plan/dual-sdk-integration.md §5）。**节流由服务端 cap**
+    ///   （每用户每天 ≤N 次），被 cap 掉的返回 `capped == true`。
+    /// - 该端点**不重试**（每次上报是一条独立观测样本，重发会污染日聚合分母）；
+    ///   失败即抛，宿主按 best-effort 吞掉即可。
+    ///
+    /// - Parameters:
+    ///   - rcActive: RC 侧 `customerInfo.entitlements.active` 的 `[权益ID: 到期时间]`；
+    ///     终身权益传 `nil`（会编码成 JSON `null`）。
+    ///   - rcRequestDate: RC 侧 `customerInfo.requestDate`（服务端时间），用于服务端归因时钟差。
+    ///   - rcSDKVersion: RC SDK 版本（可选，服务端用于按版本归因）。
+    @discardableResult
+    public func reportEntitlementDiff(rcActive: [String: Date?],
+                                      rcRequestDate: Date?,
+                                      rcSDKVersion: String? = nil) async throws -> EntitlementDiffResult {
+        await awaitStart()
+        return try await orchestrator.reportEntitlementDiff(rcActive: rcActive,
+                                                            rcRequestDate: rcRequestDate,
+                                                            rcSDKVersion: rcSDKVersion)
     }
 
     // MARK: - 商品与购买
