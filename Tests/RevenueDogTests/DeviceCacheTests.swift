@@ -139,8 +139,38 @@ struct DeviceCacheTests {
         // 另一个身份读不到（键含 appUserID 哈希）。
         #expect(await cache.cachedCustomerInfo(appUserID: "user_43") == nil)
 
-        // 显式失效。
-        await cache.invalidateCustomerInfoCache(appUserID: "user_42")
+        // 显式失效（失效代 +1，**同步**生效）。
+        cache.invalidation.invalidate()
+        #expect(await cache.isCustomerInfoInvalidated(appUserID: "user_42"))
         #expect(await cache.isCustomerInfoStale(appUserID: "user_42", now: now, isAppBackgrounded: false))
+        // 失效不删值：`.cachedOnly` 语义（RC：invalidate 只强制下一次 fetch）
+        #expect(await cache.cachedCustomerInfo(appUserID: "user_42") == info)
+
+        // 重新写入 = 追平当前失效代 → 回到「新鲜」
+        await cache.cache(customerInfo: info, appUserID: "user_42", now: now)
+        #expect(await cache.isCustomerInfoInvalidated(appUserID: "user_42") == false)
+        #expect(await cache.isCustomerInfoStale(appUserID: "user_42", now: now, isAppBackgrounded: false) == false)
+    }
+
+    @Test("失效代是单调计数器：多次 invalidate 只需一次重新写入即可追平；不同 DeviceCache 共用同一个盒子")
+    func invalidationGenerationIsMonotonic() async throws {
+        let invalidation = CustomerInfoCacheInvalidation()
+        let cache = DeviceCache(storage: InMemoryCacheStorage(), invalidation: invalidation)
+        let info = try CustomerInfo(
+            wireModel: JSONDecoder().decode(CustomerInfoWireModel.self,
+                                            from: Data(Fixtures.customerInfoOfficialExample.utf8))
+        )
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+        await cache.cache(customerInfo: info, appUserID: "user_42", now: now)
+        #expect(await cache.isCustomerInfoInvalidated(appUserID: "user_42") == false)
+
+        #expect(invalidation.invalidate() == 1)
+        #expect(invalidation.invalidate() == 2)
+        #expect(invalidation.current == 2)
+        #expect(await cache.isCustomerInfoInvalidated(appUserID: "user_42"))
+
+        await cache.cache(customerInfo: info, appUserID: "user_42", now: now)
+        #expect(await cache.isCustomerInfoInvalidated(appUserID: "user_42") == false)
     }
 }

@@ -47,7 +47,7 @@ CI 上**不设**该变量 —— 快照缺失或不一致直接失败。
 
 | 文件 | 用途 |
 |---|---|
-| `RevenueDog.json` | `swift-api-digester -dump-sdk` 的完整 API dump（机器读，喂 `-diagnose-sdk`） |
+| `RevenueDog.json` | `swift-api-digester -dump-sdk` 的完整 API dump（机器读，喂 `-diagnose-sdk`）。**已 gitignore**：612KB 的机器产物不进库，`update` 时在本地重建；缺它时 `check` 照常工作，只是不再附带破坏性变更分类 |
 | `RevenueDog.public-api.txt` | 从 dump 抽出的**排序后全限定符号清单**，逐行可 review —— `check` 的判据就是它 |
 
 要点：
@@ -67,6 +67,11 @@ SDK 侧声明：
 - Required Reason API 只有一条：`NSPrivacyAccessedAPICategoryUserDefaults` / `CA92.1`
   （身份与归因状态存自家私有键）。文件时间戳 / 系统启动时间 / 磁盘空间 / 键盘 类 API 全仓零使用，因此不声明。
 - 收集的数据类型：购买历史、用户 ID、设备 ID（`install_id` / AdServices token）、其它诊断数据；全部 `Linked = true`、`Tracking = false`。
+
+> **维护触发条件**：诊断请求头（`X-Platform-Device` / `X-Preferred-Locales` / `X-Storefront` 等）
+> 目前**不声明** —— 依据是服务端只把它们用于实时服务、不落库。
+> **一旦服务端把这些头写进 D1 / Analytics Engine 做长期留存，必须回来补声明**
+> （对应的数据类型进 `NSPrivacyCollectedDataTypes`）。改服务端留存策略时请一并回看本节。
 
 > **宿主需要自己声明的部分**：隐私清单是 per-target 的。如果你的 App 调用了
 > `setEmail` / `setPhoneNumber` / `setDisplayName` 这类保留属性 setter，
@@ -109,7 +114,8 @@ SDK 侧声明：
 | `RevenueDog-StoreKit.xctestplan` | 测试计划模板，`storeKitConfigurationFileReference` 已指向 `.storekit` |
 
 > 这些文件**不在** `swift test` 的编译范围内 —— 内部注入点（`Purchases.Dependencies`）改名不会被 CI 挡住，
-> 属于已知的静默腐坏风险点。
+> 属于已知的静默腐坏风险点。**处置：M4 第二批建宿主示例 app 工程时把这个 target 纳入 CI**，
+> 在那之前它只是素材，改内部 API 时请手动回看一眼。
 
 现有单测直接跑上 iOS Simulator（不涉及 StoreKitTest）：
 

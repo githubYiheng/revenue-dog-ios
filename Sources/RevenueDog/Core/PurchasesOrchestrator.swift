@@ -321,11 +321,6 @@ actor PurchasesOrchestrator {
         return await deviceCache.cachedCustomerInfo(appUserID: appUserID)
     }
 
-    func invalidateCustomerInfoCache() async {
-        guard let appUserID = await identity.currentAppUserIDIfAny else { return }
-        await deviceCache.invalidateCustomerInfoCache(appUserID: appUserID)
-    }
-
     private func fetchCustomerInfo(appUserID: String) async throws -> (info: CustomerInfo, created: Bool) {
         let response = try await httpClient.perform(.getCustomerInfo(appUserID: appUserID),
                                                     as: CustomerInfoWireModel.self)

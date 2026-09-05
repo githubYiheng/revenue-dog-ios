@@ -234,6 +234,8 @@ public final class Purchases {
 
     /// 运行时可写设置盒（M-2a / M-4）。`nonisolated` 可达 —— 见下面两个公开属性。
     private let settings: RuntimeSettings
+    /// CustomerInfo 缓存失效代 —— `invalidateCustomerInfoCache()` 靠它**同步**生效。
+    private let cacheInvalidation: CustomerInfoCacheInvalidation
     private let orchestrator: PurchasesOrchestrator
     private var startTask: Task<Void, Never>?
     /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
@@ -257,7 +259,9 @@ public final class Purchases {
                                     transport: dependencies.transport,
                                     retryPolicy: dependencies.networkRetryPolicy,
                                     scheduler: dependencies.networkDelayScheduler)
-        let deviceCache = DeviceCache(storage: dependencies.cacheStorage)
+        let cacheInvalidation = CustomerInfoCacheInvalidation()
+        self.cacheInvalidation = cacheInvalidation
+        let deviceCache = DeviceCache(storage: dependencies.cacheStorage, invalidation: cacheInvalidation)
         let pending = PendingPurchaseStore(directory: dependencies.pendingPurchasesDirectory)
 
         // 台账放注入目录的子目录（pending 枚举只认根级 *.json，不会误读）→ 与实例同生命周期，测试天然隔离
@@ -458,8 +462,15 @@ public final class Purchases {
         return stream
     }
 
+    /// 作废本地 CustomerInfo 缓存，强制**下一次** fetch 走网络。
+    ///
+    /// **同步生效**：失效代在本方法返回前就已经 +1，紧接着的
+    /// `customerInfo(fetchPolicy:)`（除 `.cachedOnly` 外）必然发请求 ——
+    /// 不再像之前那样把失效动作丢进 fire-and-forget `Task` 与调用方赛跑。
+    ///
+    /// `.cachedOnly` 不受影响（RC 语义：invalidate 只强制下一次 fetch，不是删缓存）。
     public func invalidateCustomerInfoCache() {
-        Task { [orchestrator] in await orchestrator.invalidateCustomerInfoCache() }
+        cacheInvalidation.invalidate()
     }
 
     // MARK: - 权益 diff 上报（M-3 客户端半边，迁移方案 v2.1 §5）

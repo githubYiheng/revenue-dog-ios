@@ -150,11 +150,8 @@ Func Store.hash(into:)
 Func StoreProduct.__derived_struct_equals(_:_:)  [Implements]
 Func StoreProduct.encode(to:)
 Func StoreProduct.hash(into:)
-Func StoreTransactionType.finish()
 Protocol LogSink
 Protocol PurchasesDelegate  [Custom]
-Protocol StoreProductType
-Protocol StoreTransactionType
 Struct Configuration
 Struct CustomerInfo
 Struct EntitlementDiffResult
@@ -378,22 +375,3 @@ Var StoreProduct.localizedPriceString  [HasStorage]
 Var StoreProduct.localizedTitle  [HasStorage]
 Var StoreProduct.price  [HasStorage]
 Var StoreProduct.productIdentifier  [HasStorage]
-Var StoreProductType.currencyCode
-Var StoreProductType.isSubscription
-Var StoreProductType.localizedDescription
-Var StoreProductType.localizedPriceString
-Var StoreProductType.localizedTitle
-Var StoreProductType.price
-Var StoreProductType.productIdentifier
-Var StoreProductType.storeProduct
-Var StoreTransactionType.appAccountToken
-Var StoreTransactionType.expirationDate
-Var StoreTransactionType.isFinished
-Var StoreTransactionType.isUpgraded
-Var StoreTransactionType.jwsRepresentation
-Var StoreTransactionType.originalTransactionIdentifier
-Var StoreTransactionType.productIdentifier
-Var StoreTransactionType.purchaseDate
-Var StoreTransactionType.quantity
-Var StoreTransactionType.revocationDate
-Var StoreTransactionType.transactionIdentifier

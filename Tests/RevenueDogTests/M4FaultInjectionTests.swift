@@ -549,8 +549,8 @@ struct M4OfflineColdStartTests {
 
     /// 把已落盘的 CustomerInfo 缓存条目「做旧」到 TTL 之外（前台 5min）。
     ///
-    /// 为什么不用 `invalidateCustomerInfoCache()`：它是 fire-and-forget 的 `Task`，
-    /// 紧接着读缓存会与失效标记赛跑 —— 测试要的是确定性，直接改 `cachedAt` 最诚实。
+    /// 这里刻意**不用** `invalidateCustomerInfoCache()`：本组要验的是 TTL 这一根轴
+    /// （「缓存到点了、拉网又失败」），失效代是另一根轴（见「缓存失效代」suite）。
     /// 必须在**创建离线实例之前**做旧：DeviceCache 有内存层，实例起来后再改磁盘不生效。
     static func ageCachedCustomerInfo(_ storage: any CacheStorage,
                                       appUserID: String,
@@ -741,6 +741,62 @@ struct M4PendingPurchaseTests {
         #expect(flag.callCount == 1)
         #expect(await PendingPurchaseStore(directory: dir).all().isEmpty) // 配对后按 txID 键收尾
         #expect(await transport.callCount(forPath: receiptsPath) == 1)    // 不重复配对、不重复上报
+    }
+}
+}
+
+// MARK: - 5. `invalidateCustomerInfoCache()` 同步生效（失效代）
+
+extension PurchasesSingletonDomain {
+@MainActor
+@Suite("M4 收尾 · 缓存失效代", .serialized)
+struct M4CacheInvalidationTests {
+
+    /// 旧实现把失效动作丢进 fire-and-forget `Task`，「invalidate 完立刻读」会与它赛跑。
+    /// 现在失效代在 `invalidateCustomerInfoCache()` 返回前就 +1 —— 本例**不含任何 sleep/轮询**，
+    /// 紧接着的一行就断言必然发了网络请求。
+    @Test("invalidate 后**立即**调 customerInfo() 必然走网络（无 sleep、无轮询）")
+    func invalidateTakesEffectSynchronously() async throws {
+        let transport = MockTransport(stubs: [.json(subscriberJSON())])
+        let purchases = makeRig(directory: tempDirectory(), transport: transport, storeKit: nil,
+                                identityStorage: InMemoryIdentityStorage(),
+                                cacheStorage: InMemoryCacheStorage())
+
+        _ = try await purchases.customerInfo()
+        let afterFirstFetch = await transport.callCount
+        #expect(afterFirstFetch == 1)
+
+        // 缓存新鲜 → 第二次不发请求
+        _ = try await purchases.customerInfo()
+        #expect(await transport.callCount == afterFirstFetch)
+
+        purchases.invalidateCustomerInfoCache()   // 同步生效
+        _ = try await purchases.customerInfo()
+        #expect(await transport.callCount == afterFirstFetch + 1)
+
+        // 拉回来的新值又追平了失效代 → 再读一次回到命中缓存
+        _ = try await purchases.customerInfo()
+        #expect(await transport.callCount == afterFirstFetch + 1)
+    }
+
+    @Test("invalidate 对 .notStaleCachedOrFetched 同样生效；对 .cachedOnly 不生效（只强制下一次 fetch，不是删缓存）")
+    func invalidateSemanticsPerFetchPolicy() async throws {
+        let transport = MockTransport(stubs: [.json(subscriberJSON())])
+        let purchases = makeRig(directory: tempDirectory(), transport: transport, storeKit: nil,
+                                identityStorage: InMemoryIdentityStorage(),
+                                cacheStorage: InMemoryCacheStorage())
+        _ = try await purchases.customerInfo()
+        let baseline = await transport.callCount
+
+        purchases.invalidateCustomerInfoCache()
+        // .cachedOnly：仍然返回旧值，且一个请求都不发
+        let cached = try await purchases.customerInfo(fetchPolicy: .cachedOnly)
+        #expect(cached.originalAppUserID == "tester")
+        #expect(await transport.callCount == baseline)
+
+        // .notStaleCachedOrFetched：走网络
+        _ = try await purchases.customerInfo(fetchPolicy: .notStaleCachedOrFetched)
+        #expect(await transport.callCount == baseline + 1)
     }
 }
 }

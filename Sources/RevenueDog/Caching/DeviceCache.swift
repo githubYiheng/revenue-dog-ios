@@ -8,6 +8,7 @@
 
 import Foundation
 import CryptoKit
+import os
 
 // MARK: - 3 天 grace（设计 §4「必抄」）
 
@@ -82,6 +83,40 @@ enum CacheKey {
     }
 }
 
+// MARK: - 缓存失效代（`invalidateCustomerInfoCache()` 的同步生效机制）
+
+/// `Purchases.invalidateCustomerInfoCache()` 必须**同步返回且同步生效**（对齐 RC 的同名 API）。
+///
+/// 之前的做法是把失效动作丢进 fire-and-forget `Task`，于是「invalidate 之后紧接着读」
+/// 会与那个 Task 赛跑 —— 宿主最常见的「失效后立刻刷新」写法有概率读到旧缓存。
+///
+/// 现在改成**失效代**（generation）：
+/// - 本类型持一个受锁保护的单调计数器，`invalidate()` 同步 +1；
+/// - `DeviceCache` 在写入缓存条目时记下**当时**的代号；
+/// - 读的时候「条目代号 < 当前代号」即视为已失效。
+///
+/// 计数器是**进程内**语义（`invalidate` 只强制下一次 fetch，不涉及磁盘），
+/// 冷启动时代号归零、磁盘条目按代号 0 处理 —— 与「失效只影响本次运行」的意图一致。
+/// 全局一个计数器而不是按 appUserID 分桶：公开 API 本身没有用户参数，
+/// 且门面在启动期解析出真实 appUserID 之前就可能被调用，按键分桶反而会把失效打到错误的键上。
+final class CustomerInfoCacheInvalidation: Sendable {
+
+    private let state = OSAllocatedUnfairLock(initialState: UInt64(0))
+
+    /// 同步递增失效代，返回新值。
+    @discardableResult
+    func invalidate() -> UInt64 {
+        state.withLock { generation in
+            generation += 1
+            return generation
+        }
+    }
+
+    var current: UInt64 {
+        state.withLock { $0 }
+    }
+}
+
 // MARK: - DeviceCache
 
 /// 设计 §6：全 actor 化，零自定义锁。
@@ -95,11 +130,16 @@ actor DeviceCache {
     private let storage: any CacheStorage
     private var customerInfoEntries: [String: Entry<CustomerInfo>] = [:]
     private var offeringsEntries: [String: Entry<Offerings>] = [:]
-    /// `invalidateCustomerInfoCache()` 打的强制失效标记（按 appUserID 哈希键）。
-    private var invalidatedCustomerInfoKeys: Set<String> = []
+    /// 每个 CustomerInfo 缓存条目**写入时**观测到的失效代。磁盘上读回来的条目没有记录 → 按 0 处理。
+    private var customerInfoGenerations: [String: UInt64] = [:]
 
-    init(storage: any CacheStorage) {
+    /// 失效代（同步生效）。`nonisolated let` + Sendable → 门面可以在主线程同步调 `invalidate()`。
+    nonisolated let invalidation: CustomerInfoCacheInvalidation
+
+    init(storage: any CacheStorage,
+         invalidation: CustomerInfoCacheInvalidation = CustomerInfoCacheInvalidation()) {
         self.storage = storage
+        self.invalidation = invalidation
     }
 
     // MARK: CustomerInfo
@@ -110,22 +150,24 @@ actor DeviceCache {
 
     /// 是否需要刷新。5xx 时上层可以忽略这个判定直接供给 stale 缓存（设计 §4）。
     func isCustomerInfoStale(appUserID: String, now: Date = Date(), isAppBackgrounded: Bool) async -> Bool {
-        let key = CacheKey.customerInfo(appUserID: appUserID)
-        if invalidatedCustomerInfoKeys.contains(key) { return true }
+        if isCustomerInfoInvalidated(appUserID: appUserID) { return true }
         let entry = await entryForCustomerInfo(appUserID: appUserID)
         return CacheTTL.isStale(cachedAt: entry?.cachedAt, now: now, isAppBackgrounded: isAppBackgrounded)
+    }
+
+    /// 条目是否已被 `invalidateCustomerInfoCache()` 作废（条目代号 < 当前失效代）。
+    func isCustomerInfoInvalidated(appUserID: String) -> Bool {
+        let key = CacheKey.customerInfo(appUserID: appUserID)
+        return (customerInfoGenerations[key] ?? 0) < invalidation.current
     }
 
     func cache(customerInfo: CustomerInfo, appUserID: String, now: Date = Date()) async {
         let key = CacheKey.customerInfo(appUserID: appUserID)
         let entry = Entry(value: customerInfo, cachedAt: now)
         customerInfoEntries[key] = entry
-        invalidatedCustomerInfoKeys.remove(key)
+        // 写入即「追平」当前失效代 —— 这一份是失效之后重新拉到的权威数据。
+        customerInfoGenerations[key] = invalidation.current
         await storage.write(entry, forKey: key)
-    }
-
-    func invalidateCustomerInfoCache(appUserID: String) {
-        invalidatedCustomerInfoKeys.insert(CacheKey.customerInfo(appUserID: appUserID))
     }
 
     private func entryForCustomerInfo(appUserID: String) async -> Entry<CustomerInfo>? {
@@ -167,6 +209,7 @@ actor DeviceCache {
     /// logOut 时把当前身份的缓存从内存里摘掉（磁盘上的按哈希键天然隔离）。
     func clearMemoryCache(appUserID: String) {
         customerInfoEntries.removeValue(forKey: CacheKey.customerInfo(appUserID: appUserID))
+        customerInfoGenerations.removeValue(forKey: CacheKey.customerInfo(appUserID: appUserID))
         offeringsEntries.removeValue(forKey: CacheKey.offerings(appUserID: appUserID))
     }
 }

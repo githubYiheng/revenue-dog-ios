@@ -21,7 +21,12 @@ import AppKit
 // MARK: - 交易
 
 /// 交易抽象。`Transaction` 的 SDK 侧只读视图。
-public protocol StoreTransactionType: Sendable {
+///
+/// **internal**：这是 StoreKit 的注入缝，只服务 SDK 内部与单测（`@testable import`）。
+/// 曾经是 `public` —— 但公开 protocol 意味着宿主可以 conform，之后往里加任何一条要求
+/// 都是破坏性变更；而公开面上没有任何类型暴露它（`StoreProduct` 是独立的值类型），
+/// 收窄零代价。M4 API 基线冻结时一并处理。
+protocol StoreTransactionType: Sendable {
     var transactionIdentifier: String { get }
     var originalTransactionIdentifier: String { get }
     var productIdentifier: String { get }
@@ -41,8 +46,8 @@ public protocol StoreTransactionType: Sendable {
     func finish() async
 }
 
-/// 商品抽象。
-public protocol StoreProductType: Sendable {
+/// 商品抽象。**internal**，理由同 `StoreTransactionType`。
+protocol StoreProductType: Sendable {
     var productIdentifier: String { get }
     var localizedTitle: String { get }
     var localizedDescription: String { get }
@@ -56,7 +61,7 @@ public protocol StoreProductType: Sendable {
 extension StoreProductType {
 
     /// 转成公开模型。
-    public var storeProduct: StoreProduct {
+    var storeProduct: StoreProduct {
         StoreProduct(productIdentifier: productIdentifier,
                      localizedTitle: localizedTitle,
                      localizedDescription: localizedDescription,
