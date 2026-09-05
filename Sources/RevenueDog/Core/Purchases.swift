@@ -180,6 +180,11 @@ public final class Purchases {
         var storeKit: (any StoreKitProvider)?
         /// P4 轮询等待的调度器；测试注入 NoDelayScheduler。
         var delayScheduler: any DelayScheduler = TaskDelayScheduler()
+        /// 网络层重试策略（设计 §5）。M4 故障注入测试靠它把「重试几次」变成可断言的常量。
+        var networkRetryPolicy: RetryPolicy = .default
+        /// 网络层退避等待的调度器。与 `delayScheduler`（P4 可见性轮询）分开：
+        /// 故障注入测试要既不真睡、又能**记录**每次退避时长（验证 Retry-After 优先）。
+        var networkDelayScheduler: any DelayScheduler = TaskDelayScheduler()
         /// ASA 归因端状态（install_id + 已采集标记）。测试注入 InMemory 版避免污染 UserDefaults。
         var attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage()
         /// AdServices token 取值面（坑 #83/#84：协议隔离，模拟器/无框架平台优雅降级）。
@@ -249,7 +254,9 @@ public final class Purchases {
         let identity = IdentityManager(storage: dependencies.identityStorage)
         let httpClient = HTTPClient(apiKey: configuration.apiKey,
                                     baseURL: configuration.baseURL,
-                                    transport: dependencies.transport)
+                                    transport: dependencies.transport,
+                                    retryPolicy: dependencies.networkRetryPolicy,
+                                    scheduler: dependencies.networkDelayScheduler)
         let deviceCache = DeviceCache(storage: dependencies.cacheStorage)
         let pending = PendingPurchaseStore(directory: dependencies.pendingPurchasesDirectory)
 

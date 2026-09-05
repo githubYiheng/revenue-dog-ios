@@ -1,0 +1,28 @@
+{
+  "configurations" : [
+    {
+      "id" : "B7E1C0A2-0000-4000-9000-524556444F47",
+      "name" : "StoreKitTest (iOS 18 Simulator)",
+      "options" : {
+        "storeKitConfigurationFileReference" : {
+          "identifier" : "../../Tests/StoreKitTestSupport/RevenueDog.storekit"
+        }
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "testExecutionOrdering" : "sequential",
+    "testTimeoutsEnabled" : true,
+    "maximumTestExecutionTimeAllowance" : 120
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:ExampleApp.xcodeproj",
+        "identifier" : "REPLACE_WITH_HOST_TEST_TARGET_ID",
+        "name" : "RevenueDogStoreKitTests"
+      }
+    }
+  ],
+  "version" : 1
+}

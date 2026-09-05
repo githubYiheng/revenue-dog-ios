@@ -21,6 +21,12 @@ let package = Package(
         .target(
             name: "RevenueDog",
             path: "Sources/RevenueDog",
+            // Apple 隐私清单（核实见 docs/research/verify/ios-privacy-manifest.md）。
+            // `.copy` 而非 `.process`：官方语义是「原样打进资源 bundle」，
+            // 不加这一行清单不会进产物，SwiftPM 还会报 unhandled resource 警告。
+            resources: [
+                .copy("PrivacyInfo.xcprivacy"),
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .enableUpcomingFeature("ExistentialAny"),

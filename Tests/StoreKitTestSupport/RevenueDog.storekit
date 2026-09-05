@@ -1,0 +1,81 @@
+{
+  "identifier" : "RD000001",
+  "nonRenewingSubscriptions" : [ ],
+  "products" : [
+    {
+      "displayPrice" : "0.99",
+      "familyShareable" : false,
+      "internalID" : "1000000001",
+      "localizations" : [
+        {
+          "description" : "100 枚金币（消耗型，用于 non_subscriptions 上报路径）",
+          "displayName" : "100 Coins",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.demo.coins",
+      "referenceName" : "Demo Coins (Consumable)",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "1234567890",
+    "_developerTeamID" : "ABCDE12345",
+    "_lastSynchronizedDate" : 0
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "2000000001",
+      "localizations" : [ ],
+      "name" : "Demo Pro",
+      "subscriptions" : [
+        {
+          "adHocOffers" : [ ],
+          "codeOffers" : [ ],
+          "displayPrice" : "9.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "3000000001",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Demo Pro 月订阅",
+              "displayName" : "Demo Pro Monthly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.demo.monthly",
+          "recurringSubscriptionPeriod" : "P1M",
+          "referenceName" : "Demo Pro Monthly",
+          "subscriptionGroupID" : "2000000001",
+          "type" : "RecurringSubscription"
+        },
+        {
+          "adHocOffers" : [ ],
+          "codeOffers" : [ ],
+          "displayPrice" : "99.99",
+          "familyShareable" : false,
+          "groupNumber" : 1,
+          "internalID" : "3000000002",
+          "introductoryOffer" : null,
+          "localizations" : [
+            {
+              "description" : "Demo Pro 年订阅（同组升降级路径）",
+              "displayName" : "Demo Pro Yearly",
+              "locale" : "en_US"
+            }
+          ],
+          "productID" : "com.demo.yearly",
+          "recurringSubscriptionPeriod" : "P1Y",
+          "referenceName" : "Demo Pro Yearly",
+          "subscriptionGroupID" : "2000000001",
+          "type" : "RecurringSubscription"
+        }
+      ]
+    }
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

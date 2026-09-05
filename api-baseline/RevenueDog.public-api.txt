@@ -1,0 +1,399 @@
+Class Attribution  [Final]
+Class Purchases  [Custom,Final]
+Constructor Configuration.init(apiKey:)
+Constructor CustomerInfo.init(from:)
+Constructor EntitlementDiffResult.Diff.init(from:)
+Constructor EntitlementDiffResult.Diff.init(onlyRC:onlyDog:expiresMismatch:)
+Constructor EntitlementDiffResult.init(from:)
+Constructor EntitlementDiffResult.init(match:diff:capped:)
+Constructor EntitlementInfo.init(from:)
+Constructor EntitlementInfos.init(all:requestDate:)
+Constructor EntitlementInfos.init(from:)
+Constructor FetchPolicy.init(rawValue:)
+Constructor InitiationSource.init(from:)
+Constructor InitiationSource.init(rawValue:)
+Constructor Money.init(amount:currency:)
+Constructor Money.init(from:)
+Constructor Offering.init(from:)
+Constructor Offerings.init(from:)
+Constructor OwnershipType.init(from:)
+Constructor OwnershipType.init(rawValue:)
+Constructor Package.init(from:)
+Constructor PackageType.init(from:)
+Constructor PackageType.init(rawValue:)
+Constructor PeriodType.init(from:)
+Constructor PeriodType.init(rawValue:)
+Constructor PurchaseResult.init(customerInfo:transactionIdentifier:userCancelled:)
+Constructor PurchasesCompletedBy.init(from:)
+Constructor PurchasesCompletedBy.init(rawValue:)
+Constructor PurchasesError.init(code:message:backendCode:httpStatusCode:userInfo:underlyingError:)
+Constructor Store.init(from:)
+Constructor Store.init(rawValue:)
+Constructor StoreProduct.init(from:)
+Constructor StoreProduct.init(productIdentifier:localizedTitle:localizedDescription:price:currencyCode:localizedPriceString:)
+Enum PurchaseUIContext  [Custom]
+Func Attribution.enableAdServicesAttributionTokenCollection()  [Final]
+Func Configuration.with(appUserID:)
+Func Configuration.with(baseURL:)
+Func Configuration.with(logLevel:)
+Func Configuration.with(purchasesCompletedBy:)
+Func CustomerInfo.__derived_struct_equals(_:_:)  [Implements]
+Func CustomerInfo.encode(to:)
+Func CustomerInfo.hash(into:)
+Func EntitlementDiffResult.Diff.__derived_struct_equals(_:_:)  [Implements]
+Func EntitlementDiffResult.Diff.encode(to:)
+Func EntitlementDiffResult.Diff.hash(into:)
+Func EntitlementDiffResult.__derived_struct_equals(_:_:)  [Implements]
+Func EntitlementDiffResult.encode(to:)
+Func EntitlementDiffResult.hash(into:)
+Func EntitlementInfo.__derived_struct_equals(_:_:)  [Implements]
+Func EntitlementInfo.encode(to:)
+Func EntitlementInfo.hash(into:)
+Func EntitlementInfo.isActive(referenceDate:)
+Func EntitlementInfos.__derived_struct_equals(_:_:)  [Implements]
+Func EntitlementInfos.active(now:)
+Func EntitlementInfos.encode(to:)
+Func EntitlementInfos.hash(into:)
+Func FetchPolicy.__derived_struct_equals(_:_:)  [Implements]
+Func FetchPolicy.hash(into:)
+Func InitiationSource.__derived_struct_equals(_:_:)  [Implements]
+Func InitiationSource.encode(to:)
+Func InitiationSource.hash(into:)
+Func LogLevel.<(_:_:)
+Func LogLevel.__derived_struct_equals(_:_:)  [Implements]
+Func LogLevel.hash(into:)
+Func LogSink.write(level:category:message:file:line:)
+Func Money.__derived_struct_equals(_:_:)  [Implements]
+Func Money.decimalString(_:)
+Func Money.encode(to:)
+Func Money.hash(into:)
+Func Offering.__derived_struct_equals(_:_:)  [Implements]
+Func Offering.encode(to:)
+Func Offering.hash(into:)
+Func Offering.package(ofType:)
+Func Offerings.__derived_struct_equals(_:_:)  [Implements]
+Func Offerings.encode(to:)
+Func Offerings.hash(into:)
+Func OwnershipType.__derived_struct_equals(_:_:)  [Implements]
+Func OwnershipType.encode(to:)
+Func OwnershipType.hash(into:)
+Func Package.__derived_struct_equals(_:_:)  [Implements]
+Func Package.encode(to:)
+Func Package.hash(into:)
+Func PackageType.__derived_struct_equals(_:_:)  [Implements]
+Func PackageType.encode(to:)
+Func PackageType.hash(into:)
+Func PeriodType.__derived_struct_equals(_:_:)  [Implements]
+Func PeriodType.encode(to:)
+Func PeriodType.hash(into:)
+Func Purchases.configure(with:)  [Custom,DiscardableResult,Final]
+Func Purchases.customerInfo(fetchPolicy:)  [Custom,Final]
+Func Purchases.invalidateCustomerInfoCache()  [Custom,Final]
+Func Purchases.logIn(_:)  [Custom,Final]
+Func Purchases.logOut()  [Custom,Final]
+Func Purchases.offerings()  [Custom,Final]
+Func Purchases.purchase(package:)  [Custom,Final]
+Func Purchases.purchase(product:)  [Custom,Final]
+Func Purchases.reportEntitlementDiff(rcActive:rcRequestDate:rcSDKVersion:)  [Custom,DiscardableResult,Final]
+Func Purchases.restorePurchases()  [Custom,Final]
+Func Purchases.setATTConsentStatus(_:)  [Custom,Final]
+Func Purchases.setAd(_:)  [Custom,Final]
+Func Purchases.setAdGroup(_:)  [Custom,Final]
+Func Purchases.setAdjustID(_:)  [Custom,Final]
+Func Purchases.setAirshipChannelID(_:)  [Custom,Final]
+Func Purchases.setAmplitudeDeviceID(_:)  [Custom,Final]
+Func Purchases.setAmplitudeUserID(_:)  [Custom,Final]
+Func Purchases.setAppleRefundHandlingPreference(_:)  [Custom,Final]
+Func Purchases.setAppsflyerID(_:)  [Custom,Final]
+Func Purchases.setAppstackID(_:)  [Custom,Final]
+Func Purchases.setAttributes(_:)  [Custom,Final]
+Func Purchases.setBrazeAliasLabel(_:)  [Custom,Final]
+Func Purchases.setBrazeAliasName(_:)  [Custom,Final]
+Func Purchases.setCampaign(_:)  [Custom,Final]
+Func Purchases.setCleverTapID(_:)  [Custom,Final]
+Func Purchases.setCreative(_:)  [Custom,Final]
+Func Purchases.setCustomerioID(_:)  [Custom,Final]
+Func Purchases.setDeviceVersion(_:)  [Custom,Final]
+Func Purchases.setDisplayName(_:)  [Custom,Final]
+Func Purchases.setEmail(_:)  [Custom,Final]
+Func Purchases.setFBAnonymousID(_:)  [Custom,Final]
+Func Purchases.setFCMToken(_:)  [Custom,Final]
+Func Purchases.setFirebaseAppInstanceID(_:)  [Custom,Final]
+Func Purchases.setIDFA(_:)  [Custom,Final]
+Func Purchases.setIDFV(_:)  [Custom,Final]
+Func Purchases.setIterableCampaignID(_:)  [Custom,Final]
+Func Purchases.setIterableTemplateID(_:)  [Custom,Final]
+Func Purchases.setIterableUserID(_:)  [Custom,Final]
+Func Purchases.setKeyword(_:)  [Custom,Final]
+Func Purchases.setKochavaDeviceID(_:)  [Custom,Final]
+Func Purchases.setLogSink(_:)  [Custom,Final]
+Func Purchases.setMediaSource(_:)  [Custom,Final]
+Func Purchases.setMixpanelDistinctID(_:)  [Custom,Final]
+Func Purchases.setMparticleID(_:)  [Custom,Final]
+Func Purchases.setOnesignalID(_:)  [Custom,Final]
+Func Purchases.setPhoneNumber(_:)  [Custom,Final]
+Func Purchases.setPostHogUserID(_:)  [Custom,Final]
+Func Purchases.setPushToken(_:)  [Custom,Final]
+Func Purchases.setTenjinID(_:)  [Custom,Final]
+Func Purchases.syncAttributesIfNeeded()  [Custom,Final]
+Func Purchases.syncPurchases()  [Custom,Final]
+Func PurchasesCompletedBy.__derived_struct_equals(_:_:)  [Implements]
+Func PurchasesCompletedBy.encode(to:)
+Func PurchasesCompletedBy.hash(into:)
+Func PurchasesDelegate.purchases(_:receivedUpdated:)  [Custom]
+Func PurchasesErrorCode.__derived_struct_equals(_:_:)  [Implements]
+Func PurchasesErrorCode.hash(into:)
+Func PurchasesErrorCode.unknown(rawValue:)
+Func Store.__derived_struct_equals(_:_:)  [Implements]
+Func Store.encode(to:)
+Func Store.hash(into:)
+Func StoreProduct.__derived_struct_equals(_:_:)  [Implements]
+Func StoreProduct.encode(to:)
+Func StoreProduct.hash(into:)
+Func StoreTransactionType.finish()
+Protocol LogSink
+Protocol PurchasesDelegate  [Custom]
+Protocol StoreProductType
+Protocol StoreTransactionType
+Struct Configuration
+Struct CustomerInfo
+Struct EntitlementDiffResult
+Struct EntitlementDiffResult.Diff
+Struct EntitlementInfo
+Struct EntitlementInfos
+Struct FetchPolicy
+Struct InitiationSource
+Struct LogLevel
+Struct Money
+Struct Offering
+Struct Offerings
+Struct OwnershipType
+Struct Package
+Struct PackageType
+Struct PeriodType
+Struct PurchaseResult
+Struct PurchasesCompletedBy
+Struct PurchasesError
+Struct PurchasesErrorCode
+Struct Store
+Struct StoreProduct
+Subscript EntitlementInfos.subscript(_:)
+Subscript Offering.subscript(_:)
+Subscript Offerings.subscript(_:)
+Var Configuration.apiKey  [HasStorage]
+Var Configuration.appUserID  [HasInitialValue,HasStorage,SetterAccess]
+Var Configuration.baseURL  [HasStorage,SetterAccess]
+Var Configuration.defaultBaseURL  [HasInitialValue,HasStorage]
+Var Configuration.logLevel  [HasStorage,SetterAccess]
+Var Configuration.purchasesCompletedBy  [HasStorage,SetterAccess]
+Var CustomerInfo.activeSubscriptionProductIdentifiers  [HasStorage]
+Var CustomerInfo.allPurchasedProductIdentifiers  [HasStorage]
+Var CustomerInfo.entitlements  [HasStorage]
+Var CustomerInfo.firstSeen  [HasStorage]
+Var CustomerInfo.hashValue
+Var CustomerInfo.lastSeen  [HasStorage]
+Var CustomerInfo.managementURL  [HasStorage]
+Var CustomerInfo.nonSubscriptionTransactionIdentifiers  [HasStorage]
+Var CustomerInfo.originalAppUserID  [HasStorage]
+Var CustomerInfo.originalApplicationVersion  [HasStorage]
+Var CustomerInfo.originalPurchaseDate  [HasStorage]
+Var CustomerInfo.requestDate  [HasStorage]
+Var EntitlementDiffResult.Diff.expiresMismatch  [HasStorage]
+Var EntitlementDiffResult.Diff.hashValue
+Var EntitlementDiffResult.Diff.onlyDog  [HasStorage]
+Var EntitlementDiffResult.Diff.onlyRC  [HasStorage]
+Var EntitlementDiffResult.capped  [HasStorage]
+Var EntitlementDiffResult.diff  [HasStorage]
+Var EntitlementDiffResult.hashValue
+Var EntitlementDiffResult.match  [HasStorage]
+Var EntitlementInfo.billingIssueDetectedAt  [HasStorage]
+Var EntitlementInfo.expirationDate  [HasStorage]
+Var EntitlementInfo.gracePeriodExpiresDate  [HasStorage]
+Var EntitlementInfo.hashValue
+Var EntitlementInfo.identifier  [HasStorage]
+Var EntitlementInfo.isLifetime
+Var EntitlementInfo.isSandbox  [HasStorage]
+Var EntitlementInfo.latestPurchaseDate  [HasStorage]
+Var EntitlementInfo.originalPurchaseDate  [HasStorage]
+Var EntitlementInfo.ownershipType  [HasStorage]
+Var EntitlementInfo.periodType  [HasStorage]
+Var EntitlementInfo.productIdentifier  [HasStorage]
+Var EntitlementInfo.requestDate  [HasStorage]
+Var EntitlementInfo.store  [HasStorage]
+Var EntitlementInfo.unsubscribeDetectedAt  [HasStorage]
+Var EntitlementInfo.willRenew
+Var EntitlementInfos.active
+Var EntitlementInfos.all  [HasStorage]
+Var EntitlementInfos.hashValue
+Var EntitlementInfos.requestDate  [HasStorage]
+Var FetchPolicy.cachedOnly  [HasInitialValue,HasStorage]
+Var FetchPolicy.cachedOrFetched  [HasInitialValue,HasStorage]
+Var FetchPolicy.description
+Var FetchPolicy.fetchCurrent  [HasInitialValue,HasStorage]
+Var FetchPolicy.hashValue
+Var FetchPolicy.notStaleCachedOrFetched  [HasInitialValue,HasStorage]
+Var FetchPolicy.rawValue  [HasStorage]
+Var InitiationSource.description
+Var InitiationSource.hashValue
+Var InitiationSource.purchase  [HasInitialValue,HasStorage]
+Var InitiationSource.queue  [HasInitialValue,HasStorage]
+Var InitiationSource.rawValue  [HasStorage]
+Var InitiationSource.restore  [HasInitialValue,HasStorage]
+Var LogLevel.debug  [HasInitialValue,HasStorage]
+Var LogLevel.description
+Var LogLevel.error  [HasInitialValue,HasStorage]
+Var LogLevel.hashValue
+Var LogLevel.info  [HasInitialValue,HasStorage]
+Var LogLevel.label  [HasStorage]
+Var LogLevel.off  [HasInitialValue,HasStorage]
+Var LogLevel.rawValue  [HasStorage]
+Var LogLevel.verbose  [HasInitialValue,HasStorage]
+Var LogLevel.warn  [HasInitialValue,HasStorage]
+Var Money.amount  [HasStorage]
+Var Money.currency  [HasStorage]
+Var Money.description
+Var Money.hashValue
+Var Offering.annual
+Var Offering.availablePackages  [HasStorage]
+Var Offering.hashValue
+Var Offering.identifier  [HasStorage]
+Var Offering.lifetime
+Var Offering.monthly
+Var Offering.serverDescription  [HasStorage]
+Var Offering.weekly
+Var Offerings.all  [HasStorage]
+Var Offerings.current
+Var Offerings.currentOfferingIdentifier  [HasStorage]
+Var Offerings.hashValue
+Var OwnershipType.description
+Var OwnershipType.familyShared  [HasInitialValue,HasStorage]
+Var OwnershipType.hashValue
+Var OwnershipType.purchased  [HasInitialValue,HasStorage]
+Var OwnershipType.rawValue  [HasStorage]
+Var OwnershipType.unknown  [HasInitialValue,HasStorage]
+Var Package.hashValue
+Var Package.identifier  [HasStorage]
+Var Package.offeringIdentifier  [HasStorage]
+Var Package.packageType  [HasStorage]
+Var Package.platformProductIdentifier  [HasStorage]
+Var Package.storeProduct  [HasStorage]
+Var PackageType.annual  [HasInitialValue,HasStorage]
+Var PackageType.custom  [HasInitialValue,HasStorage]
+Var PackageType.description
+Var PackageType.hashValue
+Var PackageType.lifetime  [HasInitialValue,HasStorage]
+Var PackageType.monthly  [HasInitialValue,HasStorage]
+Var PackageType.rawValue  [HasStorage]
+Var PackageType.sixMonth  [HasInitialValue,HasStorage]
+Var PackageType.threeMonth  [HasInitialValue,HasStorage]
+Var PackageType.twoMonth  [HasInitialValue,HasStorage]
+Var PackageType.unknown  [HasInitialValue,HasStorage]
+Var PackageType.weekly  [HasInitialValue,HasStorage]
+Var PeriodType.description
+Var PeriodType.hashValue
+Var PeriodType.intro  [HasInitialValue,HasStorage]
+Var PeriodType.normal  [HasInitialValue,HasStorage]
+Var PeriodType.prepaid  [HasInitialValue,HasStorage]
+Var PeriodType.rawValue  [HasStorage]
+Var PeriodType.trial  [HasInitialValue,HasStorage]
+Var PeriodType.unknown  [HasInitialValue,HasStorage]
+Var PurchaseResult.customerInfo  [HasStorage]
+Var PurchaseResult.transactionIdentifier  [HasStorage]
+Var PurchaseResult.userCancelled  [HasStorage]
+Var PurchaseUIContext.sceneProvider  [Custom,HasInitialValue,HasStorage]
+Var Purchases.appUserID  [Custom,Final,HasStorage,SetterAccess]
+Var Purchases.attribution  [Custom,Final,HasStorage]
+Var Purchases.cachedCustomerInfo  [Custom,Final,HasInitialValue,HasStorage,SetterAccess]
+Var Purchases.configuration  [Custom,Final,HasStorage]
+Var Purchases.customerInfoStream  [Custom,Final]
+Var Purchases.delegate  [Custom,Final,HasInitialValue,HasStorage,ReferenceOwnership]
+Var Purchases.isAnonymous  [Custom,Final]
+Var Purchases.isConfigured  [Custom,Final]
+Var Purchases.logLevel  [Custom,Final]
+Var Purchases.purchaseResultHandler  [Final,Nonisolated]
+Var Purchases.purchasesCompletedBy  [Final,Nonisolated]
+Var Purchases.shared  [Custom,Final]
+Var PurchasesCompletedBy.description
+Var PurchasesCompletedBy.hashValue
+Var PurchasesCompletedBy.myApp  [HasInitialValue,HasStorage]
+Var PurchasesCompletedBy.rawValue  [HasStorage]
+Var PurchasesCompletedBy.revenueDog  [HasInitialValue,HasStorage]
+Var PurchasesError.backendCode  [HasStorage]
+Var PurchasesError.code  [HasStorage]
+Var PurchasesError.description
+Var PurchasesError.domain  [HasInitialValue,HasStorage]
+Var PurchasesError.errorCode
+Var PurchasesError.errorDomain
+Var PurchasesError.errorUserInfo
+Var PurchasesError.httpStatusCode  [HasStorage]
+Var PurchasesError.localizedDescription
+Var PurchasesError.message  [HasStorage]
+Var PurchasesError.underlyingError  [HasStorage]
+Var PurchasesError.userInfo  [HasStorage]
+Var PurchasesErrorCode.configurationError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.customerInfoError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.description
+Var PurchasesErrorCode.emptySubscriberAttributesError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.hashValue
+Var PurchasesErrorCode.invalidAppUserIdError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.invalidAppleSubscriptionKeyError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.invalidCredentialsError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.invalidReceiptError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.missingReceiptFileError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.name  [HasStorage]
+Var PurchasesErrorCode.networkError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.notImplementedError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.offlineConnectionError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.operationAlreadyInProgressError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.productAlreadyPurchasedError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.productDiscountMissingIdentifierError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.productNotAvailableForPurchaseError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.purchaseCancelledError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.purchaseInvalidError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.purchaseNotAllowedError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.rawValue  [HasStorage]
+Var PurchasesErrorCode.receiptAlreadyInUseError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.storeProblemError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.systemInfoError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.unexpectedBackendResponseError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.unknownBackendError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.unknownError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.unsupportedError  [HasInitialValue,HasStorage]
+Var Store.amazon  [HasInitialValue,HasStorage]
+Var Store.appStore  [HasInitialValue,HasStorage]
+Var Store.description
+Var Store.hashValue
+Var Store.macAppStore  [HasInitialValue,HasStorage]
+Var Store.paddle  [HasInitialValue,HasStorage]
+Var Store.playStore  [HasInitialValue,HasStorage]
+Var Store.promotional  [HasInitialValue,HasStorage]
+Var Store.rawValue  [HasStorage]
+Var Store.roku  [HasInitialValue,HasStorage]
+Var Store.stripe  [HasInitialValue,HasStorage]
+Var Store.unknown  [HasInitialValue,HasStorage]
+Var StoreProduct.currencyCode  [HasStorage]
+Var StoreProduct.hashValue
+Var StoreProduct.localizedDescription  [HasStorage]
+Var StoreProduct.localizedPriceString  [HasStorage]
+Var StoreProduct.localizedTitle  [HasStorage]
+Var StoreProduct.price  [HasStorage]
+Var StoreProduct.productIdentifier  [HasStorage]
+Var StoreProductType.currencyCode
+Var StoreProductType.isSubscription
+Var StoreProductType.localizedDescription
+Var StoreProductType.localizedPriceString
+Var StoreProductType.localizedTitle
+Var StoreProductType.price
+Var StoreProductType.productIdentifier
+Var StoreProductType.storeProduct
+Var StoreTransactionType.appAccountToken
+Var StoreTransactionType.expirationDate
+Var StoreTransactionType.isFinished
+Var StoreTransactionType.isUpgraded
+Var StoreTransactionType.jwsRepresentation
+Var StoreTransactionType.originalTransactionIdentifier
+Var StoreTransactionType.productIdentifier
+Var StoreTransactionType.purchaseDate
+Var StoreTransactionType.quantity
+Var StoreTransactionType.revocationDate
+Var StoreTransactionType.transactionIdentifier

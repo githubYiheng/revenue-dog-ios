@@ -2,3 +2,6 @@
 .swiftpm/
 *.xcodeproj
 DerivedData/
+.build-api-baseline/
+.build-xcode-ios/
+api-baseline/RevenueDog.json

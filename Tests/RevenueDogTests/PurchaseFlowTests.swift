@@ -12,8 +12,11 @@ import Testing
 final class FinishFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var finished = false
-    func markFinished() { lock.lock(); finished = true; lock.unlock() }
+    /// `finish()` 被调用的**次数**（M4 故障注入：重试期间不得重复 finish）。
+    private var calls = 0
+    func markFinished() { lock.lock(); finished = true; calls += 1; lock.unlock() }
     var value: Bool { lock.lock(); defer { lock.unlock() }; return finished }
+    var callCount: Int { lock.lock(); defer { lock.unlock() }; return calls }
 }
 
 struct FakeTransaction: StoreTransactionType {
