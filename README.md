@@ -94,28 +94,133 @@ SDK 侧声明：
 - `networkDelayScheduler` —— 网络退避调度器；测试注入 `NoDelayScheduler`（不真睡）或 `RecordingDelayScheduler`（记录每次退避时长，用来验 `Retry-After` 优先）。
 - `delayScheduler` —— P4 交易可见性轮询用的调度器（与网络退避分开）。
 
-## StoreKitTest（`SKTestSession`）
+## 宿主示例 app（`Example/`）
 
-核实与实测见 `docs/research/verify/storekittest-spm.md`。结论：**有条件可行，但走不了纯 SwiftPM testTarget。**
+`sdk/ios/Example/` 是一个 **XcodeGen 生成**的宿主示例 app（`*.xcodeproj` 已 gitignore，**不入库**）。
+它有两个职责：
+
+1. **给 StoreKitTest 当宿主（TEST_HOST）**。没有 app host 时 `Bundle.main` 是
+   `com.apple.dt.xctest.tool`，进程缺 `application-identifier` entitlement →
+   `Transaction.currentEntitlements / .all / .unfinished` **全部返回空**，
+   RevenueDog 的上报管道（靠 `Transaction` 取 JWS）整条不可测。
+2. **当真机核验载体**。门禁报告 `docs/audit/2026-08-28-sdk-m2-gate.md` §2 的真机清单
+   （📱 必做 2 条 + 建议补充 4 条）做成了 app 内的「核验」页，每条给操作步骤与通过判据。
+
+### 生成与运行
+
+```bash
+cd sdk/ios/Example
+xcodegen generate                 # → RevenueDogExample.xcodeproj（生成物，不入库）
+open RevenueDogExample.xcodeproj  # Xcode 里选 RevenueDogExample scheme 跑
+```
+
+模拟器上 scheme 已挂 `Tests/StoreKitTestSupport/RevenueDog.storekit`，**不连后端也能走完购买 UI**：
+商品从 StoreKitTest 出；「商品」页拉 offerings 失败时会自动退回配置里的三个内建商品。
+
+界面：**配置**（apiKey / baseURL，默认 `http://127.0.0.1:8787`）、**商品**（offerings + 购买 /
+restore / sync）、**客户**（logIn / logOut / CustomerInfo 全貌 / 四种 FetchPolicy）、
+**核验**（真机清单）、**日志**（接 `Purchases.setLogSink` 的实时面板，可过滤 / 拷贝）。
+
+### 真机核验
+
+```bash
+cd sdk/ios/Example
+REVENUEDOG_DEVELOPMENT_TEAM=ABCDE12345 xcodegen generate   # 注入签名 team
+```
+
+Xcode 打开工程 → 选真机 → Run → 进「核验」页按清单逐条跑。清单勾选状态只存本机 UserDefaults。
+
+> app 只消费**公开 API**（不 `@testable import`），所以它同时是公开面可用性的活样例。
+> app **故意不在启动时 configure**（为了能在界面上改 baseURL）；生产集成必须在启动期 configure（铁律 P1），
+> 核验清单里有一条专门测这个时序。
+
+## StoreKitTest 全场景（`RevenueDogStoreKitTests`）
+
+核实与实测见 `docs/research/verify/storekittest-spm.md`。结论：**走不了纯 SwiftPM testTarget，必须挂宿主 app。**
 
 - 编译层面没问题：testTarget 里直接 `import StoreKitTest` 就能过，不需要 `linkedFramework` / `unsafeFlags`。
-- 运行层面卡在**没有 app host**：`Bundle.main` 是 `com.apple.dt.xctest.tool`，没有 `application-identifier` entitlement，
-  结果是「商品目录能读、购买不能做」，而且 `Transaction.currentEntitlements / .all / .unfinished` 全部返回 0 ——
-  RevenueDog 的上报管道正是靠 `Transaction` 取 JWS，所以无宿主 = 整条链路不可测。
-- **iOS 26.x 模拟器上 `SKTestSession` 整体失灵**（有无宿主都一样），iOS 18.5 正常。CI destination 必须钉在 iOS 18.x。
+- 运行层面必须有 app host（见上）。
+- **iOS 26.x 模拟器上 `SKTestSession` 整体失灵**（有无宿主都一样：`Product.products(for:)` 返回 0），
+  iOS 18.5 正常。**CI destination 必须钉 iOS 18.x**（2026-09-06 在 26.5 上复测，仍然失灵）。
 
-因此 `Package.swift` **不声明** StoreKitTest 相关 target。素材放在 `Tests/StoreKitTestSupport/`，
-由外部宿主示例 app 工程消费（接法见上述文档 §8）：
+因此 `Package.swift` **不声明** StoreKitTest 相关 target；场景测试挂在
+`Example/RevenueDogStoreKitTests`（host = 示例 app）。分工是：
+**StoreKit 是真的**（`SKTestSession` 驱动，JWS / `appAccountToken` / `finish()` 都是真的），
+**后端是假的**（transport 注入 `Purchases.Dependencies.transport`）。
 
-| 文件 | 说明 |
+### 运行
+
+```bash
+sdk/ios/scripts/storekit-tests.sh                       # 默认 iOS 18.5 / iPhone Xs
+SK_OS=18.5 SK_DEVICE='iPad Pro 13-inch (M4)' sdk/ios/scripts/storekit-tests.sh
+SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-tests.sh   # 只跑一个 suite
+```
+
+脚本内部：`xcodegen generate` → 校正测试计划里的 target UUID → `xcodebuild test`（退出码透传）。
+可覆盖变量：`SK_OS` / `SK_DEVICE` / `SK_DESTINATION` / `SK_SCHEME` / `SK_TEST_PLAN` /
+`SK_FILTER` / `SK_DERIVED_DATA` / `XCODEGEN`。
+
+### 场景表（21 条，iOS 18.5 全绿 ×3）
+
+| # | 场景 | 对照编号 | 关键断言 |
+|:-:|---|---|---|
+| ① | 购买成功 → 上报带真 JWS → 200 后才 finish | 铁律 P2 / 裁决 F8 | `fetch_token` 是三段式 JWS 原文；200 后 `unfinished` 里不再有它；上下文清空 |
+| ① | 购买 package 携带 offering 归因 | 契约 §2.1 | `presented_offering_identifier` 上行 |
+| ② | 5xx → 不 finish；冷启动重放 200 → finish；第三次冷启动零上报 | 坑 #8 / 铁律 P3 | 「恰好一次」= 不无限重报 |
+| ② | 确定性 4xx（400）→ finishable：finish + 删上下文 | 坑 #8 | 重试无意义的错误不许卡住 finish 义务 |
+| ③ | `forceRenewalOfSubscription` → 续期交易到达并上报 | 坑 #11 / #102 | 续期走 `queue` 通道；每笔 JWS 互不相同；200 后 finish |
+| ③ | `timeRate` 加速的真实续期（对照路径） | 坑 #102 | 同上 |
+| ④ | `refundTransaction` → revoked 交易上报 | 裁决 #12 | revoked 走同一管道、200 即 finish，无特例 |
+| ⑤ | `expireSubscription` → 权益退出 `currentEntitlements` | 坑 #31 / #102 | 过期后冷启动零重报 |
+| ⑤ | 购买日期回拨一年 → 交易一落地即过期 | — | `.purchaseDate(_:renewalBehavior:)`（StoreKitTest 专属选项） |
+| ⑥ | Ask-to-Buy：pending → approve → **配对**上报 | 坑 #19 / #104 | `initiation_source == "purchase"` 证明配对回了原发起上下文 |
+| ⑥ | Ask-to-Buy decline → 零上报、无权益 | 坑 #19 | — |
+| ⑦ | 注入 `purchaseNotAllowed` → 映射 `purchaseNotAllowedError` | 坑 #18 | 无上报、无残留上下文、无未 finish 交易 |
+| ⑦ | 注入通用 `StoreKitError` → 映射 `storeProblemError` | 坑 #43 | 同上 |
+| ⑦ | `failTransactionsEnabled` 在 iOS 17+ 已是 no-op | **矩阵修正** | 警戒线：拿它造失败 = 假绿 |
+| ⑦ | `interruptedPurchasesEnabled` → 不误报、不误 finish | 坑 #18 | 没有交易时绝不凭空上报 |
+| ⑧ | 新 `Purchases` 实例扫描 `Transaction.unfinished` 并补报 | 坑 #132 / 裁决 #2 | 补投路径 `initiation_source == "queue"` |
+| ⑧ | `clearTransactions` 之后冷启动 → 零上报 | 坑 #103 | clear 的可见性是异步的，必须等 |
+| ⑨ | 无 intro offer 时 `isEligibleForIntroOffer` 的实际返回 | 坑 #91 | 组级语义：同组两商品同答案 |
+| ⑨ | 购买后同组 intro 资格翻转 | 裁决 #124 | 端上不可信，以服务端为准 |
+| ⑩ | 消耗型未在响应 `non_subscriptions` 确认 → **绝不 finish** | 坑 #6（必抄 #1） | 「钱付了道具没到」的防线 |
+| ⑩ | 响应确认该交易 id → finish、上下文清空 | 坑 #6 | — |
+
+### 做不到 / 没做的场景（写明理由，不硬凑）
+
+| 场景 | 原因 |
 |---|---|
-| `RevenueDog.storekit` | 最小配置：一个订阅组两档 + 一个消耗型 |
-| `StoreKitPurchaseFlowTests.swift` | 样板测试：购买成功 → 上报带 JWS → 200 后才 finish（`#if canImport(StoreKitTest)` 门控） |
-| `RevenueDog-StoreKit.xctestplan` | 测试计划模板，`storeKitConfigurationFileReference` 已指向 `.storekit` |
+| promo offer 资格（`promotionalOffer(_:compactJWS:)`） | 需要 ASC 签名密钥，`.storekit` 的 `adHocOffers` 为空；且 **SDK 当前根本没用这个 API**（属 R6 范围）。只做了「读得到、且为空」的特征化断言 |
+| `unverified` 交易（篡改签名） | `VerificationResult.unverified` 无法用 `SKTestSession` 构造。留在**真机核验清单**（补充场景 · 坑 20） |
+| `@backDeployed` 三件套在 iOS 16 上的返回 | 模拟器给不出结论，必须最低版**真机**。留在真机清单 #122 |
+| 真机 CI | 真机 entitlement 情况与模拟器不同，本批全部结论基于模拟器 |
+| iOS 26.6 是否修好 `SKTestSession` | 本机只有 26.5 / 18.5，**未验证**。在拿到 26.6 运行时之前 CI 一律钉 18.x |
 
-> 这些文件**不在** `swift test` 的编译范围内 —— 内部注入点（`Purchases.Dependencies`）改名不会被 CI 挡住，
-> 属于已知的静默腐坏风险点。**处置：M4 第二批建宿主示例 app 工程时把这个 target 纳入 CI**，
-> 在那之前它只是素材，改内部 API 时请手动回看一眼。
+### 已知限制与踩坑速查
+
+- **destination 必须钉 iOS 18.x。** 26.x 上 `Product.products(for:)` 返回 0，所有场景在前置自检处直接失败
+  （前置自检刻意做在最前面，避免给出误导性的报错）。
+- **`.serialized` 是硬性要求。** 测试环境整机一份（Apple 官方原文），`Purchases` 又是静态单例。
+  本 target 所有 suite 都挂在 `StoreKitScenarioDomain` 这个带 `.serialized` 的父 suite 下 ——
+  加新 suite 请一律写成 `extension StoreKitScenarioDomain { @Suite … }`。
+- **setup 顺序**：先 `resetToDefaultState()` / `clearTransactions()`，再设 `disableDialogs` /
+  `storefront`（reset 会把 `disableDialogs` 冲回 NO，顺序错了购买会卡在无人应答的弹窗上直到 480s 超时）。
+- **坑 #103 的完整绕法**：`clearTransactions()` 不但清不干净，**清干净这件事对 StoreKit 2 侧还是异步可见的**。
+  必须 clear + 逐个 `deleteTransaction` + **等到 `unfinished` 与 `currentEntitlements` 都空**。
+  少了最后一步会出现随机假失败：残留权益被下一条测试的冷启动扫描误报一次。
+- **`timeRate` 必须在购买之前设**，购买后再改，那笔已存在的订阅不会被加速。
+- **别在同一台模拟器上并行跑两个 `xcodebuild test`**，会撞出 `Application failed preflight checks` 这类假失败。
+- **测试计划的 `testExecutionOrdering` 键在 Xcode 26.6 上会让整个 `.xctestplan` 读不出来**
+  （报 "test plan could not be read"）。别加；串行由 `.serialized` trait 负责。
+
+`Tests/StoreKitTestSupport/` 现在只剩 `RevenueDog.storekit`（一个订阅组两档 + 一个消耗型），
+由示例 app target 以**引用**方式打进 bundle。第一批留下的样板测试与测试计划模板已**迁入**
+`Example/`（样板即场景 ①），避免两份漂移。
+
+> **静默腐坏的堵漏**：测试 target 以**引用**方式编译
+> `Tests/RevenueDogTests/Support/MockTransport.swift` —— 同一份源码进两个 target，
+> `Purchases.Dependencies` / `HTTPTransport` 这类内部注入点改名会让两边一起红。
+> 这正是第一批留下的「StoreKitTestSupport 不在 CI 编译范围内」风险点的处置。
 
 现有单测直接跑上 iOS Simulator（不涉及 StoreKitTest）：
 

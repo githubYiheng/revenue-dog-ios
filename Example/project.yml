@@ -1,0 +1,120 @@
+# RevenueDogExample —— 宿主示例 app 工程定义（XcodeGen）
+#
+# 为什么要有这个工程（结论来自 docs/research/verify/storekittest-spm.md）：
+#   纯 SwiftPM testTarget **没有 app host**，`Bundle.main` 是 `com.apple.dt.xctest.tool`，
+#   进程缺 `application-identifier` entitlement → `Transaction.currentEntitlements/.all/.unfinished`
+#   全部返回空，RevenueDog 的上报管道（靠 `Transaction` 取 JWS）整条不可测。
+#   所以 StoreKitTest 场景必须挂在一个**真的 app**上。
+#
+# 生成（`*.xcodeproj` 已 gitignore，不入库）：
+#   cd sdk/ios/Example && xcodegen generate
+# 或直接跑测试脚本（内部会先 generate）：
+#   sdk/ios/scripts/storekit-tests.sh
+#
+# 真机核验：Xcode 打开生成的工程 → 选 RevenueDogExample scheme → 选真机；
+# 签名需要 team，可用环境变量注入后再 generate：
+#   REVENUEDOG_DEVELOPMENT_TEAM=ABCDE12345 xcodegen generate
+
+name: RevenueDogExample
+
+options:
+  bundleIdPrefix: ai.loomalabs.revenuedog
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "16.0"
+  # 生成的工程不入库，用相对路径引用仓库内素材（不拷贝，避免两份漂移）
+  generateEmptyDirectories: false
+
+# 本地 package 依赖：就是本仓库的 sdk/ios 包本体
+packages:
+  RevenueDog:
+    path: ../
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    # 与 SDK 同档：Swift 6 语言模式 + 严格并发。示例 app 也吃这套纪律。
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: ${REVENUEDOG_DEVELOPMENT_TEAM}
+    # 模拟器跑测试不需要签名；真机时由上面的 DEVELOPMENT_TEAM + 自动签名接管
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+
+  RevenueDogExample:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: RevenueDogExample
+      # `.storekit` **引用**仓库内素材（不拷贝）；打进 app bundle 后
+      # `SKTestSession(configurationFileNamed: "RevenueDog")` 直接可用。
+      - path: ../Tests/StoreKitTestSupport/RevenueDog.storekit
+        buildPhase: resources
+    dependencies:
+      - package: RevenueDog
+        product: RevenueDog
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.loomalabs.revenuedog.example
+        PRODUCT_NAME: RevenueDogExample
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: RevenueDog
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        # 默认 baseURL 指本机 wrangler dev（http），得放行明文回环
+        INFOPLIST_KEY_NSAppTransportSecurity_NSAllowsLocalNetworking: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_TESTABILITY: YES
+
+  RevenueDogStoreKitTests:
+    type: bundle.unit-test
+    platform: iOS
+    # 产品基线是 iOS 16，但**测试 target** 钉 17.0：
+    # StoreKitTest 的场景注入 API（`setSimulatedError(_:forAPI:)`、
+    # `buyProduct(identifier:options:)`、`PurchaseOption.purchaseDate`）都是 iOS 17+，
+    # 而 CI destination 本来就钉 iOS 18.x。被测的 SDK 仍以 iOS 16 编译。
+    deploymentTarget: "17.0"
+    sources:
+      - path: RevenueDogStoreKitTests
+      # **引用**（不拷贝）SDK 单测的传输层替身：两个 target 编同一份源码，
+      # `Purchases.Dependencies` / `HTTPTransport` 这类内部注入点改名会让两边一起红 ——
+      # 这正是第一批留下的「StoreKitTestSupport 不在 CI 编译范围内会静默腐坏」的堵漏点。
+      - path: ../Tests/RevenueDogTests/Support/MockTransport.swift
+    dependencies:
+      # `- target: App` 会自动生成 TEST_HOST / BUNDLE_LOADER（这是宿主的关键一步）
+      - target: RevenueDogExample
+      - package: RevenueDog
+        product: RevenueDog
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.loomalabs.revenuedog.example.storekittests
+        GENERATE_INFOPLIST_FILE: YES
+        # 测试用 `@testable import RevenueDog` 拿内部注入点 `Purchases.Dependencies`
+        ENABLE_TESTABILITY: YES
+
+schemes:
+
+  RevenueDogExample:
+    build:
+      targets:
+        RevenueDogExample: all
+        RevenueDogStoreKitTests: [test]
+    run:
+      config: Debug
+      # 直接 Run（不跑测试）时也能在模拟器上走完购买 UI —— 不连后端即可点通
+      storeKitConfiguration: ../Tests/StoreKitTestSupport/RevenueDog.storekit
+    test:
+      config: Debug
+      testPlans:
+        - path: RevenueDog-StoreKit.xctestplan
+          defaultPlan: true
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
