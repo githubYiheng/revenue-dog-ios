@@ -2,8 +2,11 @@
 //  IdentityManager.swift
 //  匿名 ID 生成 / logIn / logOut（设计 §2 Identity）。
 //
-//  ID 格式与后端 `packages/core/src/ids.ts` 逐字对齐（裁决 C5、契约决策 11）：
-//    - 匿名 App User ID = "$RCAnonymousID:" + 32 位无连字符**小写** hex
+//  ID 格式与后端 `packages/core/src/ids.ts` 逐字对齐（裁决 C5、契约决策 11，ADR 0019 修订）：
+//    - 匿名 App User ID = "$RDAnonymousID:" + 32 位无连字符**小写** hex（**自生成用这个**）
+//    - 识别端同时认 "$RCAnonymousID:"：档 1/2 期间宿主把 RC 的 appUserID（**含 RC 匿名 ID**）
+//      注入进来（dual-sdk-integration.md §6），认不出来就会把一个 RC 匿名用户当成具名用户
+//    - 服务端的 "$RDUnattributedID:" 占位符前缀 SDK 侧**不生成也不认**：它只存在于服务端
 //    - account_token   = 32 位无连字符小写 hex（转 Apple appAccountToken 时补连字符）
 //    - app_user_id 合法性 = 非保留值、≤100 字符、不含 '/'
 //
@@ -78,7 +81,11 @@ actor IdentityManager {
 
     // MARK: 纯逻辑（可单测，无状态）
 
-    static let anonymousPrefix = "$RCAnonymousID:"
+    /// 我方自生成的匿名前缀（ADR 0019）。冒用 RC 的前缀会让排查第一反应是「RC 给的」。
+    static let anonymousPrefix = "$RDAnonymousID:"
+
+    /// 历史与 RC 兼容前缀：**只识别、不生成**。档 1/2 宿主注入的 RC 匿名 ID 长这样。
+    static let legacyAnonymousPrefix = "$RCAnonymousID:"
 
     static let maxAppUserIDLength = 100
 
@@ -92,13 +99,14 @@ actor IdentityManager {
         UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
-    /// `$RCAnonymousID:` + 32 位小写 hex。
+    /// `$RDAnonymousID:` + 32 位小写 hex。
     static func generateAnonymousAppUserID() -> String {
         anonymousPrefix + uuid32()
     }
 
+    /// 两个前缀都认：自生成的 `$RDAnonymousID:` 与宿主注入的 RC `$RCAnonymousID:`。
     static func isAnonymous(_ appUserID: String) -> Bool {
-        appUserID.hasPrefix(anonymousPrefix)
+        appUserID.hasPrefix(anonymousPrefix) || appUserID.hasPrefix(legacyAnonymousPrefix)
     }
 
     /// 派生账户令牌：32 hex，同时满足 Apple appAccountToken(UUID) 与 Google obfuscatedAccountId(≤64)。

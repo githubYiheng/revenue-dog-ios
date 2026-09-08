@@ -44,7 +44,7 @@ final class PurchasesFacadeTests {
     func configuredWithAnonymousIdentity() {
         #expect(Purchases.isConfigured)
         #expect(purchases.isAnonymous)
-        #expect(purchases.appUserID.hasPrefix("$RCAnonymousID:"))
+        #expect(purchases.appUserID.hasPrefix("$RDAnonymousID:"))
         #expect(purchases.configuration.purchasesCompletedBy == .revenueDog)
     }
 

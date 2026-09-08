@@ -10,17 +10,20 @@ import Testing
 @Suite("Identity — 匿名 ID 格式")
 struct AnonymousIDFormatTests {
 
-    @Test("匿名 ID = $RCAnonymousID: + 32 位无连字符小写 hex")
+    /// ADR 0019：自生成的匿名 ID 用**我方**前缀 `$RDAnonymousID:`。
+    /// 冒用 RC 的前缀会让排查第一反应是「RC 给的」（2026-09-08 身份分裂诊断实证）。
+    @Test("匿名 ID = $RDAnonymousID: + 32 位无连字符小写 hex")
     func anonymousIDShape() throws {
         let id = IdentityManager.generateAnonymousAppUserID()
 
-        #expect(id.hasPrefix("$RCAnonymousID:"))
-        let suffix = String(id.dropFirst("$RCAnonymousID:".count))
+        #expect(id.hasPrefix("$RDAnonymousID:"))
+        #expect(!id.hasPrefix("$RCAnonymousID:"))
+        let suffix = String(id.dropFirst("$RDAnonymousID:".count))
         #expect(suffix.count == 32)
         #expect(!suffix.contains("-"))
         #expect(suffix.allSatisfy { $0.isHexDigit })
         #expect(suffix == suffix.lowercased())
-        #expect(id.count == "$RCAnonymousID:".count + 32)
+        #expect(id.count == "$RDAnonymousID:".count + 32)
     }
 
     @Test("匿名 ID 每次生成都不同")
@@ -29,13 +32,22 @@ struct AnonymousIDFormatTests {
         #expect(Set(ids).count == ids.count)
     }
 
-    @Test("isAnonymous 判定")
+    /// **双前缀识别**（ADR 0019 决定 1）：自生成的 `$RDAnonymousID:` 与宿主注入的
+    /// RC `$RCAnonymousID:` 都必须认。档 1/2 期间 Dog 的 appUserID 取自
+    /// `RCPurchases.shared.appUserID`（含 RC 匿名 ID，dual-sdk-integration §6）——
+    /// 少认一个就会把一个 RC 匿名用户当成具名用户，identify 走错分支。
+    @Test("isAnonymous 双前缀判定（自生成 RD + 宿主注入的 RC）")
     func isAnonymous() {
         #expect(IdentityManager.isAnonymous(IdentityManager.generateAnonymousAppUserID()))
+        #expect(IdentityManager.isAnonymous("$RDAnonymousID:deadbeef"))
         #expect(IdentityManager.isAnonymous("$RCAnonymousID:deadbeef"))
         #expect(!IdentityManager.isAnonymous("user_42"))
         #expect(!IdentityManager.isAnonymous("RCAnonymousID:deadbeef"))
+        #expect(!IdentityManager.isAnonymous("RDAnonymousID:deadbeef"))
         #expect(!IdentityManager.isAnonymous("prefix$RCAnonymousID:deadbeef"))
+        #expect(!IdentityManager.isAnonymous("prefix$RDAnonymousID:deadbeef"))
+        // 占位符前缀只存在于服务端：SDK 不生成，也不需要认（认了反而会掩盖「它跑到客户端了」）
+        #expect(!IdentityManager.isAnonymous("$RDUnattributedID:deadbeef"))
         #expect(!IdentityManager.isAnonymous(""))
     }
 

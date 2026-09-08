@@ -438,7 +438,7 @@ extension PurchasesSingletonDomain {
 
             // 契约 §1.1：路径参数必须 URL 编码后再拼接（`$` / `:` 都不能裸奔）
             let rawURL = try #require(requests[oldIndex].url?.absoluteString)
-            #expect(rawURL.contains("%24RCAnonymousID%3A"))
+            #expect(rawURL.contains("%24RDAnonymousID%3A"))
 
             // 迁移过去的属性确实在新身份下发出（而不是空批）
             let migrated = try #require(attrBody(requests[newIndex])["attributes"] as? [String: Any])
