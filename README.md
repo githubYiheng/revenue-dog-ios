@@ -1,5 +1,21 @@
 # RevenueDog iOS SDK
 
+Revenue Dog 的 iOS 客户端 SDK：自建 RevenueCat 式内购后端的 StoreKit 2 SDK，接口命名与 RevenueCat 兼容以便迁移。MIT 许可。
+
+## 安装（SwiftPM）
+
+```swift
+.package(url: "https://github.com/githubYiheng/revenue-dog-ios.git", from: "0.1.0")
+```
+
+Xcode：File → Add Package Dependencies… → 填上面的 URL，规则选 "Up to Next Major"。
+
+> **这个仓库是发布产物，不接受 PR。** 开发在私有 monorepo 的 `sdk/ios` 目录进行，每次发布用
+> `git subtree split` 推到这里并打 `vX.Y.Z` tag（历史保留）。下文提到的 `docs/…` 路径都指 monorepo 内的设计文档，本仓库不含。
+> 版本纪律见 `CHANGELOG.md`。
+
+## 概览
+
 SwiftPM 包，Swift 6 严格并发，**产品基线 iOS 16**。
 `Package.swift` 里的 `macOS 13` 只是为了让纯逻辑单测能在开发机上直接 `swift test`
 （StoreKit 相关代码用 `#if canImport(StoreKit)` + `@available` 门控）。
