@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-10
+
+修订号：公开 API 基线无差异（377 符号）。**bff 直切接线必须用本版本或更高**（v0.1.0 会在鉴权失败时错误 finish 交易）。
+
 - **修复**：`POST /v1/receipts` 返回 401/403 时不再 finish 交易。鉴权失败发生在服务端留档之前，此前的行为会把用户已付款的交易从 StoreKit 与后端两侧同时抹掉（消耗型不可恢复）。现在保留上下文，密钥修正后由前台重放补报。
 - **修复**：`Purchases.defaultBaseURL` 从 `https://api.revenuedog.com`（非本项目域名）改为 `https://api.revdog.org`。公开符号不变。
 
