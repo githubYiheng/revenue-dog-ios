@@ -26,6 +26,29 @@ private struct IdentifyBody: Encodable {
     }
 }
 
+/// 单一处理通道（`handle(transaction:source:)`）的处置结果。
+///
+/// 之前这里只返回 `CustomerInfo?`，于是 `purchase()` 分不清「后端暂时没确认（交易保留、会重放）」
+/// 与「后端确定性拒绝（已 finish、不会再有权益）」—— 两者都退化成一个裸 `.networkError`，
+/// 宿主既没法给出正确文案，也没法决定要不要给用户兜底。禁 public enum 只约束**公开面**，
+/// 这是内部类型。
+enum TransactionHandleOutcome: Sendable {
+    /// 后端 2xx 落库成功（finish 裁决已按铁律执行）。
+    case posted(CustomerInfo)
+    /// 暂时性失败（5xx / 网络 / 401 / 403 / 408 / 429）：交易**未 finish**、上下文保留，
+    /// 由前台重放与冷启动扫描补报。
+    case pendingServerConfirmation(PurchasesError)
+    /// 确定性拒绝（除 401/403/404/408/429 外的 4xx）：`.revenueDog` 下已 finish，重试无意义。
+    case rejectedByServer(PurchasesError)
+    /// 本次没有走上报：内存去重命中 / 交易缺 JWS / 观察者台账已记。
+    case skipped
+
+    var customerInfo: CustomerInfo? {
+        guard case .posted(let info) = self else { return nil }
+        return info
+    }
+}
+
 actor PurchasesOrchestrator {
 
     let configuration: Configuration
@@ -144,7 +167,7 @@ actor PurchasesOrchestrator {
     /// 幂等由三层保证：内存 in-flight 去重、.myApp 台账、服务端 content_hash。
     @discardableResult
     func handle(transaction: any StoreTransactionType,
-                source: DiagnosticsTransactionSource = .updates) async -> CustomerInfo? {
+                source: DiagnosticsTransactionSource = .updates) async -> TransactionHandleOutcome {
         let txID = transaction.transactionIdentifier
 
         // 诊断（契约 §1.3）：单一处理通道的入口是「端上看见了这笔交易」的唯一时刻。
@@ -157,7 +180,7 @@ actor PurchasesOrchestrator {
         ])
 
         // 内存级去重：同一交易同时从 purchase() 与 updates 到达时只处理一次
-        if inFlightTransactionIDs.contains(txID) { return nil }
+        if inFlightTransactionIDs.contains(txID) { return .skipped }
         inFlightTransactionIDs.insert(txID)
         defer { inFlightTransactionIDs.remove(txID) }
 
@@ -170,13 +193,13 @@ actor PurchasesOrchestrator {
         // .myApp 台账（#10）：已同步过且宿主没 finish 的重投直接跳过
         if completedBy == .myApp, let ledger,
            await ledger.contains(txID) {
-            return nil
+            return .skipped
         }
 
         guard let jws = transaction.jwsRepresentation else {
             Log.warn("交易缺少 JWS，无法上报（tx=\(txID)）", category: "purchase")
             await diagnostics.warn(DiagnosticsWarningCode.missingJWS, detail: "tx=\(txID)")
-            return nil
+            return .skipped
         }
 
         // 坑 #21：「成功购买」却带过去的 expirationDate = StoreKit 自身异常。埋点 warn，不阻断（P8：权益以后端为准）。
@@ -231,7 +254,7 @@ actor PurchasesOrchestrator {
             await ledger?.record(txID)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
             await publish(posted.customerInfo, source: .purchase)
-            return posted.customerInfo
+            return .posted(posted.customerInfo)
         case .failure(.finishable(let error)):
             // 确定性拒绝：重试无意义 —— finish（.revenueDog 模式）并删除上下文
             Log.warn("交易被后端确定性拒绝（tx=\(txID)）：\(error.description)", category: "purchase")
@@ -239,12 +262,12 @@ actor PurchasesOrchestrator {
                 await transaction.finish()
             }
             await pendingPurchases.remove(forKey: txID)
-            return nil
+            return .rejectedByServer(error)
         case .failure(.retryable(let error)):
             // 保留上下文，前台重放兜底（P3）
             Log.warn("交易上报暂时失败，保留待重放（tx=\(txID)）：\(error.description)", category: "purchase")
             _ = try? await pendingPurchases.incrementReplayCount(forKey: txID)
-            return nil
+            return .pendingServerConfirmation(error)
         }
     }
 
@@ -439,7 +462,9 @@ actor PurchasesOrchestrator {
 
         let stale = await deviceCache.isOfferingsStale(appUserID: appUserID, isAppBackgrounded: isBackgrounded)
         if !stale, let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
-            return cached
+            // 缓存里**不存** storeProduct（价格/文案是商店的当下事实，不该被我们冻在磁盘上），
+            // 读取时现补一次。
+            return await resolveStoreProducts(in: cached).offerings
         }
 
         let startedAt = Date()
@@ -447,20 +472,21 @@ actor PurchasesOrchestrator {
         do {
             let response = try await httpClient.perform(.getOfferings(appUserID: appUserID),
                                                         as: OfferingsWireModel.self, trace: trace)
-            // M2：这里再用 StoreKit 批量拉 platform_product_identifier 对应的商品填 storeProduct。
             let offerings = Offerings(wireModel: response.body)
+            // 缓存的是**后端下发的那份**（不含 storeProduct），读取时再补。
             await deviceCache.cache(offerings: offerings, appUserID: appUserID)
+            let resolved = await resolveStoreProducts(in: offerings)
             await recordOfferingsFetch(count: offerings.all.count,
-                                       notFoundProductIDs: await missingStoreProductIDs(in: offerings),
+                                       notFoundProductIDs: resolved.notFoundProductIDs,
                                        trace: trace, startedAt: startedAt, error: nil)
-            return offerings
+            return resolved.offerings
         } catch {
             if let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
                 Log.warn("offerings 拉取失败，回落缓存: \(error)", category: "offerings")
                 await diagnostics.warn(DiagnosticsWarningCode.offeringsCacheFallback)
                 await recordOfferingsFetch(count: cached.all.count, notFoundProductIDs: nil,
                                            trace: trace, startedAt: startedAt, error: error)
-                return cached
+                return await resolveStoreProducts(in: cached).offerings
             }
             await recordOfferingsFetch(count: nil, notFoundProductIDs: nil,
                                        trace: trace, startedAt: startedAt, error: error)
@@ -487,15 +513,30 @@ actor PurchasesOrchestrator {
                                  ])
     }
 
-    /// §6-4：后端 offerings 里配了、但商店查不到的商品 id。
-    /// 这是接线期最常见的一类事故（ASC 里没建、没过审、地区不售），端上不查就只能靠用户报「买不了」。
-    /// best-effort：查不动（无 StoreKit / 抛错）就返回 nil，不影响 offerings 本身。
-    private func missingStoreProductIDs(in offerings: Offerings) async -> [String]? {
-        guard let storeKit else { return nil }
+    /// 用 StoreKit **一次批量**拉齐 offerings 里全部 `platform_product_identifier`，
+    /// 填 `Package.storeProduct`，顺带算出「后端配了但商店查不到」的商品 id。
+    ///
+    /// 两件事共用同一次 `Product.products(for:)`：
+    /// - `Package.storeProduct`（宿主做定价文案的唯一来源）；
+    /// - §6-4 诊断字段 `offerings_fetch.not_found_product_ids` —— 接线期最常见的一类事故
+    ///   （ASC 里没建、没过审、地区不售），端上不查就只能靠用户报「买不了」。
+    ///
+    /// best-effort：查不动（无 StoreKit / 抛错）就原样返回，`notFoundProductIDs` 为 nil ——
+    /// 商品详情缺失绝不能让 offerings 本身失败。
+    private func resolveStoreProducts(
+        in offerings: Offerings,
+    ) async -> (offerings: Offerings, notFoundProductIDs: [String]?) {
+        guard let storeKit else { return (offerings, nil) }
         let wanted = Set(offerings.all.values.flatMap { $0.availablePackages.map(\.platformProductIdentifier) })
-        guard !wanted.isEmpty else { return [] }
-        guard let found = try? await storeKit.products(forIdentifiers: wanted) else { return nil }
-        return wanted.subtracting(found.map { $0.productIdentifier }).sorted()
+        guard !wanted.isEmpty else { return (offerings, []) }
+        guard let found = try? await storeKit.products(forIdentifiers: wanted) else { return (offerings, nil) }
+
+        var products: [String: StoreProduct] = [:]
+        for product in found {
+            products[product.productIdentifier] = await product.makeStoreProduct()
+        }
+        let notFound = wanted.subtracting(products.keys).sorted()
+        return (offerings.fillingStoreProducts(from: products), notFound)
     }
 
     // MARK: - 事件多播
@@ -650,7 +691,9 @@ actor PurchasesOrchestrator {
             await recordPurchaseResult(productIdentifier: productIdentifier,
                                        outcome: DiagnosticsPurchaseOutcome.pending,
                                        transactionID: nil, startedAt: purchaseStartedAt, error: nil)
-            return PurchaseResult(customerInfo: info, transactionIdentifier: nil, userCancelled: false)
+            // B：显式 pending 标志 —— 宿主此刻既不该发权益、也不该报错。
+            return PurchaseResult(customerInfo: info, transactionIdentifier: nil,
+                                  userCancelled: false, isPending: true)
 
         case .success(let transaction):
             // 坑 **#15**（同 productID **并发**购买配对张冠李戴）：交易 id 一到手就立刻把
@@ -663,18 +706,20 @@ actor PurchasesOrchestrator {
                                                   to: transaction.transactionIdentifier,
                                                   jws: transaction.jwsRepresentation)
             // 单一处理通道（C2-A）：直接结果与 updates 汇入同一 handle()
-            if let info = await handle(transaction: transaction, source: .purchase) {
+            let outcome = await handle(transaction: transaction, source: .purchase)
+            if let info = outcome.customerInfo {
                 await recordPurchaseResult(productIdentifier: productIdentifier,
                                            outcome: DiagnosticsPurchaseOutcome.success,
                                            transactionID: transaction.transactionIdentifier,
                                            startedAt: purchaseStartedAt, error: nil)
                 return PurchaseResult(customerInfo: info,
                                       transactionIdentifier: transaction.transactionIdentifier,
-                                      userCancelled: false)
+                                      userCancelled: false,
+                                      isPending: false)
             }
-            // 上报暂时失败：交易未 finish、上下文已留存，重放兜底；对宿主如实报错
-            let postFailure = PurchasesError(code: .networkError,
-                                             message: "购买已在商店完成，上报后端暂时失败，将自动重试（tx=\(transaction.transactionIdentifier)）")
+            // C：**钱已经扣了**，上报没成 —— 两种后果完全不同，必须给宿主两个码位，
+            // 不再共用一个裸 `.networkError`（宿主拿它没法决定给不给用户兜底）。
+            let postFailure = Self.postFailureError(outcome, transactionID: transaction.transactionIdentifier)
             await recordPurchaseResult(productIdentifier: productIdentifier,
                                        outcome: DiagnosticsPurchaseOutcome.error,
                                        transactionID: transaction.transactionIdentifier,
@@ -689,6 +734,45 @@ actor PurchasesOrchestrator {
                                            : DiagnosticsPurchaseOutcome.error,
                                        transactionID: nil, startedAt: purchaseStartedAt, error: error)
             throw error
+        }
+    }
+
+    /// 扣款之后上报失败的两个码位（C）。文案用中性英文 —— 这两条会被宿主直接
+    /// 拿去做用户可见提示，SDK 内部日志才是中文。
+    ///
+    /// - `.purchasePendingServerConfirmation`：交易**未 finish**、上下文已留存，
+    ///   SDK 会在前台/下次冷启动自动重放。宿主应提示「稍后到账」，**不要**重复扣款。
+    /// - `.purchaseRejectedByServer`：服务端确定性拒绝，交易已 finish，不会再有权益。
+    ///   `underlyingError` 带后端错误体码（`PurchasesError.backendCode`）。
+    static func postFailureError(_ outcome: TransactionHandleOutcome,
+                                 transactionID: String) -> PurchasesError {
+        switch outcome {
+        case .posted:
+            // 调用方已在上面处理；留一条兜底，语义与 `.skipped` 相同。
+            return PurchasesError(code: .purchasePendingServerConfirmation,
+                                  message: "The purchase completed in the App Store but the server "
+                                      + "confirmation is not available yet (transaction \(transactionID)).")
+        case .rejectedByServer(let error):
+            return PurchasesError(code: .purchaseRejectedByServer,
+                                  message: "The purchase completed in the App Store but the server "
+                                      + "rejected the receipt; no entitlement will be granted "
+                                      + "(transaction \(transactionID)).",
+                                  backendCode: error.backendCode,
+                                  httpStatusCode: error.httpStatusCode,
+                                  underlyingError: error)
+        case .pendingServerConfirmation(let error):
+            return PurchasesError(code: .purchasePendingServerConfirmation,
+                                  message: "The purchase completed in the App Store but could not be "
+                                      + "confirmed by the server yet; the transaction is retained and "
+                                      + "will be retried automatically (transaction \(transactionID)).",
+                                  backendCode: error.backendCode,
+                                  httpStatusCode: error.httpStatusCode,
+                                  underlyingError: error)
+        case .skipped:
+            return PurchasesError(code: .purchasePendingServerConfirmation,
+                                  message: "The purchase completed in the App Store but has not been "
+                                      + "confirmed by the server yet; the transaction is retained and "
+                                      + "will be retried automatically (transaction \(transactionID)).")
         }
     }
 
@@ -985,8 +1069,42 @@ actor PurchasesOrchestrator {
         // 有 finish 义务待清的交易键（.revenueDog：JWS 补报成功但无交易对象可 finish）
         var awaitingFinish: Set<String> = []
 
+        // **坑 #142**：带待重放上下文的冷启动过去要上报 2 次 —— 上下文重放先发一次（只有 JWS、
+        // 没有交易对象 → 不能 finish），接着 unfinished 扫描把同一笔又发一次（这次才 finish）。
+        // 服务端靠 content_hash 幂等，不是 bug，但白花一次请求，且两次 fetch_token 还不同
+        // （StoreKit 会重签），后端要多存一份 raw。
+        //
+        // 省法：**先看一眼两份 StoreKit 快照**（`Transaction.unfinished` + `currentEntitlements`），
+        // 凡是当下就看得见交易对象的上下文，这一轮跳过重放、交给下面的扫描 ——
+        // 扫描那条路径握着交易对象，一次上报就能把 finish 义务一起清掉。
+        // 去重键就是 `pendingPurchases` 现有的键（rekey 之后 = transactionId），不引入任何新状态。
+        // 看不见（P4 可见性滞后 / 交易已被清掉）时行为与从前完全一致。
+        var unfinishedSnapshot: [any StoreTransactionType] = []
+        var entitlementSnapshot: [any StoreTransactionType] = []
+        if let storeKit {
+            unfinishedSnapshot = await storeKit.unfinishedTransactions()
+                .sorted { $0.purchaseDate < $1.purchaseDate } // #26
+            entitlementSnapshot = await storeKit.currentEntitlementTransactions()
+                .sorted { $0.purchaseDate < $1.purchaseDate } // #26
+        }
+        // 只认「拿得到 JWS」的：没有 JWS 的交易扫描路径也报不出去，跳过重放会白丢一次补报机会。
+        var coveredByScan = Set(unfinishedSnapshot.filter { $0.jwsRepresentation != nil }
+            .map { $0.transactionIdentifier })
+        for transaction in entitlementSnapshot where transaction.jwsRepresentation != nil {
+            let txID = transaction.transactionIdentifier
+            // currentEntitlements 扫描对**台账已记**的交易是直接跳过的（#2 / #10 去重）——
+            // 那种交易让位过去就没人收尾了，上下文会永远挂着。只让位给「扫描真的会上报」的那些。
+            if let ledger, await ledger.contains(txID) { continue }
+            coveredByScan.insert(txID)
+        }
+
         let pending = await pendingPurchases.all()
         for context in pending where context.jws != nil {
+            if coveredByScan.contains(context.key) {
+                Log.debug("上下文 \(context.key) 对应的交易已在 unfinished 里可见，重放交给扫描路径（#142）",
+                          category: "purchase")
+                continue
+            }
             // M-2a：重放沿用**这笔购买发起时**的模式快照；没有快照的用当前运行时值。
             let completedBy = context.completedBy ?? settings.purchasesCompletedBy
             let result = await poster.post(jws: context.jws!,
@@ -1018,15 +1136,19 @@ actor PurchasesOrchestrator {
         if let storeKit {
             var attempt = 0
             var seen: Set<String> = []
+            // 第一轮直接复用上面那次读（#142 的快照）—— 不为省一次上报再多读一次 StoreKit。
+            var unfinished = unfinishedSnapshot
             while true {
                 attempt += 1
-                let unfinished = await storeKit.unfinishedTransactions()
-                    .sorted { $0.purchaseDate < $1.purchaseDate }
+                if attempt > 1 {
+                    unfinished = await storeKit.unfinishedTransactions()
+                        .sorted { $0.purchaseDate < $1.purchaseDate }
+                }
                 for transaction in unfinished {
                     let txID = transaction.transactionIdentifier
                     if seen.contains(txID) && !awaitingFinish.contains(txID) { continue }
                     seen.insert(txID)
-                    if await handle(transaction: transaction, source: .unfinishedScan) != nil {
+                    if await handle(transaction: transaction, source: .unfinishedScan).customerInfo != nil {
                         awaitingFinish.remove(txID)
                     }
                 }
@@ -1043,7 +1165,8 @@ actor PurchasesOrchestrator {
 
         // #2 后半：currentEntitlements 扫描 —— 已 finish 但可能从未上报成功的权益型交易
         // （别处设备购买 / 兑换码 / 历史上报失败后被宿主 finish）在 unfinished 里看不到。
-        await scanCurrentEntitlements()
+        // 复用上面那次读（#142）：这一轮里上面的循环已经上报过的，台账去重会挡住。
+        await scanCurrentEntitlements(snapshot: entitlementSnapshot)
     }
 
     /// **M-2b：观察者模式的前台激活重扫**（迁移方案 v2.1 §1 档 1）。
@@ -1111,14 +1234,14 @@ actor PurchasesOrchestrator {
 
     /// currentEntitlements 启动扫描（裁决 #2 后半）。台账去重：已上报过的不重发
     /// （已 finish 交易每次启动都在 currentEntitlements 里，无台账会变成每启动一 POST）。
-    private func scanCurrentEntitlements() async {
-        guard let storeKit else { return }
-        let entitlements = await storeKit.currentEntitlementTransactions()
-            .sorted { $0.purchaseDate < $1.purchaseDate } // #26
-        for transaction in entitlements {
+    ///
+    /// - Parameter snapshot: `replayPendingPurchases()` 开头读的那份快照（#142：读一次用两处）。
+    private func scanCurrentEntitlements(snapshot: [any StoreTransactionType]) async {
+        guard storeKit != nil else { return }
+        for transaction in snapshot {
             let txID = transaction.transactionIdentifier
             if let ledger, await ledger.contains(txID) { continue }
-            if await handle(transaction: transaction, source: .currentEntitlements) != nil {
+            if await handle(transaction: transaction, source: .currentEntitlements).customerInfo != nil {
                 await ledger?.record(txID)
             }
         }

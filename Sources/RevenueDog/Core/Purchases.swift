@@ -40,6 +40,11 @@ public struct Configuration: Sendable {
     /// 刻意保持 **internal**：宿主唯一需要的动作是 `with(diagnosticsEnabled:)`，
     /// 读回这个值没有集成价值，而公开面只进不出 —— 一条诊断需求只值一个公开符号。
     internal private(set) var diagnosticsEnabled: Bool
+    /// 宿主注入的传输层（**仅测试用**）。nil = 用内置 `URLSession` 实现。
+    ///
+    /// 与 `diagnosticsEnabled` 同理保持 **internal**：宿主要做的只是 `with(transport:)`，
+    /// 读回来没有集成价值。
+    internal private(set) var transport: (any HTTPTransport)?
 
     public static let defaultBaseURL = URL(string: "https://api.revdog.org")!
 
@@ -91,6 +96,28 @@ public struct Configuration: Sendable {
     public func with(diagnosticsEnabled: Bool) -> Configuration {
         var copy = self
         copy.diagnosticsEnabled = diagnosticsEnabled
+        return copy
+    }
+
+    /// **仅测试用**：把 SDK 的全部出站请求接到宿主自己的假后端上。
+    ///
+    /// ```swift
+    /// struct FakeBackend: HTTPTransport {
+    ///     func send(_ request: URLRequest) async throws -> HTTPTransportResponse {
+    ///         HTTPTransportResponse(statusCode: 200, headers: [:], body: subscriberJSON)
+    ///     }
+    /// }
+    /// Purchases.configure(with: Configuration(apiKey: "pk_test")
+    ///     .with(transport: FakeBackend()))
+    /// ```
+    ///
+    /// 用途：宿主的集成测试 / UI 预览要在**不连后端**的情况下跑完 SDK 链路
+    /// （购买、身份、CustomerInfo 都能编排）。
+    /// **不要在生产构建里注入** —— 不注入时 SDK 用内置的 `URLSession` 实现，
+    /// 它带着超时、缓存禁用与连接策略。
+    public func with(transport: any HTTPTransport) -> Configuration {
+        var copy = self
+        copy.transport = transport
         return copy
     }
 }
@@ -250,7 +277,8 @@ public final class Purchases {
             #endif
             return Dependencies(identityStorage: UserDefaultsIdentityStorage(),
                                 cacheStorage: cacheStorage,
-                                transport: URLSessionTransport.makeDefault(),
+                                // 宿主注入的假后端优先（`Configuration.with(transport:)`，仅测试用）
+                                transport: configuration.transport ?? URLSessionTransport.makeDefault(),
                                 pendingPurchasesDirectory: pendingDirectory,
                                 storeKit: storeKit)
         }

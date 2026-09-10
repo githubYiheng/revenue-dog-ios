@@ -412,7 +412,7 @@ struct M4CrashReplayTests {
                                                     completedBy: .revenueDog))
     }
 
-    @Test("切点①（上报前崩溃）：重启后 JWS 补报 + unfinished 配对 → finish 恰好一次、上下文清空、台账落账")
+    @Test("切点①（上报前崩溃）：重启后**只上报一次**（#142）→ finish 恰好一次、上下文清空、台账落账")
     func crashBeforePost() async throws {
         let dir = tempDirectory()
         try await Self.seedContext(directory: dir, key: "tx-crash-1",
@@ -434,9 +434,10 @@ struct M4CrashReplayTests {
         await Purchases.awaitConfigured()
 
         #expect(flag.callCount == 1) // 无漏 finish，也没有重复 finish
-        // 两次 POST：JWS 补报（无交易对象 → 不能 finish）+ unfinished 配对后的那次（带交易对象 → finish）。
-        // 服务端按 fetch_token 幂等收敛（契约 §1.6），端上不做第三次。
-        #expect(await transport.callCount(forPath: receiptsPath) == 2)
+        // **坑 #142**：这笔交易在 `unfinished` 里当场就看得见 → 上下文重放让位给扫描路径，
+        // 全程**只有一次** POST（扫描那条握着交易对象，一次上报把 finish 义务一起清掉）。
+        // 从前是两次（JWS 补报一次 + 配对后再一次），靠服务端 content_hash 幂等收敛。
+        #expect(await transport.callCount(forPath: receiptsPath) == 1)
         #expect(await PendingPurchaseStore(directory: dir).all().isEmpty)
     }
 
@@ -464,11 +465,11 @@ struct M4CrashReplayTests {
         await Purchases.awaitConfigured()
 
         #expect(flag.callCount == 1)  // 消耗型：响应确认后才 finish，且只 finish 一次
-        #expect(await transport.callCount(forPath: receiptsPath) == 2)
+        #expect(await transport.callCount(forPath: receiptsPath) == 1)  // #142：只上报一次
         #expect(await PendingPurchaseStore(directory: dir).all().isEmpty)
     }
 
-    @Test("切点③（finish 后、台账/上下文清理前崩溃）：重启后不再漏 finish，上下文清空、台账补上")
+    @Test("切点③（finish 后、台账/上下文清理前崩溃）：**只上报一次**（#142），上下文清空、台账补上")
     func crashAfterFinishBeforeLedger() async throws {
         let dir = tempDirectory()
         try await Self.seedContext(directory: dir, key: "tx-crash-3",
@@ -498,8 +499,9 @@ struct M4CrashReplayTests {
         // 上下文最终由 currentEntitlements 扫描收尾清掉，台账补上去重标记
         #expect(await PendingPurchaseStore(directory: dir).all().isEmpty)
         #expect(await SyncedTransactionLedger(fileURL: ledgerURL).contains("tx-crash-3"))
-        // 上报次数有限（JWS 补报 + currentEntitlements 配对），不会因为「finish 义务清不掉」而无限打
-        #expect(await transport.callCount(forPath: receiptsPath) == 2)
+        // **坑 #142**：这笔交易崩溃前已 finish，`unfinished` 里看不见它，但 `currentEntitlements`
+        // 里看得见 → 上下文重放同样让位给扫描路径，全程**只有一次** POST（从前是两次）。
+        #expect(await transport.callCount(forPath: receiptsPath) == 1)
     }
 
     @Test("崩溃重放不双重上报：同一笔交易第二次冷启动时台账已去重，零新增 POST")

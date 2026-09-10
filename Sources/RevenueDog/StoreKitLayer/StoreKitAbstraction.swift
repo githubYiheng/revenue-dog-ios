@@ -56,18 +56,31 @@ protocol StoreProductType: Sendable {
     var localizedPriceString: String { get }
     /// 是否为订阅型商品。
     var isSubscription: Bool { get }
+    /// 订阅周期（非订阅商品为 nil）。
+    var subscriptionPeriod: SubscriptionPeriod? { get }
+    /// 介绍性优惠 + 当前 Apple ID 的资格。
+    ///
+    /// 做成 `async`：资格判定要向 StoreKit 查（`Product.SubscriptionInfo.isEligibleForIntroOffer`
+    /// 是 async 属性，且语义是**订阅组级**的，坑 #91）。查不动一律返回 nil，绝不 throw。
+    func introductoryOffer() async -> IntroductoryOffer?
 }
 
 extension StoreProductType {
 
-    /// 转成公开模型。
-    var storeProduct: StoreProduct {
+    // 默认实现：不带订阅信息的商品替身（测试 / 非订阅平台）无需逐个实现。
+    var subscriptionPeriod: SubscriptionPeriod? { nil }
+    func introductoryOffer() async -> IntroductoryOffer? { nil }
+
+    /// 转成公开模型（`Package.storeProduct` 的唯一构造点）。
+    func makeStoreProduct() async -> StoreProduct {
         StoreProduct(productIdentifier: productIdentifier,
                      localizedTitle: localizedTitle,
                      localizedDescription: localizedDescription,
                      price: price,
                      currencyCode: currencyCode,
-                     localizedPriceString: localizedPriceString)
+                     localizedPriceString: localizedPriceString,
+                     subscriptionPeriod: subscriptionPeriod,
+                     introductoryOffer: await introductoryOffer())
     }
 }
 
@@ -216,6 +229,50 @@ struct SK2Product: StoreProductType {
     var currencyCode: String? { underlying.priceFormatStyle.currencyCode }
     var localizedPriceString: String { underlying.displayPrice }
     var isSubscription: Bool { underlying.subscription != nil }
+
+    var subscriptionPeriod: SubscriptionPeriod? {
+        guard let subscription = underlying.subscription else { return nil }
+        return Self.period(subscription.subscriptionPeriod)
+    }
+
+    /// 「新 SK2 API 接入模板」纪律：`Unit` 是 enum（`@unknown default` 兜底），
+    /// `PaymentMode` 是 struct + static 常量（`default` 兜底）—— 两者都不许硬吃未知值。
+    func introductoryOffer() async -> IntroductoryOffer? {
+        guard let subscription = underlying.subscription,
+              let offer = subscription.introductoryOffer else { return nil }
+        // 资格是组级语义（坑 #91）；端上结论仅用于文案（裁决 #124）。
+        let isEligible = await subscription.isEligibleForIntroOffer
+        return IntroductoryOffer(type: Self.offerType(offer.paymentMode),
+                                 period: Self.period(offer.period),
+                                 periodCount: offer.periodCount,
+                                 displayPrice: offer.displayPrice,
+                                 isEligible: isEligible)
+    }
+
+    private static func period(_ period: Product.SubscriptionPeriod) -> SubscriptionPeriod {
+        let unit: SubscriptionPeriod.Unit
+        switch period.unit {
+        case .day: unit = .day
+        case .week: unit = .week
+        case .month: unit = .month
+        case .year: unit = .year
+        @unknown default:
+            Log.warn("未知订阅周期单位，按 unknown 处理", category: "storekit")
+            unit = .unknown
+        }
+        return SubscriptionPeriod(unit: unit, value: period.value)
+    }
+
+    private static func offerType(_ mode: Product.SubscriptionOffer.PaymentMode) -> IntroductoryOffer.OfferType {
+        switch mode {
+        case .freeTrial: return .freeTrial
+        case .payAsYouGo: return .payAsYouGo
+        case .payUpFront: return .payUpFront
+        default:
+            Log.warn("未知介绍性优惠形态（\(mode.rawValue)），按 unknown 处理", category: "storekit")
+            return .unknown
+        }
+    }
 }
 
 @available(iOS 16.0, macOS 13.0, tvOS 16.0, watchOS 9.0, *)
@@ -408,8 +465,12 @@ actor FakeStoreKitProvider: StoreKitProvider {
         updatesContinuation.yield(transaction)
     }
 
+    /// `products(forIdentifiers:)` 的调用次数（A 项断言「补 storeProduct 与算 not_found 只查一次商店」）。
+    private(set) var productsCallCount = 0
+
     func products(forIdentifiers identifiers: Set<String>) async throws -> [any StoreProductType] {
-        identifiers.compactMap { productsByIdentifier[$0] }
+        productsCallCount += 1
+        return identifiers.compactMap { productsByIdentifier[$0] }
     }
 
     nonisolated func transactionUpdates() -> AsyncStream<any StoreTransactionType> {

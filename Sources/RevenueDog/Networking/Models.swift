@@ -778,6 +778,11 @@ public struct Offerings: Sendable, Hashable, Codable {
 
     public subscript(identifier: String) -> Offering? { all[identifier] }
 
+    init(all: [String: Offering], currentOfferingIdentifier: String?) {
+        self.all = all
+        self.currentOfferingIdentifier = currentOfferingIdentifier
+    }
+
     init(wireModel: OfferingsWireModel) {
         var offerings: [String: Offering] = [:]
         for wire in wireModel.offerings where !wire.identifier.isEmpty {
@@ -795,6 +800,129 @@ public struct Offerings: Sendable, Hashable, Codable {
         self.all = offerings
         self.currentOfferingIdentifier = wireModel.currentOfferingID
     }
+
+    /// 用 StoreKit 查回来的商品详情补 `Package.storeProduct`（M2 A 项）。
+    /// 查不到的商品保持 `nil` —— 「后端配了但商店没有」在诊断事件
+    /// `offerings_fetch.not_found_product_ids` 里已经有记录点，这里不再重复判定。
+    func fillingStoreProducts(from products: [String: StoreProduct]) -> Offerings {
+        let filled = all.mapValues { offering in
+            Offering(identifier: offering.identifier,
+                     serverDescription: offering.serverDescription,
+                     availablePackages: offering.availablePackages.map { package in
+                         Package(identifier: package.identifier,
+                                 packageType: package.packageType,
+                                 offeringIdentifier: package.offeringIdentifier,
+                                 platformProductIdentifier: package.platformProductIdentifier,
+                                 storeProduct: products[package.platformProductIdentifier])
+                     })
+        }
+        return Offerings(all: filled, currentOfferingIdentifier: currentOfferingIdentifier)
+    }
+}
+
+// MARK: - 公开模型：订阅周期与介绍性优惠（由 StoreKit 填充，供宿主做定价文案）
+
+/// 订阅周期。禁 public enum → 单位用 struct + static 常量（Apple 日后加单位不摔老 SDK）。
+public struct SubscriptionPeriod: Sendable, Hashable, Codable, CustomStringConvertible {
+
+    /// 周期单位。
+    public struct Unit: Sendable, Hashable, Codable, CustomStringConvertible {
+
+        public let rawValue: String
+
+        public init(rawValue: String) { self.rawValue = rawValue.lowercased() }
+
+        public static let day = Unit(rawValue: "day")
+        public static let week = Unit(rawValue: "week")
+        public static let month = Unit(rawValue: "month")
+        public static let year = Unit(rawValue: "year")
+        /// StoreKit 给出了我们还不认识的单位。
+        public static let unknown = Unit(rawValue: "unknown")
+
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            self.init(rawValue: (try? container.decode(String.self)) ?? Unit.unknown.rawValue)
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
+
+        public var description: String { rawValue }
+    }
+
+    public let unit: Unit
+    /// 单位数量（`value = 3` + `unit = .month` = 三个月）。
+    public let value: Int
+
+    public init(unit: Unit, value: Int) {
+        self.unit = unit
+        self.value = value
+    }
+
+    public var description: String { "\(value) \(unit.rawValue)" }
+}
+
+/// 介绍性优惠（首购优惠）。禁 public enum → 类型用 struct + static 常量。
+public struct IntroductoryOffer: Sendable, Hashable, Codable {
+
+    /// 优惠形态。Apple 三选一：免费试用 / 分期低价 / 一次性预付。
+    public struct OfferType: Sendable, Hashable, Codable, CustomStringConvertible {
+
+        public let rawValue: String
+
+        public init(rawValue: String) { self.rawValue = rawValue.lowercased() }
+
+        /// 免费试用。
+        public static let freeTrial = OfferType(rawValue: "free_trial")
+        /// 优惠期内按周期付低价。
+        public static let payAsYouGo = OfferType(rawValue: "pay_as_you_go")
+        /// 优惠期一次性预付。
+        public static let payUpFront = OfferType(rawValue: "pay_up_front")
+        /// StoreKit 给出了我们还不认识的形态。
+        public static let unknown = OfferType(rawValue: "unknown")
+
+        public init(from decoder: any Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            self.init(rawValue: (try? container.decode(String.self)) ?? OfferType.unknown.rawValue)
+        }
+
+        public func encode(to encoder: any Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(rawValue)
+        }
+
+        public var description: String { rawValue }
+    }
+
+    public let type: OfferType
+    /// 优惠期长度（**单个**周期，不含重复次数 —— 重复次数见 `periodCount`）。
+    public let period: SubscriptionPeriod
+    /// 优惠期重复几次（`Product.SubscriptionOffer.periodCount` 原样带出）。
+    ///
+    /// `payAsYouGo` 靠它才做得出「$1.99/月 × 3 个月」这种文案（`period` 只是「1 个月」）；
+    /// `freeTrial` / `payUpFront` 通常是 1，但一律**如实带**，不在端上做归一化。
+    public let periodCount: Int
+    /// 本地化价格串（免费试用为商店给出的零价串）。
+    public let displayPrice: String
+    /// 当前 Apple ID 是否**还有资格**享受该优惠（`Product.SubscriptionInfo.isEligibleForIntroOffer`）。
+    ///
+    /// 资格是**订阅组级**的（坑 #91），且端上判定不可信（裁决 #124）——
+    /// 只用于展示文案，计费与权益一律以服务端为准。
+    public let isEligible: Bool
+
+    public init(type: OfferType,
+                period: SubscriptionPeriod,
+                periodCount: Int,
+                displayPrice: String,
+                isEligible: Bool) {
+        self.type = type
+        self.period = period
+        self.periodCount = periodCount
+        self.displayPrice = displayPrice
+        self.isEligible = isEligible
+    }
 }
 
 // MARK: - 公开模型：StoreProduct（M2 由 StoreKit 填充）
@@ -807,6 +935,14 @@ public struct StoreProduct: Sendable, Hashable, Codable {
     public let price: Decimal
     public let currencyCode: String?
     public let localizedPriceString: String
+    /// 订阅周期。非订阅商品（消耗型 / 非消耗型 / 永久）为 nil。
+    public let subscriptionPeriod: SubscriptionPeriod?
+    /// 介绍性优惠（含当前 Apple ID 的资格）。没有配置优惠时为 nil。
+    public let introductoryOffer: IntroductoryOffer?
+
+    /// 本地化价格串的 StoreKit 2 命名别名（与 `localizedPriceString` **同值**）。
+    /// 从 RC 迁移的代码读 `localizedPriceString`，照 StoreKit 2 写的代码读 `displayPrice`。
+    public var displayPrice: String { localizedPriceString }
 
     public init(productIdentifier: String,
                 localizedTitle: String,
@@ -814,12 +950,32 @@ public struct StoreProduct: Sendable, Hashable, Codable {
                 price: Decimal,
                 currencyCode: String?,
                 localizedPriceString: String) {
+        self.init(productIdentifier: productIdentifier,
+                  localizedTitle: localizedTitle,
+                  localizedDescription: localizedDescription,
+                  price: price,
+                  currencyCode: currencyCode,
+                  localizedPriceString: localizedPriceString,
+                  subscriptionPeriod: nil,
+                  introductoryOffer: nil)
+    }
+
+    public init(productIdentifier: String,
+                localizedTitle: String,
+                localizedDescription: String,
+                price: Decimal,
+                currencyCode: String?,
+                localizedPriceString: String,
+                subscriptionPeriod: SubscriptionPeriod?,
+                introductoryOffer: IntroductoryOffer?) {
         self.productIdentifier = productIdentifier
         self.localizedTitle = localizedTitle
         self.localizedDescription = localizedDescription
         self.price = price
         self.currencyCode = currencyCode
         self.localizedPriceString = localizedPriceString
+        self.subscriptionPeriod = subscriptionPeriod
+        self.introductoryOffer = introductoryOffer
     }
 }
 
@@ -830,10 +986,27 @@ public struct PurchaseResult: Sendable {
     public let customerInfo: CustomerInfo
     public let transactionIdentifier: String?
     public let userCancelled: Bool
+    /// 购买已提交、但**还在等第三方批准**（Ask-to-Buy 家长同意 / SCA 银行验证）。
+    ///
+    /// 为 true 时 `transactionIdentifier == nil` 且 `userCancelled == false`：
+    /// 交易稍后会从 `Transaction.updates` 流出并由 SDK 自动上报，宿主此刻**不要**发放权益，
+    /// 请提示「等待批准」并监听 `customerInfoStream`。
+    public let isPending: Bool
 
     public init(customerInfo: CustomerInfo, transactionIdentifier: String?, userCancelled: Bool) {
+        self.init(customerInfo: customerInfo,
+                  transactionIdentifier: transactionIdentifier,
+                  userCancelled: userCancelled,
+                  isPending: false)
+    }
+
+    public init(customerInfo: CustomerInfo,
+                transactionIdentifier: String?,
+                userCancelled: Bool,
+                isPending: Bool) {
         self.customerInfo = customerInfo
         self.transactionIdentifier = transactionIdentifier
         self.userCancelled = userCancelled
+        self.isPending = isPending
     }
 }

@@ -157,14 +157,33 @@ enum Endpoint: Sendable, Equatable {
 
 // MARK: - 传输层
 
-struct HTTPTransportResponse: Sendable {
-    let statusCode: Int
-    let headers: [String: String]
-    let body: Data
+/// 一次 HTTP 往返的响应。
+///
+/// **公开面的存在理由只有一个：让宿主能在自己的测试里塞一个假后端**
+/// （`Configuration.with(transport:)`）。生产接线不需要碰它。
+public struct HTTPTransportResponse: Sendable {
+
+    public let statusCode: Int
+    /// 响应头。SDK 读 `X-Request-Id` / `Retry-After` / `Is-Retryable`（设计 §5）。
+    public let headers: [String: String]
+    public let body: Data
+
+    public init(statusCode: Int, headers: [String: String], body: Data) {
+        self.statusCode = statusCode
+        self.headers = headers
+        self.body = body
+    }
 }
 
-/// 传输层协议 —— 测试注入点（出站请求快照基建靠它）。
-protocol HTTPTransport: Sendable {
+/// 传输层协议 —— SDK 全部出站请求的唯一出口。
+///
+/// **仅测试用**：宿主在集成测试里实现它 + `Configuration.with(transport:)`，
+/// 就能在不连后端的情况下跑完整条 SDK 链路（SDK 自己的 StoreKitTest 套件就是这么做的）。
+/// 生产环境不要注入 —— 不注入时 SDK 用内置的 `URLSession` 实现（含超时/缓存策略）。
+///
+/// 实现要求：`send` 只做「发出去、把响应原样带回来」。重试、退避、`Retry-After`、
+/// 鉴权头、诊断头一律由 SDK 自己在上层做，实现方**不要**重复一遍。
+public protocol HTTPTransport: Sendable {
     func send(_ request: URLRequest) async throws -> HTTPTransportResponse
 }
 

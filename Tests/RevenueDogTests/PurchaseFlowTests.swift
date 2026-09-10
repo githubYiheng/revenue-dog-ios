@@ -38,12 +38,18 @@ struct FakeTransaction: StoreTransactionType {
 
 struct FakeProduct: StoreProductType {
     let productIdentifier: String
+    /// 订阅周期（A 项：`Package.storeProduct` 的字段来源）。默认 nil = 不是订阅。
+    var subscriptionPeriod: SubscriptionPeriod?
+    /// 介绍性优惠（含资格）。协议要求是 async 方法，这里用存储属性承载脚本值。
+    var introOffer: IntroductoryOffer?
+
     var localizedTitle: String { productIdentifier }
     var localizedDescription: String { productIdentifier }
     var price: Decimal { 9.99 }
     var currencyCode: String? { "USD" }
     var localizedPriceString: String { "$9.99" }
     var isSubscription: Bool { true }
+    func introductoryOffer() async -> IntroductoryOffer? { introOffer }
 }
 
 // MARK: - Fixtures

@@ -25,6 +25,79 @@ SwiftPM 包，Swift 6 严格并发，**产品基线 iOS 16**。
 - `docs/plan/ios-sdk-pitfall-matrix.md`
 - 门禁报告：`docs/audit/2026-08-28-sdk-m2-gate.md`
 
+## 宿主接线要点
+
+### 商品文案：`Package.storeProduct`（0.2.0 起不再恒 nil）
+
+`offerings()` 会用 StoreKit 2 一次批量把商品详情填进每个 `Package`。做定价文案直接读它：
+
+```swift
+guard let package = try await Purchases.shared.offerings().current?.monthly,
+      let product = package.storeProduct else { return }   // nil = 商店里查不到这个商品
+
+product.displayPrice              // "¥68.00"（== localizedPriceString，StoreKit 2 命名别名）
+product.price                     // Decimal(68)
+product.currencyCode              // "CNY"
+product.subscriptionPeriod        // SubscriptionPeriod(unit: .month, value: 1)
+if let offer = product.introductoryOffer, offer.isEligible {
+    // offer.type ∈ .freeTrial / .payAsYouGo / .payUpFront
+    // offer.period（单个周期）/ offer.periodCount（重复几次）/ offer.displayPrice
+    // payAsYouGo 的文案要两者一起用："\(offer.displayPrice) / \(offer.period)" × periodCount
+}
+```
+
+> `storeProduct == nil` = 后端 offerings 里配了、但 App Store 查不到（ASC 没建 / 没过审 / 地区不售）。
+> 这一条同时会进诊断事件 `offerings_fetch.not_found_product_ids`，后台可直接查到是哪几个 id。
+> `introductoryOffer.isEligible` 是**订阅组级**且端上不可信的判定（坑 #91 / 裁决 #124）——
+> 只用来决定 UI 上显不显示优惠文案，**计费与权益一律以服务端为准**。
+
+### 购买结果：`isPending` 与扣款后的两个错误码
+
+```swift
+do {
+    let result = try await Purchases.shared.purchase(package: package)
+    if result.userCancelled {
+        // 用户自己取消，什么都不用做
+    } else if result.isPending {
+        // Ask-to-Buy（家长同意）/ SCA（银行验证）：transactionIdentifier == nil
+        // **不要**发权益、**不要**报错；提示「等待批准」，监听 customerInfoStream 等结果
+    } else {
+        // 已上报后端并落库，result.customerInfo 就是最新权益
+    }
+} catch let error as PurchasesError {
+    switch error.code {
+    case .purchasePendingServerConfirmation:
+        // 钱扣了、后端暂时没确认（5xx / 断网 / 401 / 403 / 408 / 429）。
+        // 交易**未 finish**、上下文已落盘，SDK 会自动重放。
+        // 提示「支付已收到，权益稍后到账」，**绝不要**引导用户再买一次。
+    case .purchaseRejectedByServer:
+        // 钱扣了、后端确定性拒绝（确定性 4xx）。交易**已 finish**，不会再有权益。
+        // 这是要人看的状态：走客服 / 退款路径，别静默吞掉。
+        // (error.underlyingError as? PurchasesError)?.backendCode 带后端错误体码。
+    case .purchaseCancelledError, .purchaseNotAllowedError, .storeProblemError:
+        // 商店侧失败，钱没扣
+    default:
+        break
+    }
+}
+```
+
+### 集成测试：把假后端接进来（仅测试用）
+
+```swift
+struct FakeBackend: HTTPTransport {
+    func send(_ request: URLRequest) async throws -> HTTPTransportResponse {
+        HTTPTransportResponse(statusCode: 200, headers: [:], body: subscriberJSON)
+    }
+}
+
+Purchases.configure(with: Configuration(apiKey: "pk_test")
+    .with(transport: FakeBackend()))       // 不注入 = 用内置 URLSession 实现
+```
+
+只做「发出去、把响应原样带回来」即可 —— 重试、退避、`Retry-After`、鉴权头、诊断头都由 SDK 上层负责。
+**不要在生产构建里注入。**
+
 ## 本机开发
 
 ```bash
@@ -135,6 +208,7 @@ SDK 侧声明：
 | 文件 | 作用 |
 |---|---|
 | `Tests/RevenueDogTests/Support/MockTransport.swift` | 出站请求捕获 + 可编排响应；支持**按路径**排队 stub、按路径注入超时/断网、整机断网 |
+| `Tests/RevenueDogTests/PublicTransportInjectionTests.swift` | **故意不 `@testable`**：公开注入路径（`HTTPTransport` / `Configuration.with(transport:)`）的可用性门禁 |
 | `Tests/RevenueDogTests/Support/RequestSnapshot.swift` | 出站请求 JSON 快照 |
 | `Tests/RevenueDogTests/Support/SingletonSerialDomain.swift` | 碰 `Purchases` 静态单例的 suite 必须挂在这个串行域下 |
 | `Sources/RevenueDog/StoreKitLayer/StoreKitAbstraction.swift` | `FakeStoreKitProvider`：纯内存 StoreKit 替身 |
@@ -198,7 +272,7 @@ Xcode 打开工程 → 选真机 → Run → 进「核验」页按清单逐条�
 因此 `Package.swift` **不声明** StoreKitTest 相关 target；场景测试挂在
 `Example/RevenueDogStoreKitTests`（host = 示例 app）。分工是：
 **StoreKit 是真的**（`SKTestSession` 驱动，JWS / `appAccountToken` / `finish()` 都是真的），
-**后端是假的**（transport 注入 `Purchases.Dependencies.transport`）。
+**后端是假的**（transport 走**公开**注入点 `Configuration.with(transport:)`，与宿主用的是同一条路径）。
 
 ### 运行
 
@@ -212,7 +286,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 可覆盖变量：`SK_OS` / `SK_DEVICE` / `SK_DESTINATION` / `SK_SCHEME` / `SK_TEST_PLAN` /
 `SK_FILTER` / `SK_DERIVED_DATA` / `XCODEGEN`。
 
-### 场景表（21 条，iOS 18.5 全绿 ×3）
+### 场景表（23 条，iOS 18.5 全绿）
 
 | # | 场景 | 对照编号 | 关键断言 |
 |:-:|---|---|---|
@@ -237,6 +311,8 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 | ⑨ | 购买后同组 intro 资格翻转 | 裁决 #124 | 端上不可信，以服务端为准 |
 | ⑩ | 消耗型未在响应 `non_subscriptions` 确认 → **绝不 finish** | 坑 #6（必抄 #1） | 「钱付了道具没到」的防线 |
 | ⑩ | 响应确认该交易 id → finish、上下文清空 | 坑 #6 | — |
+| ⑪ | 一次购买产出 `purchase_started → transaction_observed → receipt_post → finish_decision` | ADR 0028 | 事件字段合规、无 JWS/密钥外泄 |
+| ⑫ | `Package.storeProduct` 来自真 StoreKit | v0.2.0 A | 价格 / `subscriptionPeriod` 映射正确；消耗型无周期；商店没有的仍为 nil |
 
 ### 做不到 / 没做的场景（写明理由，不硬凑）
 

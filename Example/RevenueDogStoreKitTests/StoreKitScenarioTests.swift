@@ -795,5 +795,63 @@ extension StoreKitScenarioDomain {
             #expect(second.pendingContextCount() == 0)
         }
     }
+
+    // MARK: - ⑫ offerings 的商品详情（v0.2.0 A）
+
+    /// 单测层的 A 项用 `FakeStoreKitProvider` 打桩，验的是「填进去的东西对不对」；
+    /// **真 StoreKit → `StoreProduct` 的字段映射**（`Product.SubscriptionPeriod.Unit` 那个 switch、
+    /// `priceFormatStyle.currencyCode`、`displayName`）只有这里能验。
+    @MainActor
+    @Suite("⑫ offerings 商品详情（真 StoreKit → StoreProduct 映射）")
+    struct OfferingsStoreProductTests {
+
+        /// 后端下发四个包：三个真商品 + 一个商店里根本没有的。
+        private static let offeringsJSON = """
+        {"current_offering_id":"default","offerings":[{"identifier":"default","description":"default",
+          "packages":[{"identifier":"$rc_monthly","platform_product_identifier":"com.demo.monthly"},
+                      {"identifier":"$rc_annual","platform_product_identifier":"com.demo.yearly"},
+                      {"identifier":"coins","platform_product_identifier":"com.demo.coins"},
+                      {"identifier":"ghost","platform_product_identifier":"com.demo.nope"}]}]}
+        """
+
+        @Test("Package.storeProduct 来自真 StoreKit：价格与订阅周期正确；消耗型无周期；商店没有的仍为 nil")
+        func storeProductsComeFromRealStoreKit() async throws {
+            let session = try await SKTestHarness.makeSession()
+            try await SKTestHarness.requireSessionIsLive()
+            let directory = try TempDirectory.make()
+            defer { TempDirectory.remove(directory); SDKSession.tearDown() }
+            _ = session
+
+            let sdk = await SDKSession.start(directory: directory, receipts: [.json(FakeBackend.empty())])
+            await sdk.transport.enqueue(.json(Self.offeringsJSON), forPath: "/offerings")
+
+            let offerings = try await sdk.purchases.offerings()
+            let current = try #require(offerings.current)
+
+            let monthly = try #require(current.monthly?.storeProduct)
+            #expect(monthly.productIdentifier == DemoProduct.monthly)
+            #expect(monthly.localizedTitle == "Demo Pro Monthly")
+            #expect(monthly.price == Decimal(string: "9.99"))
+            #expect(monthly.currencyCode == "USD")                      // storefront = USA
+            #expect(monthly.displayPrice == monthly.localizedPriceString)
+            #expect(monthly.displayPrice.contains("9.99"))
+            #expect(monthly.subscriptionPeriod == SubscriptionPeriod(unit: .month, value: 1))
+            // `.storekit` 两档订阅都没配 introductoryOffer（场景 ⑨ 的前提）→ 必须是 nil
+            #expect(monthly.introductoryOffer == nil)
+
+            let yearly = try #require(current.annual?.storeProduct)
+            #expect(yearly.subscriptionPeriod == SubscriptionPeriod(unit: .year, value: 1))
+            #expect(yearly.price == Decimal(string: "99.99"))
+
+            // 消耗型：没有订阅周期、没有优惠
+            let coins = try #require(current["coins"]?.storeProduct)
+            #expect(coins.subscriptionPeriod == nil)
+            #expect(coins.introductoryOffer == nil)
+
+            // 商店里没有的商品：storeProduct 保持 nil，offerings 本身照常返回
+            #expect(current["ghost"] != nil)
+            #expect(current["ghost"]?.storeProduct == nil)
+        }
+    }
 }
 #endif

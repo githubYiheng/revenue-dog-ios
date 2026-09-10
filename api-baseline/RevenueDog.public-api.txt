@@ -10,8 +10,13 @@ Constructor EntitlementInfo.init(from:)
 Constructor EntitlementInfos.init(all:requestDate:)
 Constructor EntitlementInfos.init(from:)
 Constructor FetchPolicy.init(rawValue:)
+Constructor HTTPTransportResponse.init(statusCode:headers:body:)
 Constructor InitiationSource.init(from:)
 Constructor InitiationSource.init(rawValue:)
+Constructor IntroductoryOffer.OfferType.init(from:)
+Constructor IntroductoryOffer.OfferType.init(rawValue:)
+Constructor IntroductoryOffer.init(from:)
+Constructor IntroductoryOffer.init(type:period:periodCount:displayPrice:isEligible:)
 Constructor Money.init(amount:currency:)
 Constructor Money.init(from:)
 Constructor Offering.init(from:)
@@ -24,6 +29,7 @@ Constructor PackageType.init(rawValue:)
 Constructor PeriodType.init(from:)
 Constructor PeriodType.init(rawValue:)
 Constructor PurchaseResult.init(customerInfo:transactionIdentifier:userCancelled:)
+Constructor PurchaseResult.init(customerInfo:transactionIdentifier:userCancelled:isPending:)
 Constructor PurchasesCompletedBy.init(from:)
 Constructor PurchasesCompletedBy.init(rawValue:)
 Constructor PurchasesError.init(code:message:backendCode:httpStatusCode:userInfo:underlyingError:)
@@ -31,6 +37,11 @@ Constructor Store.init(from:)
 Constructor Store.init(rawValue:)
 Constructor StoreProduct.init(from:)
 Constructor StoreProduct.init(productIdentifier:localizedTitle:localizedDescription:price:currencyCode:localizedPriceString:)
+Constructor StoreProduct.init(productIdentifier:localizedTitle:localizedDescription:price:currencyCode:localizedPriceString:subscriptionPeriod:introductoryOffer:)
+Constructor SubscriptionPeriod.Unit.init(from:)
+Constructor SubscriptionPeriod.Unit.init(rawValue:)
+Constructor SubscriptionPeriod.init(from:)
+Constructor SubscriptionPeriod.init(unit:value:)
 Enum PurchaseUIContext  [Custom]
 Func Attribution.enableAdServicesAttributionTokenCollection()  [Final]
 Func Configuration.with(appUserID:)
@@ -38,6 +49,7 @@ Func Configuration.with(baseURL:)
 Func Configuration.with(diagnosticsEnabled:)
 Func Configuration.with(logLevel:)
 Func Configuration.with(purchasesCompletedBy:)
+Func Configuration.with(transport:)
 Func CustomerInfo.__derived_struct_equals(_:_:)  [Implements]
 Func CustomerInfo.encode(to:)
 Func CustomerInfo.hash(into:)
@@ -57,9 +69,16 @@ Func EntitlementInfos.encode(to:)
 Func EntitlementInfos.hash(into:)
 Func FetchPolicy.__derived_struct_equals(_:_:)  [Implements]
 Func FetchPolicy.hash(into:)
+Func HTTPTransport.send(_:)
 Func InitiationSource.__derived_struct_equals(_:_:)  [Implements]
 Func InitiationSource.encode(to:)
 Func InitiationSource.hash(into:)
+Func IntroductoryOffer.OfferType.__derived_struct_equals(_:_:)  [Implements]
+Func IntroductoryOffer.OfferType.encode(to:)
+Func IntroductoryOffer.OfferType.hash(into:)
+Func IntroductoryOffer.__derived_struct_equals(_:_:)  [Implements]
+Func IntroductoryOffer.encode(to:)
+Func IntroductoryOffer.hash(into:)
 Func LogLevel.<(_:_:)
 Func LogLevel.__derived_struct_equals(_:_:)  [Implements]
 Func LogLevel.hash(into:)
@@ -151,6 +170,13 @@ Func Store.hash(into:)
 Func StoreProduct.__derived_struct_equals(_:_:)  [Implements]
 Func StoreProduct.encode(to:)
 Func StoreProduct.hash(into:)
+Func SubscriptionPeriod.Unit.__derived_struct_equals(_:_:)  [Implements]
+Func SubscriptionPeriod.Unit.encode(to:)
+Func SubscriptionPeriod.Unit.hash(into:)
+Func SubscriptionPeriod.__derived_struct_equals(_:_:)  [Implements]
+Func SubscriptionPeriod.encode(to:)
+Func SubscriptionPeriod.hash(into:)
+Protocol HTTPTransport
 Protocol LogSink
 Protocol PurchasesDelegate  [Custom]
 Struct Configuration
@@ -160,7 +186,10 @@ Struct EntitlementDiffResult.Diff
 Struct EntitlementInfo
 Struct EntitlementInfos
 Struct FetchPolicy
+Struct HTTPTransportResponse
 Struct InitiationSource
+Struct IntroductoryOffer
+Struct IntroductoryOffer.OfferType
 Struct LogLevel
 Struct Money
 Struct Offering
@@ -175,6 +204,8 @@ Struct PurchasesError
 Struct PurchasesErrorCode
 Struct Store
 Struct StoreProduct
+Struct SubscriptionPeriod
+Struct SubscriptionPeriod.Unit
 Subscript EntitlementInfos.subscript(_:)
 Subscript Offering.subscript(_:)
 Subscript Offerings.subscript(_:)
@@ -231,12 +262,28 @@ Var FetchPolicy.fetchCurrent  [HasInitialValue,HasStorage]
 Var FetchPolicy.hashValue
 Var FetchPolicy.notStaleCachedOrFetched  [HasInitialValue,HasStorage]
 Var FetchPolicy.rawValue  [HasStorage]
+Var HTTPTransportResponse.body  [HasStorage]
+Var HTTPTransportResponse.headers  [HasStorage]
+Var HTTPTransportResponse.statusCode  [HasStorage]
 Var InitiationSource.description
 Var InitiationSource.hashValue
 Var InitiationSource.purchase  [HasInitialValue,HasStorage]
 Var InitiationSource.queue  [HasInitialValue,HasStorage]
 Var InitiationSource.rawValue  [HasStorage]
 Var InitiationSource.restore  [HasInitialValue,HasStorage]
+Var IntroductoryOffer.OfferType.description
+Var IntroductoryOffer.OfferType.freeTrial  [HasInitialValue,HasStorage]
+Var IntroductoryOffer.OfferType.hashValue
+Var IntroductoryOffer.OfferType.payAsYouGo  [HasInitialValue,HasStorage]
+Var IntroductoryOffer.OfferType.payUpFront  [HasInitialValue,HasStorage]
+Var IntroductoryOffer.OfferType.rawValue  [HasStorage]
+Var IntroductoryOffer.OfferType.unknown  [HasInitialValue,HasStorage]
+Var IntroductoryOffer.displayPrice  [HasStorage]
+Var IntroductoryOffer.hashValue
+Var IntroductoryOffer.isEligible  [HasStorage]
+Var IntroductoryOffer.period  [HasStorage]
+Var IntroductoryOffer.periodCount  [HasStorage]
+Var IntroductoryOffer.type  [HasStorage]
 Var LogLevel.debug  [HasInitialValue,HasStorage]
 Var LogLevel.description
 Var LogLevel.error  [HasInitialValue,HasStorage]
@@ -296,6 +343,7 @@ Var PeriodType.rawValue  [HasStorage]
 Var PeriodType.trial  [HasInitialValue,HasStorage]
 Var PeriodType.unknown  [HasInitialValue,HasStorage]
 Var PurchaseResult.customerInfo  [HasStorage]
+Var PurchaseResult.isPending  [HasStorage]
 Var PurchaseResult.transactionIdentifier  [HasStorage]
 Var PurchaseResult.userCancelled  [HasStorage]
 Var PurchaseUIContext.sceneProvider  [Custom,HasInitialValue,HasStorage]
@@ -349,6 +397,8 @@ Var PurchasesErrorCode.productNotAvailableForPurchaseError  [HasInitialValue,Has
 Var PurchasesErrorCode.purchaseCancelledError  [HasInitialValue,HasStorage]
 Var PurchasesErrorCode.purchaseInvalidError  [HasInitialValue,HasStorage]
 Var PurchasesErrorCode.purchaseNotAllowedError  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.purchasePendingServerConfirmation  [HasInitialValue,HasStorage]
+Var PurchasesErrorCode.purchaseRejectedByServer  [HasInitialValue,HasStorage]
 Var PurchasesErrorCode.rawValue  [HasStorage]
 Var PurchasesErrorCode.receiptAlreadyInUseError  [HasInitialValue,HasStorage]
 Var PurchasesErrorCode.storeProblemError  [HasInitialValue,HasStorage]
@@ -370,9 +420,24 @@ Var Store.roku  [HasInitialValue,HasStorage]
 Var Store.stripe  [HasInitialValue,HasStorage]
 Var Store.unknown  [HasInitialValue,HasStorage]
 Var StoreProduct.currencyCode  [HasStorage]
+Var StoreProduct.displayPrice
 Var StoreProduct.hashValue
+Var StoreProduct.introductoryOffer  [HasStorage]
 Var StoreProduct.localizedDescription  [HasStorage]
 Var StoreProduct.localizedPriceString  [HasStorage]
 Var StoreProduct.localizedTitle  [HasStorage]
 Var StoreProduct.price  [HasStorage]
 Var StoreProduct.productIdentifier  [HasStorage]
+Var StoreProduct.subscriptionPeriod  [HasStorage]
+Var SubscriptionPeriod.Unit.day  [HasInitialValue,HasStorage]
+Var SubscriptionPeriod.Unit.description
+Var SubscriptionPeriod.Unit.hashValue
+Var SubscriptionPeriod.Unit.month  [HasInitialValue,HasStorage]
+Var SubscriptionPeriod.Unit.rawValue  [HasStorage]
+Var SubscriptionPeriod.Unit.unknown  [HasInitialValue,HasStorage]
+Var SubscriptionPeriod.Unit.week  [HasInitialValue,HasStorage]
+Var SubscriptionPeriod.Unit.year  [HasInitialValue,HasStorage]
+Var SubscriptionPeriod.description
+Var SubscriptionPeriod.hashValue
+Var SubscriptionPeriod.unit  [HasStorage]
+Var SubscriptionPeriod.value  [HasStorage]

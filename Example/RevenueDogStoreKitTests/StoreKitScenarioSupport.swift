@@ -239,9 +239,11 @@ struct SDKSession {
             .with(baseURL: URL(string: "https://storekit.test.invalid")!)
             .with(logLevel: .debug)
             .with(diagnosticsEnabled: diagnosticsEnabled)
+            // 假后端走**公开**注入点（v0.2.0 D 项）：这条路径宿主也能用，
+            // 顺带让它一直有人跑 —— `Configuration.with(transport:)` 一旦回退成 internal，本 target 立刻红。
+            .with(transport: transport)
 
         var dependencies = Purchases.Dependencies.live(configuration: configuration)
-        dependencies.transport = transport
         dependencies.identityStorage = InMemoryIdentityStorage()
         dependencies.cacheStorage = InMemoryCacheStorage()
         dependencies.attributionState = InMemoryAttributionStateStorage()

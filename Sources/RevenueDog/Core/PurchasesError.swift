@@ -51,6 +51,24 @@ public struct PurchasesErrorCode: Sendable, Hashable, CustomStringConvertible {
     /// 本 SDK 专有：M1 骨架里尚未实现的路径。
     public static let notImplementedError = PurchasesErrorCode(rawValue: 900, name: "notImplementedError")
 
+    /// 本 SDK 专有：**扣款已经发生**，但服务端还没确认这笔收据。
+    ///
+    /// 触发面：5xx / 网络错误 / 超时 / 401 / 403 / 408 / 429。
+    /// 语义：交易**没有 finish**、上下文已落盘，SDK 会在前台恢复与下次冷启动自动重放。
+    /// 宿主处置：提示「支付已收到，权益稍后到账」，**不要**引导用户再买一次；
+    /// 监听 `customerInfoStream` 等权益到位。
+    public static let purchasePendingServerConfirmation = PurchasesErrorCode(rawValue: 901,
+                                                                             name: "purchasePendingServerConfirmation")
+
+    /// 本 SDK 专有：**扣款已经发生**，但服务端确定性拒绝了这笔收据。
+    ///
+    /// 触发面：除 401/403/404/408/429 之外的 4xx（重试不会有不同结果）。
+    /// 语义：交易**已经 finish**（`.revenueDog` 模式），不会再有权益产生。
+    /// `underlyingError` 是原始的 `PurchasesError`，其 `backendCode` 带后端错误体里的数值码。
+    /// 宿主处置：这是需要人来看的状态 —— 给用户走客服/退款路径，别静默吞掉。
+    public static let purchaseRejectedByServer = PurchasesErrorCode(rawValue: 902,
+                                                                    name: "purchaseRejectedByServer")
+
     public var description: String { "\(name)(\(rawValue))" }
 }
 
