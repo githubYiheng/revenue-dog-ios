@@ -3,6 +3,11 @@
 语义化版本。公开 API 基线（`api-baseline/RevenueDog.public-api.txt`）有「减」或「改」= 主版本；只「增」= 次版本；无差异 = 修订号。
 破坏性变更必须在对应条目里写迁移说明。tag 一经发布不可移动。
 
+## [Unreleased]
+
+- **修复**：`POST /v1/receipts` 返回 401/403 时不再 finish 交易。鉴权失败发生在服务端留档之前，此前的行为会把用户已付款的交易从 StoreKit 与后端两侧同时抹掉（消耗型不可恢复）。现在保留上下文，密钥修正后由前台重放补报。
+- **修复**：`Purchases.defaultBaseURL` 从 `https://api.revenuedog.com`（非本项目域名）改为 `https://api.revdog.org`。公开符号不变。
+
 ## [0.1.0] - 2026-09-08
 
 首个 tag。**尚未在生产 App 上线**，仅供双 SDK 影子期接线与真机核验。

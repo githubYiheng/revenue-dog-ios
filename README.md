@@ -183,7 +183,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 | ① | 购买成功 → 上报带真 JWS → 200 后才 finish | 铁律 P2 / 裁决 F8 | `fetch_token` 是三段式 JWS 原文；200 后 `unfinished` 里不再有它；上下文清空 |
 | ① | 购买 package 携带 offering 归因 | 契约 §2.1 | `presented_offering_identifier` 上行 |
 | ② | 5xx → 不 finish；冷启动重放 200 → finish；第三次冷启动零上报 | 坑 #8 / 铁律 P3 | 「恰好一次」= 不无限重报 |
-| ② | 确定性 4xx（400）→ finishable：finish + 删上下文 | 坑 #8 | 重试无意义的错误不许卡住 finish 义务 |
+| ② | 确定性 4xx（400）→ finishable：finish + 删上下文；401/403 例外（鉴权失败，保留上下文等重放，ADR 0023） | 坑 #8 | 重试无意义的错误不许卡住 finish 义务；配置错误不许抹掉付款 |
 | ③ | `forceRenewalOfSubscription` → 续期交易到达并上报 | 坑 #11 / #102 | 续期走 `queue` 通道；每笔 JWS 互不相同；200 后 finish |
 | ③ | `timeRate` 加速的真实续期（对照路径） | 坑 #102 | 同上 |
 | ④ | `refundTransaction` → revoked 交易上报 | 裁决 #12 | revoked 走同一管道、200 即 finish，无特例 |

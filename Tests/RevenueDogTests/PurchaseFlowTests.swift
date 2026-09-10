@@ -188,6 +188,28 @@ struct PurchaseFlowTests {
         #expect(flag.value) // 确定性拒绝 → finish，不再无限重投
     }
 
+    @Test("#8 例外：401/403 鉴权失败 → 不 finish、保留上下文（后端无 raw 留档，finish 即丢单）")
+    func authFailureKeepsContext() async throws {
+        for status in [401, 403] {
+            let (purchases, transport, provider) = makePurchases()
+            let flag = FinishFlag()
+            await provider.scriptPurchase { _ in
+                .success(FakeTransaction(transactionIdentifier: "tx-auth-\(status)", originalTransactionIdentifier: "tx-auth-\(status)",
+                                         productIdentifier: "com.demo.monthly", purchaseDate: Date(),
+                                         expirationDate: Date().addingTimeInterval(3600),
+                                         jwsRepresentation: "h.pa\(status).s", finishFlag: flag))
+            }
+            await transport.enqueue(.failure(statusCode: status))
+
+            await #expect(throws: PurchasesError.self) {
+                _ = try await purchases.purchase(
+                    product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
+                                          price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
+            }
+            #expect(!flag.value, "status \(status) 不得 finish")
+        }
+    }
+
     @Test("消耗型：响应 non_subscriptions 未确认 → 不 finish、保留 finish 义务")
     func consumableUnconfirmedKeepsObligation() async throws {
         let (purchases, transport, provider) = makePurchases()

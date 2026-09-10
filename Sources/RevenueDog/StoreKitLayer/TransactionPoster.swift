@@ -5,7 +5,9 @@
 //  finish 三铁律（RC `shouldFinish` + 我们的收紧）：
 //  1. 只有「本次后端 2xx 响应」（source=backend200）允许触发 finish —— stale 缓存 / 本地推算永不 finish（#7）。
 //  2. 消耗型 / 非订阅：必须在响应 `non_subscriptions` 里看到该 transactionId 才 finish。
-//  3. 失败侧映射（#8）：确定性 4xx（除 404/429）→ finishable（重试也不会成功，交易已在服务端 raw 留档）；
+//  3. 失败侧映射（#8）：确定性 4xx（除 401/403/404/408/429）→ finishable（重试也不会成功，交易已在服务端 raw 留档）；
+//     401/403 是**鉴权失败**：服务端鉴权中间件在留档之前，后端没有任何 raw 记录，finish 即丢单
+//     （订阅型可由启动 currentEntitlements 扫描自愈，消耗型不可）→ 视同暂时失败，保留上下文等密钥修正后重放；
 //     5xx / 网络 / 超时 → 绝不 finish，保留上下文等待重放。
 //  revoked / 已过期 / isUpgraded 交易走同一管道，无特例（#12）。
 //
@@ -119,6 +121,9 @@ actor TransactionPoster {
     private func classify(_ error: PurchasesError) -> PostReceiptFailure {
         guard let status = error.httpStatusCode else { return .retryable(error) } // 网络/超时
         switch status {
+        // 401/403：密钥无效/被吊销/误用 secret key —— 服务端在鉴权处就拒绝，交易没有 raw 留档，
+        // finish 等于把这笔付款从两边同时抹掉。密钥是可修的配置，保留上下文等重放（2026-09-10 审查 SDK#1）。
+        case 401, 403: return .retryable(error)
         case 404, 408, 429: return .retryable(error)
         case 400...499: return .finishable(error)
         default: return .retryable(error)

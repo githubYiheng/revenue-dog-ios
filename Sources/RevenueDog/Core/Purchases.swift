@@ -36,7 +36,7 @@ public struct Configuration: Sendable {
     /// 日志级别。
     public private(set) var logLevel: LogLevel
 
-    public static let defaultBaseURL = URL(string: "https://api.revenuedog.com")!
+    public static let defaultBaseURL = URL(string: "https://api.revdog.org")!
 
     public init(apiKey: String) {
         self.apiKey = apiKey
