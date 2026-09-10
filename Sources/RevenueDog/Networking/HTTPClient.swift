@@ -61,12 +61,14 @@ enum Endpoint: Sendable, Equatable {
     case postAdServicesAttribution
     /// `POST /v1/diagnostics/entitlement-diff` —— 档 1 权益一致率上报（迁移方案 v2.1 §5 M-3）。
     case postEntitlementDiff
+    /// `POST /v1/diagnostics/events` —— SDK 客户端诊断事件攒批上报（sdk-diagnostics §1）。
+    case postDiagnosticsEvents
 
     var method: HTTPMethod {
         switch self {
         case .getCustomerInfo, .getOfferings: return .get
         case .postAttributes, .postReceipt, .postIdentify, .postAdServicesAttribution,
-             .postEntitlementDiff: return .post
+             .postEntitlementDiff, .postDiagnosticsEvents: return .post
         }
     }
 
@@ -87,6 +89,21 @@ enum Endpoint: Sendable, Equatable {
             return "/v1/attribution/adservices"
         case .postEntitlementDiff:
             return "/v1/diagnostics/entitlement-diff"
+        case .postDiagnosticsEvents:
+            return "/v1/diagnostics/events"
+        }
+    }
+
+    /// 进诊断事件 `http_error.path` 的**脱敏路径**：app_user_id 段一律换成 `*`
+    /// （契约 §1.3：`/v1/subscribers/*`）。app_user_id 可能是宿主 uid，不进 fields。
+    var diagnosticsPath: String {
+        switch self {
+        case .getCustomerInfo: return "/v1/subscribers/*"
+        case .getOfferings: return "/v1/subscribers/*/offerings"
+        case .postAttributes: return "/v1/subscribers/*/attributes"
+        case .postReceipt, .postIdentify, .postAdServicesAttribution,
+             .postEntitlementDiff, .postDiagnosticsEvents:
+            return path
         }
     }
 
@@ -119,6 +136,12 @@ enum Endpoint: Sendable, Equatable {
             // 同一次观测计成多条，直接污染日聚合的「权益一致率」（档 1 出口条件的分母）。
             // 丢一次样本无所谓 —— 宿主在 RC `customerInfoStream` 每次更新时都会再报
             // （接线模板 dual-sdk-integration.md §5），服务端还有每用户每天 cap 兜底。
+            return EndpointPolicy(isRetryable: false, usesETag: false,
+                                  authScope: .publicKey, sendsPlatformHeader: true)
+        case .postDiagnosticsEvents:
+            // **不重试**（sdk-diagnostics §2）：重发节奏归 `DiagnosticsUploader` 的退避掌管。
+            // 让 HTTPClient 在一次调用里连打四发，会把「30s 起、×2、上限 1h」的口径架空。
+            // 服务端按事件 `id` 做 `INSERT OR IGNORE`，重发本身是幂等的 —— 这里不重试是节奏问题，不是幂等问题。
             return EndpointPolicy(isRetryable: false, usesETag: false,
                                   authScope: .publicKey, sendsPlatformHeader: true)
         }
@@ -273,9 +296,57 @@ struct HTTPResponse<Body: Sendable>: Sendable {
     let serverRequestDate: Date?
 }
 
+// MARK: - 调用观测句柄（诊断事件用）
+
+/// 一次 `perform` / `performRaw` 调用的观测句柄。
+///
+/// 存在的理由：`PurchasesError` 是**公开**类型，不能为了诊断往里塞 `request_id`
+/// （公开面只进不出，一条诊断需求不该扩公开 API）。所以调用方按需传一个 trace 进去，
+/// HTTPClient 每次尝试结束时往里填一笔，调用方读回最后一次的 status / `X-Request-Id` / 耗时。
+///
+/// `extraFields` 是调用方要**补进该端点事件**的字段（如 receipts 的 `transaction_id`）——
+/// HTTPClient 自己不认识交易，但它是唯一握有 attempt / 耗时 / request_id 的地方。
+final class HTTPCallTrace: @unchecked Sendable {
+
+    struct Attempt: Sendable, Equatable {
+        let attempt: Int
+        /// nil = 传输层错误（超时 / 断网）。
+        let statusCode: Int?
+        let requestID: String?
+        let durationMs: Int
+    }
+
+    let extraFields: [String: DiagnosticsFieldValue]
+
+    private let lock = NSLock()
+    private var storage: [Attempt] = []
+
+    init(extraFields: [String: DiagnosticsFieldValue] = [:]) {
+        self.extraFields = extraFields
+    }
+
+    func record(_ attempt: Attempt) {
+        lock.lock(); defer { lock.unlock() }
+        storage.append(attempt)
+    }
+
+    var attempts: [Attempt] {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+
+    var last: Attempt? {
+        lock.lock(); defer { lock.unlock() }
+        return storage.last
+    }
+}
+
 // MARK: - HTTPClient
 
 actor HTTPClient {
+
+    /// 服务端请求 id 头（契约 §1.3：`request_id` 一律取它）。
+    static let requestIDHeaderName = "X-Request-Id"
 
     /// 服务端时间头。契约 ⟦决策3⟧ 尚未定名 —— 保守做法：两个名字都读，优先自家品牌名。
     static let requestTimeHeaderNames = ["X-RevenueDog-Request-Time", "X-RevenueCat-Request-Time"]
@@ -287,6 +358,9 @@ actor HTTPClient {
     private let scheduler: any DelayScheduler
     private let systemInfoProvider: @Sendable () -> SystemInfo
     private let randomProvider: @Sendable () -> Double
+    /// 客户端诊断（sdk-diagnostics §1.3：`receipt_post` / `http_error` 的唯一记录点）。
+    /// 后置注入：Recorder 的 uploader 反过来依赖本 client，构造期无法闭环。
+    private var diagnostics: DiagnosticsRecorder?
 
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
@@ -309,6 +383,11 @@ actor HTTPClient {
         self.scheduler = scheduler
         self.systemInfoProvider = systemInfoProvider
         self.randomProvider = randomProvider
+    }
+
+    /// 由 `Purchases.start()` 在任何请求发生前注入一次。
+    func setDiagnostics(_ recorder: DiagnosticsRecorder?) {
+        diagnostics = recorder
     }
 
     // MARK: 请求构造
@@ -350,8 +429,9 @@ actor HTTPClient {
 
     func perform<Body: Decodable & Sendable>(_ endpoint: Endpoint,
                                              body: Data? = nil,
-                                             as type: Body.Type) async throws -> HTTPResponse<Body> {
-        let raw = try await performRaw(endpoint, body: body)
+                                             as type: Body.Type,
+                                             trace: HTTPCallTrace? = nil) async throws -> HTTPResponse<Body> {
+        let raw = try await performRaw(endpoint, body: body, trace: trace)
         do {
             let decoded = try decoder.decode(Body.self, from: raw.body)
             return HTTPResponse(statusCode: raw.statusCode,
@@ -363,7 +443,9 @@ actor HTTPClient {
         }
     }
 
-    func performRaw(_ endpoint: Endpoint, body: Data? = nil) async throws -> HTTPResponse<Data> {
+    func performRaw(_ endpoint: Endpoint,
+                    body: Data? = nil,
+                    trace: HTTPCallTrace? = nil) async throws -> HTTPResponse<Data> {
         let request = try makeRequest(for: endpoint, body: body)
         let policy = endpoint.policy
         var attempt = 0
@@ -374,6 +456,7 @@ actor HTTPClient {
             var statusCode: Int?
             var headers: [String: String] = [:]
             var payload = Data()
+            let startedAt = Date()
 
             do {
                 let response = try await transport.send(request)
@@ -383,6 +466,27 @@ actor HTTPClient {
             } catch {
                 lastError = error
                 Log.debug("请求失败（第 \(attempt) 次）\(endpoint.path): \(error)", category: "network")
+            }
+
+            // 每次尝试结束就记一笔（契约 §1.3：receipt_post 的记录点就是「每次尝试结束」）。
+            // 这里 **await** 而不是 fire-and-forget：事件顺序是排查的全部价值所在，
+            // 队列写入是一次极小的文件追加，网络上传由 Recorder 另起 Task，不会卡住请求。
+            let durationMs = Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
+            let requestID = headers.firstValue(forCaseInsensitiveKey: Self.requestIDHeaderName)
+            trace?.record(HTTPCallTrace.Attempt(attempt: attempt,
+                                                statusCode: statusCode,
+                                                requestID: requestID,
+                                                durationMs: durationMs))
+            if let diagnostics {
+                await diagnostics.recordHTTPAttempt(endpoint: endpoint,
+                                                    attempt: attempt,
+                                                    statusCode: statusCode,
+                                                    requestID: requestID,
+                                                    durationMs: durationMs,
+                                                    errorCode: Self.diagnosticErrorCode(statusCode: statusCode,
+                                                                                        payload: payload,
+                                                                                        decoder: decoder),
+                                                    extraFields: trace?.extraFields ?? [:])
             }
 
             let serverIsRetryable = RetryPolicy.isRetryableHeaderValue(headers)
@@ -423,6 +527,17 @@ actor HTTPClient {
             }
         }
         return nil
+    }
+
+    /// 诊断事件的 `error_code`：优先取后端错误体里的数值码（契约 §1.4，如 7243 = 用错了 secret key），
+    /// 没有就退回 SDK 自己的 code 名。**永远是字符串、永远不带 message**（契约 §1.3 末段）。
+    static func diagnosticErrorCode(statusCode: Int?, payload: Data, decoder: JSONDecoder) -> String? {
+        guard let statusCode else { return PurchasesErrorCode.networkError.name }
+        guard !(200...299).contains(statusCode) else { return nil }
+        if let code = (try? decoder.decode(BackendErrorWireModel.self, from: payload))?.code {
+            return String(code)
+        }
+        return Self.error(statusCode: statusCode, payload: payload, decoder: decoder).code.name
     }
 
     static func error(statusCode: Int, payload: Data, decoder: JSONDecoder) -> PurchasesError {

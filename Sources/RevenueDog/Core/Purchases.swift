@@ -35,6 +35,11 @@ public struct Configuration: Sendable {
     public private(set) var baseURL: URL
     /// 日志级别。
     public private(set) var logLevel: LogLevel
+    /// 客户端诊断事件开关（ADR 0028 / sdk-diagnostics）。默认 **true**。
+    ///
+    /// 刻意保持 **internal**：宿主唯一需要的动作是 `with(diagnosticsEnabled:)`，
+    /// 读回这个值没有集成价值，而公开面只进不出 —— 一条诊断需求只值一个公开符号。
+    internal private(set) var diagnosticsEnabled: Bool
 
     public static let defaultBaseURL = URL(string: "https://api.revdog.org")!
 
@@ -44,6 +49,7 @@ public struct Configuration: Sendable {
         self.purchasesCompletedBy = .revenueDog
         self.baseURL = Configuration.defaultBaseURL
         self.logLevel = .info
+        self.diagnosticsEnabled = true
     }
 
     public func with(appUserID: String?) -> Configuration {
@@ -67,6 +73,24 @@ public struct Configuration: Sendable {
     public func with(logLevel: LogLevel) -> Configuration {
         var copy = self
         copy.logLevel = logLevel
+        return copy
+    }
+
+    /// **客户端诊断事件开关**（默认开启）。
+    ///
+    /// 开启时 SDK 会在关键节点（configure / 身份 / 购买 / 收据上报 / finish 判定 /
+    /// 恢复同步 / HTTP 错误）记结构化事件，攒批上报到 Revenue Dog 后端，
+    /// 供「某个用户在他机器上到底发生了什么」的排查。宿主**零工作量**。
+    ///
+    /// 上传的内容：事件类型与等级、时间戳、商品 id / 交易 id、HTTP 状态码与 `request_id`、
+    /// 耗时、错误分类，以及当前 `app_user_id` 与安装标识 `install_id`。
+    /// **不上传**：任何 token / 密钥、JWS 原文、请求或响应 body、错误消息文本、
+    /// 邮箱 / 姓名 / 设备名，以及日志文本。
+    ///
+    /// 关掉之后 SDK 不记录、不上传，并**清空本地队列文件**。
+    public func with(diagnosticsEnabled: Bool) -> Configuration {
+        var copy = self
+        copy.diagnosticsEnabled = diagnosticsEnabled
         return copy
     }
 }
@@ -148,6 +172,7 @@ public final class Purchases {
     public static func configure(with configuration: Configuration) -> Purchases {
         if let instance {
             Log.warn("Purchases 已配置过，忽略重复的 configure(with:)")
+            instance.recordWarning(DiagnosticsWarningCode.duplicateConfigure)
             return instance
         }
         let purchases = Purchases(configuration: configuration, dependencies: .live(configuration: configuration))
@@ -189,6 +214,22 @@ public final class Purchases {
         var attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage()
         /// AdServices token 取值面（坑 #83/#84：协议隔离，模拟器/无框架平台优雅降级）。
         var adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()
+        /// 客户端诊断管线的可注入面（测试用；生产全走默认值）。
+        var diagnostics = DiagnosticsDependencies()
+
+        /// 诊断管线的注入点。默认即生产配置。
+        struct DiagnosticsDependencies: Sendable {
+            /// JSONL 队列文件位置。nil = `<Application Support>/RevenueDog/diagnostics/queue.jsonl`。
+            var fileURL: URL?
+            /// `sample_rate_info` 的落盘面。
+            var settings: any DiagnosticsSettingsStorage = UserDefaultsDiagnosticsSettingsStorage()
+            /// 防抖 / 定时用的调度器（测试注入 NoDelayScheduler）。
+            var scheduler: any DelayScheduler = TaskDelayScheduler()
+            /// 是否起「前台每 30s」的定时循环。测试注入 NoDelayScheduler 时必须关掉，否则空转。
+            var startsPeriodicFlush = true
+            var now: @Sendable () -> Date = { Date() }
+            var random: @Sendable () -> Double = { Double.random(in: 0..<1) }
+        }
 
         static func live(configuration: Configuration) -> Dependencies {
             let pendingDirectory = (try? PendingPurchaseStore.defaultDirectory())
@@ -237,6 +278,9 @@ public final class Purchases {
     /// CustomerInfo 缓存失效代 —— `invalidateCustomerInfoCache()` 靠它**同步**生效。
     private let cacheInvalidation: CustomerInfoCacheInvalidation
     private let orchestrator: PurchasesOrchestrator
+    /// 客户端诊断（ADR 0028）。关掉时仍然存在，只是不记不发（并在 start 时清空队列文件）。
+    private let diagnostics: DiagnosticsRecorder
+    private let httpClient: HTTPClient
     private var startTask: Task<Void, Never>?
     /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
     /// （Swift 6 下 @MainActor 类的 deinit 不能安全触碰隔离状态，所以不写在 deinit 里）。
@@ -259,8 +303,36 @@ public final class Purchases {
                                     transport: dependencies.transport,
                                     retryPolicy: dependencies.networkRetryPolicy,
                                     scheduler: dependencies.networkDelayScheduler)
+        self.httpClient = httpClient
         let cacheInvalidation = CustomerInfoCacheInvalidation()
         self.cacheInvalidation = cacheInvalidation
+
+        // 诊断管线（ADR 0028）。构造顺序：queue → uploader（要 httpClient）→ recorder；
+        // httpClient 反过来要 recorder（receipt_post / http_error 的记录点），
+        // 这一环由 `httpClient.setDiagnostics(_:)` 在 start() 里闭合。
+        let diagnosticsQueue = DiagnosticsQueue(
+            fileURL: dependencies.diagnostics.fileURL
+                ?? (try? DiagnosticsQueue.defaultFileURL())
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("RevenueDog/diagnostics/\(DiagnosticsQueue.fileName)",
+                                            isDirectory: false),
+        )
+        let attributionState = dependencies.attributionState
+        let diagnosticsUploader = DiagnosticsUploader(
+            httpClient: httpClient,
+            queue: diagnosticsQueue,
+            installIDProvider: { await Purchases.resolveInstallID(attributionState) },
+            appUserIDProvider: { [identity] in await identity.currentAppUserIDIfAny },
+            now: dependencies.diagnostics.now,
+        )
+        self.diagnostics = DiagnosticsRecorder(queue: diagnosticsQueue,
+                                               uploader: diagnosticsUploader,
+                                               settings: dependencies.diagnostics.settings,
+                                               enabled: configuration.diagnosticsEnabled,
+                                               scheduler: dependencies.diagnostics.scheduler,
+                                               startsPeriodicFlush: dependencies.diagnostics.startsPeriodicFlush,
+                                               now: dependencies.diagnostics.now,
+                                               random: dependencies.diagnostics.random)
         let deviceCache = DeviceCache(storage: dependencies.cacheStorage, invalidation: cacheInvalidation)
         let pending = PendingPurchaseStore(directory: dependencies.pendingPurchasesDirectory)
 
@@ -282,7 +354,8 @@ public final class Purchases {
                                                   delayScheduler: dependencies.delayScheduler,
                                                   attributesDirectory: attributesDirectory,
                                                   attributionState: dependencies.attributionState,
-                                                  adServicesTokenProvider: dependencies.adServicesTokenProvider)
+                                                  adServicesTokenProvider: dependencies.adServicesTokenProvider,
+                                                  diagnostics: self.diagnostics)
         self.orchestrator = orchestrator
         self.attribution = Attribution(orchestrator: orchestrator)
 
@@ -346,11 +419,35 @@ public final class Purchases {
     }
     #endif
 
+    /// `install_id`：与「这次安装」同生命周期的设备标识（裁决 D2 的 ASA 幂等键，诊断事件复用同一个）。
+    /// 没有就地生成并落盘 —— ASA 采集路径读的是同一把键，两边不会各生成一个。
+    private static func resolveInstallID(_ storage: any AttributionStateStorage) async -> String {
+        if let stored = await storage.installID() { return stored }
+        let generated = IdentityManager.uuid32()
+        await storage.setInstallID(generated)
+        return generated
+    }
+
+    /// 门面层的 `sdk_warning` 出口（fire-and-forget，绝不阻塞调用方）。
+    private nonisolated func recordWarning(_ code: String, detail: String? = nil) {
+        Task { [diagnostics] in await diagnostics.warn(code, detail: detail) }
+    }
+
     private func start() {
         AppStateProvider.refresh()
         observeAppLifecycle()
         // 铁律 P1：configure 内**同步**创建监听 Task。
-        startTask = Task { [orchestrator] in
+        startTask = Task { [orchestrator, diagnostics, httpClient, configuration] in
+            // 诊断先接线：receipt_post / http_error 的记录点在 HTTPClient 里，
+            // 必须早于任何一次请求（所有公开入口都先 await 本 Task）。
+            await httpClient.setDiagnostics(diagnostics)
+            await diagnostics.start()
+            await diagnostics.record(DiagnosticsEventType.sdkConfigured, fields: [
+                "log_level": .string(configuration.logLevel.label),
+                "purchases_completed_by": .string(configuration.purchasesCompletedBy.rawValue),
+                "has_app_user_id": .bool(configuration.appUserID != nil),
+                "diagnostics_enabled": .bool(configuration.diagnosticsEnabled),
+            ])
             await orchestrator.setCustomerInfoObserver { [weak self] customerInfo in
                 Task { @MainActor in self?.receive(customerInfo) }
             }
