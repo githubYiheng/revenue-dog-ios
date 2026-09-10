@@ -44,6 +44,7 @@ private func makeHardened(
             pendingPurchasesDirectory: dir,
             storeKit: provider,
             delayScheduler: NoDelayScheduler(),
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, transport, provider, dir)

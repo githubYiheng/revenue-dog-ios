@@ -316,13 +316,23 @@ final class HTTPCallTrace: @unchecked Sendable {
         let durationMs: Int
     }
 
-    let extraFields: [String: DiagnosticsFieldValue]
-
     private let lock = NSLock()
     private var storage: [Attempt] = []
+    private var extra: [String: DiagnosticsFieldValue]
 
     init(extraFields: [String: DiagnosticsFieldValue] = [:]) {
-        self.extraFields = extraFields
+        self.extra = extraFields
+    }
+
+    /// 追加一个要补进该端点事件的字段（如 receipts 的 `transaction_id`）。
+    func addExtraField(_ key: String, _ value: DiagnosticsFieldValue) {
+        lock.lock(); defer { lock.unlock() }
+        extra[key] = value
+    }
+
+    var extraFields: [String: DiagnosticsFieldValue] {
+        lock.lock(); defer { lock.unlock() }
+        return extra
     }
 
     func record(_ attempt: Attempt) {

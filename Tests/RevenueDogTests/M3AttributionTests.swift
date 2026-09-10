@@ -72,6 +72,7 @@ private func makeASA(
             delayScheduler: NoDelayScheduler(),   // 5s × 3 的等待在测试里不真睡
             attributionState: state,
             adServicesTokenProvider: provider,
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, storeKit)

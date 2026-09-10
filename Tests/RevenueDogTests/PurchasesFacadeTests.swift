@@ -29,7 +29,8 @@ final class PurchasesFacadeTests {
             cacheStorage: InMemoryCacheStorage(),
             transport: transport,
             pendingPurchasesDirectory: directory,
-            storeKit: nil
+            storeKit: nil,
+            diagnostics: .isolated(),
         )
         self.purchases = Purchases.configure(
             with: Configuration(apiKey: "pk_test_0123456789")

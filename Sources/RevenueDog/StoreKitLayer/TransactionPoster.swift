@@ -32,9 +32,13 @@ enum PostReceiptFailure: Error, Sendable {
 actor TransactionPoster {
 
     private let httpClient: HTTPClient
+    /// 客户端诊断：`finish_decision`（finish 三铁律判定处）的唯一记录点。
+    /// `receipt_post` 由 HTTPClient 在每次尝试结束时记（那里才有 attempt / 耗时 / request_id）。
+    private let diagnostics: DiagnosticsRecorder
 
-    init(httpClient: HTTPClient) {
+    init(httpClient: HTTPClient, diagnostics: DiagnosticsRecorder) {
         self.httpClient = httpClient
+        self.diagnostics = diagnostics
     }
 
     /// 上报一笔交易。成功返回 CustomerInfo 并按铁律裁决 finish；失败返回处置指令。
@@ -51,7 +55,12 @@ actor TransactionPoster {
         completedBy: PurchasesCompletedBy,
         appTransactionJWS: String? = nil,
         attributes: [SubscriberAttribute] = [],
+        trace externalTrace: HTTPCallTrace? = nil,
     ) async -> Result<PostReceiptResult, PostReceiptFailure> {
+        // 交易 id：直接结果/补投有交易对象；重放路径只有上下文（key 已 rekey 成 transactionId）。
+        let transactionID = transaction?.transactionIdentifier ?? context?.key
+        let trace = externalTrace ?? HTTPCallTrace()
+        if let transactionID { trace.addExtraField("transaction_id", .string(transactionID)) }
         let body = ReceiptBody(
             fetchToken: jws,
             appUserID: appUserID,
@@ -74,7 +83,8 @@ actor TransactionPoster {
         }
 
         do {
-            let response = try await httpClient.perform(.postReceipt, body: data, as: CustomerInfoWireModel.self)
+            let response = try await httpClient.perform(.postReceipt, body: data,
+                                                        as: CustomerInfoWireModel.self, trace: trace)
             let info = CustomerInfo(wireModel: response.body)
             let finished = await finishIfAllowed(transaction: transaction,
                                                  productIdentifier: productIdentifier,
@@ -82,12 +92,61 @@ actor TransactionPoster {
                                                  completedBy: completedBy)
             return .success(PostReceiptResult(customerInfo: info, finished: finished))
         } catch let error as PurchasesError {
-            return .failure(classify(error))
+            let failure = classify(error)
+            await recordFailureFinishDecision(failure, transactionID: transactionID, completedBy: completedBy)
+            return .failure(failure)
         } catch {
-            return .failure(.retryable(PurchasesError(code: .networkError,
-                                                      message: "receipt 上报未知失败",
-                                                      underlyingError: error)))
+            let wrapped = PurchasesError(code: .networkError,
+                                         message: "receipt 上报未知失败",
+                                         underlyingError: error)
+            await recordFinishDecision(transactionID: transactionID,
+                                       decision: DiagnosticsFinishDecision.kept,
+                                       reason: DiagnosticsFinishReason.retryableFailure,
+                                       level: DiagnosticsLevel.warn)
+            return .failure(.retryable(wrapped))
         }
+    }
+
+    // MARK: - finish 判定的诊断记录（契约 §1.3 `finish_decision`）
+
+    /// 失败侧：`.finishable` 在 `.revenueDog` 下会由 orchestrator 真的 finish；
+    /// `.retryable` 一律保留。401/403 单独标 `auth_failure_keep`（ADR 0023 的那条防线）。
+    private func recordFailureFinishDecision(_ failure: PostReceiptFailure,
+                                             transactionID: String?,
+                                             completedBy: PurchasesCompletedBy) async {
+        switch failure {
+        case .finishable:
+            if completedBy == .revenueDog {
+                await recordFinishDecision(transactionID: transactionID,
+                                           decision: DiagnosticsFinishDecision.finished,
+                                           reason: DiagnosticsFinishReason.deterministic4xx,
+                                           level: DiagnosticsLevel.info)
+            } else {
+                await recordFinishDecision(transactionID: transactionID,
+                                           decision: DiagnosticsFinishDecision.kept,
+                                           reason: DiagnosticsFinishReason.observerMode,
+                                           level: DiagnosticsLevel.info)
+            }
+        case .retryable(let error):
+            let isAuth = error.httpStatusCode == 401 || error.httpStatusCode == 403
+            await recordFinishDecision(transactionID: transactionID,
+                                       decision: DiagnosticsFinishDecision.kept,
+                                       reason: isAuth
+                                           ? DiagnosticsFinishReason.authFailureKeep
+                                           : DiagnosticsFinishReason.retryableFailure,
+                                       level: DiagnosticsLevel.warn)
+        }
+    }
+
+    private func recordFinishDecision(transactionID: String?,
+                                      decision: String,
+                                      reason: String,
+                                      level: String) async {
+        await diagnostics.record(DiagnosticsEventType.finishDecision, level: level, fields: [
+            "transaction_id": transactionID.map { .string($0) },
+            "decision": .string(decision),
+            "reason": .string(reason),
+        ])
     }
 
     /// 铁律 P2 + #7/#8：本函数只会被「后端 2xx」路径调用（编译期由调用点保证，运行期再断言）。
@@ -97,8 +156,20 @@ actor TransactionPoster {
         customerInfo: CustomerInfo,
         completedBy: PurchasesCompletedBy,
     ) async -> Bool {
-        guard completedBy == .revenueDog else { return false } // .myApp：宿主自管 finish
-        guard let transaction else { return false }            // 重放路径无交易对象（仅 JWS）时不 finish
+        guard completedBy == .revenueDog else {                 // .myApp：宿主自管 finish
+            await recordFinishDecision(transactionID: transaction?.transactionIdentifier,
+                                       decision: DiagnosticsFinishDecision.kept,
+                                       reason: DiagnosticsFinishReason.observerMode,
+                                       level: DiagnosticsLevel.info)
+            return false
+        }
+        guard let transaction else {                            // 重放路径无交易对象（仅 JWS）时不 finish
+            await recordFinishDecision(transactionID: nil,
+                                       decision: DiagnosticsFinishDecision.kept,
+                                       reason: DiagnosticsFinishReason.replayNoTransaction,
+                                       level: DiagnosticsLevel.info)
+            return false
+        }
 
         // 判定规则（RC shouldFinish + 裁决 #12）：
         // - 订阅型（有 expirationDate）/ 已撤销：后端 2xx 即 finish
@@ -109,11 +180,19 @@ actor TransactionPoster {
 
         if isSubscriptionLike || confirmedNonSubscription {
             await transaction.finish()
+            await recordFinishDecision(transactionID: transaction.transactionIdentifier,
+                                       decision: DiagnosticsFinishDecision.finished,
+                                       reason: DiagnosticsFinishReason.serverAck,
+                                       level: DiagnosticsLevel.info)
             return true
         }
         // 一次性但响应里没看到：不 finish（下次启动补投重试；服务端幂等）
         Log.warn("一次性交易未出现在响应 non_subscriptions，暂不 finish（tx=\(transaction.transactionIdentifier)）",
                  category: "poster")
+        await recordFinishDecision(transactionID: transaction.transactionIdentifier,
+                                   decision: DiagnosticsFinishDecision.kept,
+                                   reason: DiagnosticsFinishReason.consumableUnconfirmed,
+                                   level: DiagnosticsLevel.warn)
         return false
     }
 

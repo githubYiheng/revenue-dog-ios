@@ -112,6 +112,7 @@ private func makeRig(
             storeKit: storeKit,
             delayScheduler: NoDelayScheduler(),
             networkDelayScheduler: networkScheduler,
+            diagnostics: .isolated(),
         ),
     )
 }

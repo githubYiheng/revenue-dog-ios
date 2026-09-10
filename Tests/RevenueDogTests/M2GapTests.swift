@@ -132,6 +132,7 @@ private func makeGapPurchases(
             pendingPurchasesDirectory: directory,
             storeKit: provider,
             delayScheduler: NoDelayScheduler(),
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, provider)

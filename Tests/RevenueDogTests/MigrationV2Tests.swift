@@ -95,6 +95,7 @@ private func makeMigrationPurchases(
                 .appendingPathComponent("RevenueDogMigrationV2/\(UUID().uuidString)", isDirectory: true),
             storeKit: provider,
             delayScheduler: NoDelayScheduler(),
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, transport, provider)

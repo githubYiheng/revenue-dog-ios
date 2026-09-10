@@ -80,6 +80,7 @@ private func makeAttrPurchases(
             storeKit: storeKit,
             delayScheduler: NoDelayScheduler(),
             attributionState: InMemoryAttributionStateStorage(),
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, storeKit)

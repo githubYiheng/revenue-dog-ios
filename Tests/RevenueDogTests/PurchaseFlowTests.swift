@@ -83,6 +83,7 @@ private func makePurchases(
             transport: transport,
             pendingPurchasesDirectory: dir,
             storeKit: provider,
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, transport, provider)

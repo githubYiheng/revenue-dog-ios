@@ -148,3 +148,26 @@ extension SystemInfo {
                    preferredLocales: ["en-US", "zh-Hans-CN"])
     }
 }
+
+// MARK: - 诊断管线的测试隔离（sdk-diagnostics §2）
+
+extension Purchases.Dependencies.DiagnosticsDependencies {
+
+    /// 单测隔离版：
+    /// - 队列落**每次调用独立**的临时文件 —— 默认位置是 `<Application Support>` 下的全局单文件，
+    ///   同一个测试进程里所有 suite 会往同一份 JSONL 里堆事件，攒够 20 条就触发一次真上传，
+    ///   把「这条链路一共发了几个请求」这类断言污染成随机值。
+    /// - 采样率存内存，不写 `UserDefaults.standard`。
+    /// - 不起「前台每 30s」的定时循环（测试进程里那是纯空转）。
+    static func isolated(startsPeriodicFlush: Bool = false,
+                         scheduler: any DelayScheduler = TaskDelayScheduler()) -> Self {
+        var dependencies = Purchases.Dependencies.DiagnosticsDependencies()
+        dependencies.fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RevenueDogDiagnostics/\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(DiagnosticsQueue.fileName, isDirectory: false)
+        dependencies.settings = InMemoryDiagnosticsSettingsStorage()
+        dependencies.scheduler = scheduler
+        dependencies.startsPeriodicFlush = startsPeriodicFlush
+        return dependencies
+    }
+}

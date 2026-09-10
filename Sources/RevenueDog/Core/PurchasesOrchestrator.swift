@@ -46,6 +46,8 @@ actor PurchasesOrchestrator {
     private let attributionState: any AttributionStateStorage
     /// AdServices token 取值面（协议隔离，坑 #83/#84）。
     private let adServicesTokenProvider: any AdServicesTokenProvider
+    /// 客户端诊断（ADR 0028 / sdk-diagnostics §1.3 的记录点大半在本文件）。
+    private let diagnostics: DiagnosticsRecorder
     /// 属性同步的单飞闸：同时只允许一次 POST /attributes 在途，避免前后台抖动打出重复请求。
     private var isSyncingAttributes = false
     /// ASA 采集在本进程内只启动一次（跨进程的一次性由 `attributionState` 持久化保证）。
@@ -78,7 +80,8 @@ actor PurchasesOrchestrator {
          delayScheduler: any DelayScheduler = TaskDelayScheduler(),
          attributesDirectory: URL,
          attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage(),
-         adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()) {
+         adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider(),
+         diagnostics: DiagnosticsRecorder) {
         self.configuration = configuration
         self.settings = settings
         self.identity = identity
@@ -90,7 +93,8 @@ actor PurchasesOrchestrator {
         self.attributesStore = SubscriberAttributesStore(directory: attributesDirectory)
         self.attributionState = attributionState
         self.adServicesTokenProvider = adServicesTokenProvider
-        self.poster = TransactionPoster(httpClient: httpClient)
+        self.diagnostics = diagnostics
+        self.poster = TransactionPoster(httpClient: httpClient, diagnostics: diagnostics)
         self.ledger = (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL()))
             .map { SyncedTransactionLedger(fileURL: $0) }
     }
@@ -110,7 +114,7 @@ actor PurchasesOrchestrator {
             Task { [weak self] in
                 for await transaction in storeKit.transactionUpdates() {
                     // P5：循环体内立即派生子 Task，不阻塞流消费。
-                    Task { await self?.handle(transaction: transaction) }
+                    Task { await self?.handle(transaction: transaction, source: .updates) }
                 }
             }
         }
@@ -139,8 +143,18 @@ actor PurchasesOrchestrator {
     /// 单一处理通道（裁决 C2-A）：purchase() 直接结果与 updates 流都汇入这里。
     /// 幂等由三层保证：内存 in-flight 去重、.myApp 台账、服务端 content_hash。
     @discardableResult
-    func handle(transaction: any StoreTransactionType) async -> CustomerInfo? {
+    func handle(transaction: any StoreTransactionType,
+                source: DiagnosticsTransactionSource = .updates) async -> CustomerInfo? {
         let txID = transaction.transactionIdentifier
+
+        // 诊断（契约 §1.3）：单一处理通道的入口是「端上看见了这笔交易」的唯一时刻。
+        await diagnostics.record(DiagnosticsEventType.transactionObserved, fields: [
+            "source": .string(source.rawValue),
+            "transaction_id": .string(txID),
+            "original_transaction_id": .string(transaction.originalTransactionIdentifier),
+            "product_id": .string(transaction.productIdentifier),
+            "environment": StoreEnvironmentCache.appTransactionEnvironment.map { .string($0) },
+        ])
 
         // 内存级去重：同一交易同时从 purchase() 与 updates 到达时只处理一次
         if inFlightTransactionIDs.contains(txID) { return nil }
@@ -161,6 +175,7 @@ actor PurchasesOrchestrator {
 
         guard let jws = transaction.jwsRepresentation else {
             Log.warn("交易缺少 JWS，无法上报（tx=\(txID)）", category: "purchase")
+            await diagnostics.warn(DiagnosticsWarningCode.missingJWS, detail: "tx=\(txID)")
             return nil
         }
 
@@ -169,6 +184,7 @@ actor PurchasesOrchestrator {
            transaction.revocationDate == nil, expiration < Date() {
             Log.warn("购买/投递的交易 expirationDate 已在过去（tx=\(txID)，expires=\(expiration)）——疑似 StoreKit 异常，继续上报以后端裁决为准",
                      category: "storekit")
+            await diagnostics.warn(DiagnosticsWarningCode.expiredOnArrival, detail: "tx=\(txID)")
         }
 
         // 上下文配对：txID 键（重放）已在上面读过；没读到就按商品匹配发起键（#15/#16）并 rekey + 写入 JWS
@@ -254,7 +270,20 @@ actor PurchasesOrchestrator {
         await syncAttributesIfNeeded()
         let installID = await attributionState.installID()
         let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID, installID: installID))
-        let response = try await httpClient.perform(.postIdentify, body: body, as: CustomerInfoWireModel.self)
+        let fromAnonymous = previous.map { IdentityManager.isAnonymous($0) } ?? true
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
+        let response: HTTPResponse<CustomerInfoWireModel>
+        do {
+            response = try await httpClient.perform(.postIdentify, body: body,
+                                                    as: CustomerInfoWireModel.self, trace: trace)
+        } catch {
+            await recordIdentityEvent(DiagnosticsEventType.identityLogin,
+                                      trace: trace, startedAt: startedAt,
+                                      extra: ["from_anonymous": .bool(fromAnonymous)],
+                                      error: error)
+            throw error
+        }
         try await identity.logIn(newAppUserID)
         if let previous { await deviceCache.clearMemoryCache(appUserID: previous) }
         let info = CustomerInfo(wireModel: response.body)
@@ -266,16 +295,60 @@ actor PurchasesOrchestrator {
         }
         await syncAttributesIfNeeded()
         await publish(info)
+        await recordIdentityEvent(DiagnosticsEventType.identityLogin,
+                                  trace: trace, startedAt: startedAt,
+                                  extra: ["from_anonymous": .bool(fromAnonymous),
+                                          "created": .bool(response.statusCode == 201)],
+                                  error: nil)
         return (info, response.statusCode == 201)
     }
 
     func logOut() async throws -> CustomerInfo {
-        let previous = try await identity.appUserID
-        let anonymous = try await identity.logOut()
-        await deviceCache.clearMemoryCache(appUserID: previous)
-        let response = try await fetchCustomerInfo(appUserID: anonymous)
-        await publish(response.info)
-        return response.info
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
+        do {
+            let previous = try await identity.appUserID
+            let anonymous = try await identity.logOut()
+            await deviceCache.clearMemoryCache(appUserID: previous)
+            let response = try await fetchCustomerInfo(appUserID: anonymous, trace: trace)
+            await publish(response.info)
+            await recordIdentityEvent(DiagnosticsEventType.identityLogout,
+                                      trace: trace, startedAt: startedAt, extra: [:], error: nil)
+            return response.info
+        } catch {
+            await recordIdentityEvent(DiagnosticsEventType.identityLogout,
+                                      trace: trace, startedAt: startedAt, extra: [:], error: error)
+            throw error
+        }
+    }
+
+    /// `identity_login` / `identity_logout` 的统一出口（契约 §1.3）。
+    private func recordIdentityEvent(_ type: String,
+                                     trace: HTTPCallTrace,
+                                     startedAt: Date,
+                                     extra: [String: DiagnosticsFieldValue],
+                                     error: (any Error)?) async {
+        var fields: [String: DiagnosticsFieldValue?] = [
+            "status": trace.last?.statusCode.map { .int($0) },
+            "request_id": trace.last?.requestID.map { .string($0) },
+            "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+            "error_code": Self.diagnosticsErrorCode(error),
+        ]
+        for (key, value) in extra { fields[key] = value }
+        await diagnostics.record(type,
+                                 level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
+                                 fields: fields)
+    }
+
+    /// SDK 自己的错误码名（**绝不带 message**，契约 §1.3 末段）。
+    static func diagnosticsErrorCode(_ error: (any Error)?) -> DiagnosticsFieldValue? {
+        guard let error else { return nil }
+        if let purchases = error as? PurchasesError { return .string(purchases.code.name) }
+        return .string(PurchasesErrorCode.unknownError.name)
+    }
+
+    static func elapsedMs(since startedAt: Date) -> Int {
+        Int((Date().timeIntervalSince(startedAt) * 1000).rounded())
     }
 
     // MARK: - CustomerInfo
@@ -299,9 +372,14 @@ actor PurchasesOrchestrator {
             }
         }
 
+        // 走到这里 = 缓存没命中（或策略要求拉网），契约 §1.3 的 `customer_info_fetch` 记录点。
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
         do {
-            let response = try await fetchCustomerInfo(appUserID: appUserID)
+            let response = try await fetchCustomerInfo(appUserID: appUserID, trace: trace)
             await publish(response.info)
+            await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: false,
+                                          trace: trace, startedAt: startedAt, error: nil)
             return response.info
         } catch let error as PurchasesError {
             // 设计 §4：后端 5xx 时忽略 TTL 直接供给 stale 缓存。
@@ -310,10 +388,33 @@ actor PurchasesOrchestrator {
             if isServerError, fetchPolicy != .fetchCurrent,
                let cached = await deviceCache.cachedCustomerInfo(appUserID: appUserID) {
                 Log.warn("后端不可用（\(error.description)），回落 stale 缓存", category: "customer-info")
+                await diagnostics.warn(DiagnosticsWarningCode.staleCustomerInfoFallback,
+                                       detail: "policy=\(fetchPolicy.rawValue)")
+                await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: true,
+                                              trace: trace, startedAt: startedAt, error: error)
                 return cached
             }
+            await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: false,
+                                          trace: trace, startedAt: startedAt, error: error)
             throw error
         }
+    }
+
+    private func recordCustomerInfoFetch(policy: FetchPolicy,
+                                         cacheHit: Bool,
+                                         trace: HTTPCallTrace,
+                                         startedAt: Date,
+                                         error: (any Error)?) async {
+        await diagnostics.record(DiagnosticsEventType.customerInfoFetch,
+                                 level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
+                                 fields: [
+                                     "policy": .string(policy.rawValue),
+                                     "cache_hit": .bool(cacheHit),
+                                     "status": trace.last?.statusCode.map { .int($0) },
+                                     "request_id": trace.last?.requestID.map { .string($0) },
+                                     "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+                                     "error_code": Self.diagnosticsErrorCode(error),
+                                 ])
     }
 
     func cachedCustomerInfo() async -> CustomerInfo? {
@@ -321,9 +422,10 @@ actor PurchasesOrchestrator {
         return await deviceCache.cachedCustomerInfo(appUserID: appUserID)
     }
 
-    private func fetchCustomerInfo(appUserID: String) async throws -> (info: CustomerInfo, created: Bool) {
+    private func fetchCustomerInfo(appUserID: String,
+                                   trace: HTTPCallTrace? = nil) async throws -> (info: CustomerInfo, created: Bool) {
         let response = try await httpClient.perform(.getCustomerInfo(appUserID: appUserID),
-                                                    as: CustomerInfoWireModel.self)
+                                                    as: CustomerInfoWireModel.self, trace: trace)
         let info = CustomerInfo(wireModel: response.body)
         await deviceCache.cache(customerInfo: info, appUserID: appUserID)
         return (info, response.statusCode == 201)
@@ -340,20 +442,43 @@ actor PurchasesOrchestrator {
             return cached
         }
 
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
         do {
             let response = try await httpClient.perform(.getOfferings(appUserID: appUserID),
-                                                        as: OfferingsWireModel.self)
+                                                        as: OfferingsWireModel.self, trace: trace)
             // M2：这里再用 StoreKit 批量拉 platform_product_identifier 对应的商品填 storeProduct。
             let offerings = Offerings(wireModel: response.body)
             await deviceCache.cache(offerings: offerings, appUserID: appUserID)
+            await recordOfferingsFetch(count: offerings.all.count, trace: trace,
+                                       startedAt: startedAt, error: nil)
             return offerings
         } catch {
             if let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
                 Log.warn("offerings 拉取失败，回落缓存: \(error)", category: "offerings")
+                await diagnostics.warn(DiagnosticsWarningCode.offeringsCacheFallback)
+                await recordOfferingsFetch(count: cached.all.count, trace: trace,
+                                           startedAt: startedAt, error: error)
                 return cached
             }
+            await recordOfferingsFetch(count: nil, trace: trace, startedAt: startedAt, error: error)
             throw error
         }
+    }
+
+    private func recordOfferingsFetch(count: Int?,
+                                      trace: HTTPCallTrace,
+                                      startedAt: Date,
+                                      error: (any Error)?) async {
+        await diagnostics.record(DiagnosticsEventType.offeringsFetch,
+                                 level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
+                                 fields: [
+                                     "status": trace.last?.statusCode.map { .int($0) },
+                                     "request_id": trace.last?.requestID.map { .string($0) },
+                                     "count": count.map { .int($0) },
+                                     "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+                                     "error_code": Self.diagnosticsErrorCode(error),
+                                 ])
     }
 
     // MARK: - 事件多播
@@ -425,19 +550,31 @@ actor PurchasesOrchestrator {
         // verify/rc-sdk-observer-mode.md §8.1 判断 6）。读一次并贯穿本次购买 ——
         // 这一读就是「发起时快照」的取值点。
         let completedBy = settings.purchasesCompletedBy
-        guard completedBy == .revenueDog else {
-            throw PurchasesError(code: .configurationError,
-                                 message: "purchasesCompletedBy == .myApp 时购买由宿主发起，SDK 只观察")
-        }
-        guard let storeKit else {
-            throw PurchasesError(code: .configurationError, message: "当前平台无 StoreKit 能力")
-        }
-        let products = try await storeKit.products(forIdentifiers: [productIdentifier])
-        guard let product = products.first else {
-            throw PurchasesError(code: .productNotAvailableForPurchaseError,
-                                 message: "商店无此商品：\(productIdentifier)")
-        }
-        let appUserID = try await identity.appUserID
+        // 诊断（契约 §1.3）：`purchase()` 进入。initiation_key 在下面才算得出来，
+        // 但「进入」这个事实必须在任何一次 throw 之前落下 —— 否则「用户点了买、然后什么都没发生」
+        // 这种最常见的报障在事件流里根本看不见。
+        let purchaseStartedAt = Date()
+        let initiationKey = PendingPurchaseStore.initiationKey(productIdentifier: productIdentifier)
+        await diagnostics.record(DiagnosticsEventType.purchaseStarted, fields: [
+            "product_id": .string(productIdentifier),
+            "package_id": presentedPackageIdentifier.map { .string($0) },
+            "initiation_key": .string(initiationKey),
+        ])
+
+        do {
+            guard completedBy == .revenueDog else {
+                throw PurchasesError(code: .configurationError,
+                                     message: "purchasesCompletedBy == .myApp 时购买由宿主发起，SDK 只观察")
+            }
+            guard let storeKit else {
+                throw PurchasesError(code: .configurationError, message: "当前平台无 StoreKit 能力")
+            }
+            let products = try await storeKit.products(forIdentifiers: [productIdentifier])
+            guard let product = products.first else {
+                throw PurchasesError(code: .productNotAvailableForPurchaseError,
+                                     message: "商店无此商品：\(productIdentifier)")
+            }
+            let appUserID = try await identity.appUserID
 
         // #22：服务端签发的 account_token（缓存 CustomerInfo 携带，契约决策 21）→ Apple appAccountToken。
         // 辅助归户链，best-effort：无缓存/形状不合法就不带（后端权威仍是 originalTransactionId ↔ appUserID）。
@@ -445,7 +582,6 @@ actor PurchasesOrchestrator {
         let appAccountToken = accountToken.flatMap(IdentityManager.accountTokenToUUID)
 
         // P3：上下文先落盘再发起购买（复合发起键 #15）
-        let initiationKey = PendingPurchaseStore.initiationKey(productIdentifier: productIdentifier)
         let context = PendingPurchaseContext(key: initiationKey,
                                              productIdentifier: productIdentifier,
                                              appUserID: appUserID,
@@ -475,11 +611,17 @@ actor PurchasesOrchestrator {
         case .userCancelled:
             await pendingPurchases.remove(forKey: initiationKey)
             let info = try await customerInfo(fetchPolicy: .cachedOrFetched)
+            await recordPurchaseResult(productIdentifier: productIdentifier,
+                                       outcome: DiagnosticsPurchaseOutcome.cancelled,
+                                       transactionID: nil, startedAt: purchaseStartedAt, error: nil)
             return PurchaseResult(customerInfo: info, transactionIdentifier: nil, userCancelled: true)
 
         case .pending:
             // Ask-to-Buy / SCA：结果只会从 updates 流出（R3）；发起键保留供配对
             let info = try await customerInfo(fetchPolicy: .cachedOrFetched)
+            await recordPurchaseResult(productIdentifier: productIdentifier,
+                                       outcome: DiagnosticsPurchaseOutcome.pending,
+                                       transactionID: nil, startedAt: purchaseStartedAt, error: nil)
             return PurchaseResult(customerInfo: info, transactionIdentifier: nil, userCancelled: false)
 
         case .success(let transaction):
@@ -493,15 +635,59 @@ actor PurchasesOrchestrator {
                                                   to: transaction.transactionIdentifier,
                                                   jws: transaction.jwsRepresentation)
             // 单一处理通道（C2-A）：直接结果与 updates 汇入同一 handle()
-            if let info = await handle(transaction: transaction) {
+            if let info = await handle(transaction: transaction, source: .purchase) {
+                await recordPurchaseResult(productIdentifier: productIdentifier,
+                                           outcome: DiagnosticsPurchaseOutcome.success,
+                                           transactionID: transaction.transactionIdentifier,
+                                           startedAt: purchaseStartedAt, error: nil)
                 return PurchaseResult(customerInfo: info,
                                       transactionIdentifier: transaction.transactionIdentifier,
                                       userCancelled: false)
             }
             // 上报暂时失败：交易未 finish、上下文已留存，重放兜底；对宿主如实报错
-            throw PurchasesError(code: .networkError,
-                                 message: "购买已在商店完成，上报后端暂时失败，将自动重试（tx=\(transaction.transactionIdentifier)）")
+            let postFailure = PurchasesError(code: .networkError,
+                                             message: "购买已在商店完成，上报后端暂时失败，将自动重试（tx=\(transaction.transactionIdentifier)）")
+            await recordPurchaseResult(productIdentifier: productIdentifier,
+                                       outcome: DiagnosticsPurchaseOutcome.error,
+                                       transactionID: transaction.transactionIdentifier,
+                                       startedAt: purchaseStartedAt, error: postFailure)
+            throw postFailure
         }
+        } catch {
+            // `purchase()` 抛出（含商品不存在 / 弹窗前失败 / StoreKit 取消）：一律留一条 error 级事件。
+            await recordPurchaseResult(productIdentifier: productIdentifier,
+                                       outcome: Self.isUserCancelledOutcome(error)
+                                           ? DiagnosticsPurchaseOutcome.cancelled
+                                           : DiagnosticsPurchaseOutcome.error,
+                                       transactionID: nil, startedAt: purchaseStartedAt, error: error)
+            throw error
+        }
+    }
+
+    /// `purchase_result`（契约 §1.3）。取消不算错误 → info 级。
+    private func recordPurchaseResult(productIdentifier: String,
+                                      outcome: String,
+                                      transactionID: String?,
+                                      startedAt: Date,
+                                      error: (any Error)?) async {
+        let isError = outcome == DiagnosticsPurchaseOutcome.error
+        await diagnostics.record(DiagnosticsEventType.purchaseResult,
+                                 level: isError ? DiagnosticsLevel.error : DiagnosticsLevel.info,
+                                 fields: [
+                                     "product_id": .string(productIdentifier),
+                                     "outcome": .string(outcome),
+                                     "transaction_id": transactionID.map { .string($0) },
+                                     "error_code": Self.diagnosticsErrorCode(error),
+                                     "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+                                 ])
+    }
+
+    /// 坑 #18：`StoreKitError.userCancelled` 这种 throw 形态的取消没有 `PurchaseResult` 可交。
+    static func isUserCancelledOutcome(_ error: any Error) -> Bool {
+        #if canImport(StoreKit)
+        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
+        #endif
+        return (error as? PurchasesError)?.code == .purchaseCancelledError
     }
 
     /// restore（用户显式动作，会弹 Apple ID 框）。契约 C（裁决 C2-C）：
@@ -516,8 +702,44 @@ actor PurchasesOrchestrator {
     }
 
     private func syncInternal(userInitiated: Bool) async throws -> CustomerInfo {
+        let type = userInitiated ? DiagnosticsEventType.restore : DiagnosticsEventType.sync
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
+        do {
+            return try await syncInternalBody(userInitiated: userInitiated, trace: trace) { count in
+                await self.recordSyncEvent(type, count: count, trace: trace,
+                                           startedAt: startedAt, error: nil)
+            }
+        } catch {
+            await recordSyncEvent(type, count: nil, trace: trace, startedAt: startedAt, error: error)
+            throw error
+        }
+    }
+
+    /// `restore` / `sync`（契约 §1.3）。`count` = 端上找到的可上报交易数。
+    private func recordSyncEvent(_ type: String,
+                                 count: Int?,
+                                 trace: HTTPCallTrace,
+                                 startedAt: Date,
+                                 error: (any Error)?) async {
+        await diagnostics.record(type,
+                                 level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
+                                 fields: [
+                                     "status": trace.last?.statusCode.map { .int($0) },
+                                     "request_id": trace.last?.requestID.map { .string($0) },
+                                     "count": count.map { .int($0) },
+                                     "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+                                     "error_code": Self.diagnosticsErrorCode(error),
+                                 ])
+    }
+
+    private func syncInternalBody(userInitiated: Bool,
+                                  trace: HTTPCallTrace,
+                                  onSuccess: (Int?) async -> Void) async throws -> CustomerInfo {
         guard let storeKit else {
-            return try await customerInfo(fetchPolicy: .fetchCurrent)
+            let info = try await customerInfo(fetchPolicy: .fetchCurrent)
+            await onSuccess(0)
+            return info
         }
         if userInitiated {
             do {
@@ -539,9 +761,13 @@ actor PurchasesOrchestrator {
             .sorted { $0.purchaseDate > $1.purchaseDate }
             .first
 
+        let candidateCount = (entitlements + unfinished).filter { $0.jwsRepresentation != nil }.count
+
         guard let latest, let jws = latest.jwsRepresentation else {
             // 无任何本地交易 = 没有可恢复的 —— 只刷新服务端视图
-            return try await customerInfo(fetchPolicy: .fetchCurrent)
+            let info = try await customerInfo(fetchPolicy: .fetchCurrent)
+            await onSuccess(0)
+            return info
         }
 
         // AppTransaction：优先启动预取缓存，缺则现取（P7：失败不阻断）
@@ -566,13 +792,15 @@ actor PurchasesOrchestrator {
                                        // restore/sync 不是「进行中的购买」，用当前运行时模式（M-2a）
                                        completedBy: settings.purchasesCompletedBy,
                                        appTransactionJWS: appTransactionJWS,
-                                       attributes: pendingAttributes)
+                                       attributes: pendingAttributes,
+                                       trace: trace)
         switch result {
         case .success(let posted):
             await attributesStore.markSynced(pendingAttributes, appUserID: appUserID)
             await ledger?.record(latest.transactionIdentifier)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
             await publish(posted.customerInfo)
+            await onSuccess(candidateCount)
             return posted.customerInfo
         case .failure(.finishable(let error)), .failure(.retryable(let error)):
             throw error
@@ -650,6 +878,7 @@ actor PurchasesOrchestrator {
                (400...499).contains(status), status != 404, status != 408, status != 429 {
                 Log.warn("属性同步被服务端确定性拒绝（HTTP \(status)）：\(error.description) —— 标记已同步不再重试（#127）",
                          category: "attributes")
+                await diagnostics.warn(DiagnosticsWarningCode.attributesRejected, detail: "status=\(status)")
                 await attributesStore.markSynced(pending, appUserID: appUserID)
                 return false
             }
@@ -767,7 +996,7 @@ actor PurchasesOrchestrator {
                     let txID = transaction.transactionIdentifier
                     if seen.contains(txID) && !awaitingFinish.contains(txID) { continue }
                     seen.insert(txID)
-                    if await handle(transaction: transaction) != nil {
+                    if await handle(transaction: transaction, source: .unfinishedScan) != nil {
                         awaitingFinish.remove(txID)
                     }
                 }
@@ -777,6 +1006,8 @@ actor PurchasesOrchestrator {
             if !awaitingFinish.isEmpty {
                 Log.warn("unfinished 轮询 5 次后仍有 \(awaitingFinish.count) 笔 finish 义务未清，留待下次启动",
                          category: "purchase")
+                await diagnostics.warn(DiagnosticsWarningCode.finishBacklog,
+                                       detail: "pending=\(awaitingFinish.count)")
             }
         }
 
@@ -857,7 +1088,7 @@ actor PurchasesOrchestrator {
         for transaction in entitlements {
             let txID = transaction.transactionIdentifier
             if let ledger, await ledger.contains(txID) { continue }
-            if await handle(transaction: transaction) != nil {
+            if await handle(transaction: transaction, source: .currentEntitlements) != nil {
                 await ledger?.record(txID)
             }
         }

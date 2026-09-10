@@ -40,6 +40,7 @@ private func makeM3(
                 .appendingPathComponent("RevenueDogM3/\(UUID().uuidString)", isDirectory: true),
             storeKit: provider,
             delayScheduler: NoDelayScheduler(),
+            diagnostics: .isolated(),
         ),
     )
     return (purchases, transport, provider)
