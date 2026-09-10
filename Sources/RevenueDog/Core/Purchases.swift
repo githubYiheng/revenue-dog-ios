@@ -486,10 +486,16 @@ public final class Purchases {
         }
     }
 
-    /// 进入后台：刷新 `X-Is-Backgrounded` 快照 + 冲一次属性缓冲（设计 §5）。
+    /// 进入后台：刷新 `X-Is-Backgrounded` 快照 + 冲一次属性缓冲（设计 §5）
+    /// + 把攒着的诊断事件发出去（sdk-diagnostics §2 的第三个触发条件）。
+    ///
+    /// 平台抽象走 `observeAppLifecycle()` 里既有的那套：
+    /// iOS/tvOS/visionOS = `UIApplication.didEnterBackgroundNotification`，
+    /// macOS = `NSApplication.didResignActiveNotification`，watchOS 无对应通知（不触发，编译照过）。
     func applicationDidEnterBackground() {
         AppStateProvider.setBackgrounded(true)
         Task { [orchestrator] in await orchestrator.syncAttributesIfNeeded() }
+        Task { [diagnostics] in await diagnostics.flushForBackground() }
     }
 
     func applicationDidBecomeActive() {
@@ -662,6 +668,9 @@ public final class Purchases {
         await attributeWriteChain.value   // 先把排队中的 setter 落盘，别把最后一条漏在队列里
         await orchestrator.syncAttributesIfNeeded()
     }
+
+    /// 诊断记录器（内部读视图：测试断言事件序列用）。
+    var diagnosticsRecorder: DiagnosticsRecorder { diagnostics }
 
     /// 当前身份下**待同步**的属性缓冲（诊断/测试读视图，不对外公开）。
     /// 先等属性写入链排空，读到的才是「所有已调用的 setter 都落盘之后」的状态。
