@@ -220,20 +220,25 @@ struct SDKSession {
     ///   - other: 其余端点（`/subscribers` 等）的兜底响应。
     ///   - retryPolicy: 默认 `.none` —— 让「上报失败几次」在断言里是个确定数，
     ///     HTTP 层的重试逻辑另有单测覆盖（`M4FaultInjectionTests`）。
+    ///   - diagnosticsEnabled: 默认 **false**（sdk-diagnostics §6-14）。诊断上传会往
+    ///     transport 里多打请求，把「这条链路一共发了几次」这类断言变成随机值；
+    ///     只有专门断言事件序列的诊断场景才打开。打开时队列落 `directory` 下的独立文件，
+    ///     不会碰到 Application Support 里那份全局队列。
     static func start(directory: URL,
                       appUserID: String = "storekit-test",
                       receipts: [MockTransport.Stub],
                       other: MockTransport.Stub = .json(FakeBackend.empty()),
-                      retryPolicy: RetryPolicy = .none) async -> SDKSession {
+                      retryPolicy: RetryPolicy = .none,
+                      diagnosticsEnabled: Bool = false) async -> SDKSession {
         let transport = MockTransport(stubs: [other])
         for stub in receipts {
             await transport.enqueue(stub, forPath: "/receipts")
         }
-
         let configuration = Configuration(apiKey: "pk_storekit_test")
             .with(appUserID: appUserID)
             .with(baseURL: URL(string: "https://storekit.test.invalid")!)
             .with(logLevel: .debug)
+            .with(diagnosticsEnabled: diagnosticsEnabled)
 
         var dependencies = Purchases.Dependencies.live(configuration: configuration)
         dependencies.transport = transport
@@ -245,6 +250,11 @@ struct SDKSession {
         dependencies.delayScheduler = NoDelayScheduler()
         dependencies.networkDelayScheduler = NoDelayScheduler()
         dependencies.networkRetryPolicy = retryPolicy
+        dependencies.diagnostics.fileURL = directory
+            .appendingPathComponent("_diagnostics", isDirectory: true)
+            .appendingPathComponent(DiagnosticsQueue.fileName, isDirectory: false)
+        dependencies.diagnostics.settings = InMemoryDiagnosticsSettingsStorage()
+        dependencies.diagnostics.startsPeriodicFlush = false
 
         Purchases.resetForTesting()
         let purchases = Purchases.configure(with: configuration, dependencies: dependencies)
@@ -281,6 +291,12 @@ struct SDKSession {
 
     func receiptCallCount() async -> Int {
         await transport.callCount(forPath: "/receipts")
+    }
+
+    /// 本次会话记下的诊断事件（按发生顺序）。只有 `diagnosticsEnabled: true` 的用例才有内容。
+    @MainActor
+    func diagnosticEvents() async -> [DiagnosticsEvent] {
+        await purchases.diagnosticsRecorder.queuedEvents()
     }
 
     /// 待重放上下文的残留数（pending 目录里的根级 *.json）。

@@ -71,6 +71,39 @@ CI 上**不设**该变量 —— 快照缺失或不一致直接失败。
 - 判据用符号清单 diff，不能只看 `-diagnose-sdk`：后者只报**破坏性**变更，**新增 public 符号它不报**，而新增同样需要 review（公开面只进不出）。
 - 换 Xcode / Swift 工具链后 dump 可能出现与本仓库无关的差异 —— 这时应该 `update` 一次并在 PR 里注明「工具链升级导致」。
 
+## 诊断事件（默认开启）
+
+SDK 在关键节点记**结构化事件**，攒批上报到 Revenue Dog 后端，供「某个用户在他机器上到底发生了什么」的排查。
+**宿主零工作量**，不需要接任何三方 SDK。契约与服务端设计见 `docs/plan/sdk-diagnostics.md`（ADR 0028）。
+
+**怎么关**：
+
+```swift
+Purchases.configure(with: Configuration(apiKey: "pk_…")
+    .with(diagnosticsEnabled: false))     // 默认 true
+```
+
+关掉之后：不记录、不上传，并**清空本地队列文件**。
+
+**上传什么**：事件类型与等级（info / warn / error）、设备时间戳与会话内序号、
+`app_user_id`（当前身份，可能是匿名 `$RDAnonymousID:…`）、`install_id`（与这次安装同生命周期的随机标识）、
+商品 id / 交易 id、HTTP 状态码与 `X-Request-Id`、尝试次数、耗时、错误分类与我方错误码、
+finish 判定结果与理由、当前生效的权益 id。系统信息走既有请求头（平台 / OS 版本 / 机型 / SDK 与宿主版本）。
+
+**不上传**：任何 token 或密钥、StoreKit JWS 原文、请求或响应 body、错误消息文本、日志文本、
+邮箱 / 姓名 / 设备名。`http_error` 的 `path` 会把 app_user_id 段替换成 `*`。
+
+**行为**：事件先落 `<Application Support>/RevenueDog/diagnostics/queue.jsonl`（上限 500 条 / 256 KB，
+超限丢最旧）；队列攒够 20 条、前台每 30s、进后台、或任一 warn/error 事件 2s 防抖后上传；
+失败按 30s→1h 指数退避并**保留事件**，恢复后补发；鉴权失败停 1 小时。同一时刻只有一个上传在飞。
+
+> **宿主需要自己做的两件事**：
+> 1. **App Store 隐私营养标签**：SDK 的 `PrivacyInfo.xcprivacy` 只覆盖 SDK 自己这一层；提交时宿主要在
+>    App Store Connect 的 App Privacy 问卷里勾上 **User ID / Device ID / Diagnostics**（均为 linked，非 tracking）。
+>    Xcode 的 Product → Archive → Generate Privacy Report 会把 SDK 清单聚合出来，照着填即可。
+> 2. **`app_user_id` 不得是个人信息**：传给 `configure(appUserID:)` / `logIn(_:)` 的值会随事件上行并留存，
+>    请用稳定的内部 uid（Firebase uid 这类），**不要**用邮箱、手机号、姓名。
+
 ## 隐私清单（PrivacyInfo.xcprivacy）
 
 `Sources/RevenueDog/PrivacyInfo.xcprivacy`，在 `Package.swift` 里以
@@ -83,11 +116,14 @@ SDK 侧声明：
 - Required Reason API 只有一条：`NSPrivacyAccessedAPICategoryUserDefaults` / `CA92.1`
   （身份与归因状态存自家私有键）。文件时间戳 / 系统启动时间 / 磁盘空间 / 键盘 类 API 全仓零使用，因此不声明。
 - 收集的数据类型：购买历史、用户 ID、设备 ID（`install_id` / AdServices token）、其它诊断数据；全部 `Linked = true`、`Tracking = false`。
+- 用途：购买历史 / 设备 ID / 其它诊断数据均含 **App Functionality + Analytics**（诊断事件在后台既按用户反查、
+  也按版本做分布聚合，后者只能落在 Analytics —— 逐条核实见 `docs/research/verify/privacy-manifest-diagnostics.md`）；
+  用户 ID 只含 App Functionality。
 
-> **维护触发条件**：诊断请求头（`X-Platform-Device` / `X-Preferred-Locales` / `X-Storefront` 等）
-> 目前**不声明** —— 依据是服务端只把它们用于实时服务、不落库。
-> **一旦服务端把这些头写进 D1 / Analytics Engine 做长期留存，必须回来补声明**
-> （对应的数据类型进 `NSPrivacyCollectedDataTypes`）。改服务端留存策略时请一并回看本节。
+> **维护触发条件**：诊断请求头里的平台 / OS 版本 / 机型 / SDK 与宿主版本**已随诊断事件写进 D1 留存 30 天**
+> （ADR 0028），核实结论是它们被既有的 `OtherDiagnosticData` / `DeviceID` 覆盖，无需新增数据类型；
+> 但 `X-Storefront` / `X-Preferred-Locales` **如果**日后也进 D1，需要重新核对
+> （商店地区与 `CoarseLocation` 的边界官方未明确，见 verify 报告 §5.2）。改服务端留存策略时请一并回看本节。
 
 > **宿主需要自己声明的部分**：隐私清单是 per-target 的。如果你的 App 调用了
 > `setEmail` / `setPhoneNumber` / `setDisplayName` 这类保留属性 setter，

@@ -18,6 +18,67 @@ import StoreKitTest
 
 extension StoreKitScenarioDomain {
 
+    // MARK: - ⑪ 客户端诊断事件序列（ADR 0028 / sdk-diagnostics §1.3）
+
+    @MainActor
+    @Suite("⑪ 诊断事件序列（真 StoreKit + 真事件管线）")
+    struct DiagnosticsSequenceTests {
+
+        @Test("一次购买产出 purchase_started → transaction_observed → receipt_post → finish_decision，字段合规")
+        func purchaseProducesEventSequence() async throws {
+            let session = try await SKTestHarness.makeSession()
+            try await SKTestHarness.requireSessionIsLive()
+            let directory = try TempDirectory.make()
+            defer { TempDirectory.remove(directory); SDKSession.tearDown() }
+            _ = session
+
+            let sdk = await SDKSession.start(
+                directory: directory,
+                receipts: [.json(FakeBackend.customerInfo(
+                    subscriptions: [DemoProduct.monthly: FakeBackend.farFuture],
+                    entitlements: ["pro": (DemoProduct.monthly, FakeBackend.farFuture)]))],
+                diagnosticsEnabled: true)
+
+            _ = try await sdk.purchases.purchase(product: SDKSession.productShell(DemoProduct.monthly))
+
+            let events = await sdk.diagnosticEvents()
+            let types = events.map(\.type)
+            // 顺序断言：四个关键节点必须按这个先后出现（中间可以有别的事件）。
+            let expected = [DiagnosticsEventType.purchaseStarted,
+                            DiagnosticsEventType.transactionObserved,
+                            DiagnosticsEventType.receiptPost,
+                            DiagnosticsEventType.finishDecision]
+            var cursor = types.startIndex
+            for type in expected {
+                let found = types[cursor...].firstIndex(of: type)
+                #expect(found != nil, "事件序列里缺 \(type)：\(types)")
+                guard let found else { return }
+                cursor = types.index(after: found)
+            }
+
+            // 真 JWS 走过这条链路 —— 但它**绝不能**出现在任何事件里（契约 §1.3 末段）。
+            let dump = try #require(String(data: try DiagnosticsCoding.encoder.encode(events), encoding: .utf8))
+            #expect(!dump.contains("eyJ"), "诊断事件里出现了 JWS 片段")
+            #expect(!dump.lowercased().contains("fetch_token"))
+            #expect(!dump.contains("pk_storekit_test"), "诊断事件里出现了 API key")
+
+            // finish_decision 的判据：后端 200 且是订阅型 → finished / server_ack。
+            let finish = try #require(events.last { $0.type == DiagnosticsEventType.finishDecision })
+            #expect(finish.fields["decision"] == .string(DiagnosticsFinishDecision.finished))
+            #expect(finish.fields["reason"] == .string(DiagnosticsFinishReason.serverAck))
+            // receipt_post 带真实交易 id 与 200。
+            let receipt = try #require(events.first { $0.type == DiagnosticsEventType.receiptPost })
+            #expect(receipt.fields["status"] == .int(200))
+            #expect(receipt.fields["transaction_id"] != nil)
+            // §6-2：每条事件自带记录时刻的身份；§6-5：会话内 seq 单调。
+            #expect(events.allSatisfy { $0.appUserID == "storekit-test" })
+            #expect(events.compactMap(\.seq) == events.compactMap(\.seq).sorted())
+        }
+    }
+}
+
+extension StoreKitScenarioDomain {
+
     // MARK: - ① 购买成功 → 上报带真 JWS → 200 后才 finish
 
     @MainActor

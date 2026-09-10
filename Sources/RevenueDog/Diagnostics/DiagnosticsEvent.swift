@@ -81,6 +81,11 @@ struct DiagnosticsEvent: Sendable, Equatable, Codable {
     let id: String
     /// 设备时钟（ms epoch）。
     let tsMs: Int64
+    /// **记录那一刻**的身份（§6-2：下沉到每条事件，envelope 不再带）。
+    /// 一批事件可能横跨一次 logIn —— 用 envelope 的「发送时身份」会把匿名期事件整批算到登入后的人头上。
+    let appUserID: String?
+    /// 会话内单调序号（§6-5）：同毫秒的事件靠它排序。
+    let seq: Int64?
     let type: String
     let level: String
     let fields: [String: DiagnosticsFieldValue]
@@ -88,6 +93,8 @@ struct DiagnosticsEvent: Sendable, Equatable, Codable {
     enum CodingKeys: String, CodingKey {
         case id
         case tsMs = "ts_ms"
+        case appUserID = "app_user_id"
+        case seq
         case type
         case level
         case fields
@@ -98,13 +105,16 @@ struct DiagnosticsEvent: Sendable, Equatable, Codable {
                      level: String,
                      fields: [String: DiagnosticsFieldValue?] = [:],
                      id: String = UUID().uuidString.lowercased(),
+                     appUserID: String? = nil,
+                     seq: Int64? = nil,
                      tsMs: Int64) -> DiagnosticsEvent {
         var clean: [String: DiagnosticsFieldValue] = [:]
         for (key, value) in fields {
             guard let value else { continue }
             clean[key] = value.truncated
         }
-        return DiagnosticsEvent(id: id, tsMs: tsMs, type: type, level: level, fields: clean)
+        return DiagnosticsEvent(id: id, tsMs: tsMs, appUserID: appUserID, seq: seq,
+                                type: type, level: level, fields: clean)
     }
 }
 
@@ -124,6 +134,8 @@ enum DiagnosticsEventType {
     static let restore = "restore"
     static let sync = "sync"
     static let customerInfoFetch = "customer_info_fetch"
+    /// §6-4：CustomerInfo 每次实际变化（不管从哪条路来）都留一条 —— 权益什么时候变的是排查的主线。
+    static let customerInfoUpdated = "customer_info_updated"
     static let offeringsFetch = "offerings_fetch"
     static let httpError = "http_error"
     static let sdkWarning = "sdk_warning"
@@ -151,6 +163,8 @@ enum DiagnosticsWarningCode {
     static let attributesRejected = "attributes_rejected"
     /// 后端不可用，CustomerInfo 回落 stale 缓存。
     static let staleCustomerInfoFallback = "stale_customer_info_fallback"
+    /// §6-13：诊断上传自己失败只在本地计数，成功后补记一条（绝不为诊断失败再发诊断请求）。
+    static let diagUploadFailed = "diag_upload_failed"
     /// offerings 拉取失败，回落缓存。
     static let offeringsCacheFallback = "offerings_cache_fallback"
 }
@@ -180,6 +194,16 @@ enum DiagnosticsTransactionSource: String, Sendable {
     case updates
     case unfinishedScan = "unfinished_scan"
     case currentEntitlements = "current_entitlements"
+}
+
+/// `customer_info_updated.source`（§6-4）。
+enum DiagnosticsCustomerInfoSource: String, Sendable {
+    case fetch
+    case purchase
+    case restore
+    case sync
+    case stream
+    case login
 }
 
 /// `purchase_result.outcome`。

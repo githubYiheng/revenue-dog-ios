@@ -35,6 +35,7 @@ Enum PurchaseUIContext  [Custom]
 Func Attribution.enableAdServicesAttributionTokenCollection()  [Final]
 Func Configuration.with(appUserID:)
 Func Configuration.with(baseURL:)
+Func Configuration.with(diagnosticsEnabled:)
 Func Configuration.with(logLevel:)
 Func Configuration.with(purchasesCompletedBy:)
 Func CustomerInfo.__derived_struct_equals(_:_:)  [Implements]

@@ -41,6 +41,13 @@ actor MockTransport: HTTPTransport {
     /// 整机断网（任何路径都抛传输层错误）。
     private var alwaysFailError: (any Error)?
 
+    /// §6-14：诊断上传端点的**兜底**响应（不是排队 stub —— 排进队列会把测试自己编排的
+    /// 第一个 stub 挤到第二位）。只有该路径上没有任何编排时才生效，
+    /// 保证任何用例意外打开诊断时，上传拿到的是形状正确的 202，而不是别的端点的 body。
+    private var fallbackStubsByPath: [String: Stub] = [
+        "/v1/diagnostics/events": .json(#"{"accepted":0,"dropped":0}"#, statusCode: 202),
+    ]
+
     init(stubs: [Stub] = []) {
         self.stubs = stubs
     }
@@ -60,6 +67,14 @@ actor MockTransport: HTTPTransport {
     /// 「后端一直 5xx」这种场景不用把 stub 数得刚刚好。
     func enqueue(_ stub: Stub, forPath path: String) {
         stubsByPath[path, default: []].append(stub)
+    }
+
+    /// 清掉某路径已排队的 stub（「先一直失败、再恢复」的场景要先清，
+    /// 否则粘住的失败 stub 会把恢复后的第一次调用又吃掉一次）。
+    func clearStubs(forPath path: String) {
+        stubsByPath[path] = nil
+        transportFailuresByPath[path] = nil
+        alwaysFailError = nil
     }
 
     /// 让某路径的前 `times` 次调用抛传输层错误（超时/断网）。`times: .max` = 一直不通。
@@ -107,12 +122,28 @@ actor MockTransport: HTTPTransport {
             stubsByPath[key] = queue
             return HTTPTransportResponse(statusCode: stub.statusCode, headers: stub.headers, body: stub.body)
         }
+        if let key = fallbackStubsByPath.keys.first(where: { Self.matches(path, key: $0) }),
+           let stub = fallbackStubsByPath[key] {
+            return HTTPTransportResponse(statusCode: stub.statusCode, headers: stub.headers, body: stub.body)
+        }
 
         guard !stubs.isEmpty else {
             return HTTPTransportResponse(statusCode: 200, headers: [:], body: Data("{}".utf8))
         }
         let stub = stubs.count == 1 ? stubs[0] : stubs.removeFirst()
         return HTTPTransportResponse(statusCode: stub.statusCode, headers: stub.headers, body: stub.body)
+    }
+}
+
+/// **永不返回**的调度器：把「定时 / 防抖上传」彻底冻住。
+///
+/// 为什么需要它：诊断的防抖是 2s、网络重试的真实退避是 5s 量级 —— 用真调度器跑集成测试时，
+/// 防抖会在断言之前把队列冲走（队列轮转到在飞文件、上传成功后清空），断言就变成了掷骰子。
+/// 冻住之后队列在整条链路跑完前保持原样，事件序列才是可断言的。
+/// Task 被取消时照常抛 `CancellationError`，不会泄漏。
+struct NeverDelayScheduler: DelayScheduler {
+    func sleep(seconds: TimeInterval) async throws {
+        try await Task.sleep(nanoseconds: 3_600 * 1_000_000_000)
     }
 }
 
@@ -159,8 +190,10 @@ extension Purchases.Dependencies.DiagnosticsDependencies {
     ///   把「这条链路一共发了几个请求」这类断言污染成随机值。
     /// - 采样率存内存，不写 `UserDefaults.standard`。
     /// - 不起「前台每 30s」的定时循环（测试进程里那是纯空转）。
+    /// - Parameter scheduler: 默认 `NeverDelayScheduler` —— 冻住防抖与定时上传，
+    ///   让「这条链路一共发了几个请求 / 队列里有哪些事件」在断言时是确定的。
     static func isolated(startsPeriodicFlush: Bool = false,
-                         scheduler: any DelayScheduler = TaskDelayScheduler()) -> Self {
+                         scheduler: any DelayScheduler = NeverDelayScheduler()) -> Self {
         var dependencies = Purchases.Dependencies.DiagnosticsDependencies()
         dependencies.fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("RevenueDogDiagnostics/\(UUID().uuidString)", isDirectory: true)

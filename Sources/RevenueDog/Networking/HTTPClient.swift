@@ -296,6 +296,13 @@ struct HTTPResponse<Body: Sendable>: Sendable {
     let serverRequestDate: Date?
 }
 
+/// `performUnchecked` 的返回：原始状态码 + 头 + body，`statusCode == nil` = 传输层错误。
+struct HTTPUncheckedResponse: Sendable {
+    let statusCode: Int?
+    let headers: [String: String]
+    let body: Data
+}
+
 // MARK: - 调用观测句柄（诊断事件用）
 
 /// 一次 `perform` / `performRaw` 调用的观测句柄。
@@ -525,6 +532,23 @@ actor HTTPClient {
             Log.debug("\(endpoint.path) 第 \(attempt) 次失败，\(String(format: "%.2f", delay))s 后重试",
                       category: "network")
             try await scheduler.sleep(seconds: delay)
+        }
+    }
+
+    /// 发一次、**不重试、不把非 2xx 转成错误**：诊断上传要按原始 HTTP 状态码分类
+    /// （sdk-diagnostics §6-10）。经 `PurchasesError` 映射会把 413 / 429 / 503 揉成同几个 code，
+    /// 而上传器的处置矩阵恰恰是**按状态码**分叉的（丢批 / 停摆 / 退避各不相同）。
+    ///
+    /// 本路径同样不记诊断事件（`recordHTTPAttempt` 对该端点直接返回），不会自激。
+    func performUnchecked(_ endpoint: Endpoint, body: Data? = nil) async -> HTTPUncheckedResponse {
+        do {
+            let request = try makeRequest(for: endpoint, body: body)
+            let response = try await transport.send(request)
+            return HTTPUncheckedResponse(statusCode: response.statusCode,
+                                         headers: response.headers,
+                                         body: response.body)
+        } catch {
+            return HTTPUncheckedResponse(statusCode: nil, headers: [:], body: Data())
         }
     }
 

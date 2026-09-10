@@ -281,6 +281,8 @@ public final class Purchases {
     /// 客户端诊断（ADR 0028）。关掉时仍然存在，只是不记不发（并在 start 时清空队列文件）。
     private let diagnostics: DiagnosticsRecorder
     private let httpClient: HTTPClient
+    /// 归因端状态：诊断的 `install_id` 与 ASA 共用同一把键（§6-1）。
+    private let attributionState: any AttributionStateStorage
     private var startTask: Task<Void, Never>?
     /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
     /// （Swift 6 下 @MainActor 类的 deinit 不能安全触碰隔离状态，所以不写在 deinit 里）。
@@ -318,17 +320,23 @@ public final class Purchases {
                                             isDirectory: false),
         )
         let attributionState = dependencies.attributionState
+        self.attributionState = attributionState
+        // 会话 id（§6-5）：一次 configure = 一个会话，事件靠它 + `seq` 还原「这次启动都发生了什么」。
+        let sessionID = UUID().uuidString.lowercased()
         let diagnosticsUploader = DiagnosticsUploader(
             httpClient: httpClient,
             queue: diagnosticsQueue,
+            sessionID: sessionID,
             installIDProvider: { await Purchases.resolveInstallID(attributionState) },
-            appUserIDProvider: { [identity] in await identity.currentAppUserIDIfAny },
             now: dependencies.diagnostics.now,
         )
         self.diagnostics = DiagnosticsRecorder(queue: diagnosticsQueue,
                                                uploader: diagnosticsUploader,
                                                settings: dependencies.diagnostics.settings,
                                                enabled: configuration.diagnosticsEnabled,
+                                               appUserIDProvider: { [identity] in
+                                                   await identity.currentAppUserIDIfAny
+                                               },
                                                scheduler: dependencies.diagnostics.scheduler,
                                                startsPeriodicFlush: dependencies.diagnostics.startsPeriodicFlush,
                                                now: dependencies.diagnostics.now,
@@ -419,8 +427,13 @@ public final class Purchases {
     }
     #endif
 
-    /// `install_id`：与「这次安装」同生命周期的设备标识（裁决 D2 的 ASA 幂等键，诊断事件复用同一个）。
-    /// 没有就地生成并落盘 —— ASA 采集路径读的是同一把键，两边不会各生成一个。
+    /// `install_id`：与「这次安装」同生命周期的设备标识。
+    ///
+    /// §6-1：**由 SDK 首次 `configure` 生成并持久化**，与 ASA 归因路径**解耦** ——
+    /// 诊断不能依赖宿主有没有开 `enableAdServicesAttributionTokenCollection()`。
+    /// 存的是同一把 UserDefaults 键（`com.revenuedog.sdk.installID`），ASA 路径直接复用，
+    /// 两边不会各生成一个。形态沿用 32 位小写 hex（无连字符 uuid）：
+    /// 服务端诊断端点只校验非空 ≤ 64 字符，而 ASA 端点要 `^[A-Za-z0-9_-]{8,64}$` —— 这个形态两边都过。
     private static func resolveInstallID(_ storage: any AttributionStateStorage) async -> String {
         if let stored = await storage.installID() { return stored }
         let generated = IdentityManager.uuid32()
@@ -437,17 +450,13 @@ public final class Purchases {
         AppStateProvider.refresh()
         observeAppLifecycle()
         // 铁律 P1：configure 内**同步**创建监听 Task。
-        startTask = Task { [orchestrator, diagnostics, httpClient, configuration] in
+        startTask = Task { [orchestrator, diagnostics, httpClient, configuration, attributionState] in
             // 诊断先接线：receipt_post / http_error 的记录点在 HTTPClient 里，
             // 必须早于任何一次请求（所有公开入口都先 await 本 Task）。
             await httpClient.setDiagnostics(diagnostics)
+            // §6-1：install_id 在**首次 configure** 就落盘，不等第一次上传、也不等 ASA。
+            _ = await Purchases.resolveInstallID(attributionState)
             await diagnostics.start()
-            await diagnostics.record(DiagnosticsEventType.sdkConfigured, fields: [
-                "log_level": .string(configuration.logLevel.label),
-                "purchases_completed_by": .string(configuration.purchasesCompletedBy.rawValue),
-                "has_app_user_id": .bool(configuration.appUserID != nil),
-                "diagnostics_enabled": .bool(configuration.diagnosticsEnabled),
-            ])
             await orchestrator.setCustomerInfoObserver { [weak self] customerInfo in
                 Task { @MainActor in self?.receive(customerInfo) }
             }
@@ -458,6 +467,15 @@ public final class Purchases {
             } catch {
                 Log.error("SDK 启动失败: \(error)")
             }
+            // `sdk_configured` 记在**身份解析之后**：每条事件都要带记录时刻的 app_user_id（§6-2），
+            // 而服务端那一列是 NOT NULL —— 在 bootstrap 之前记这一条，它会因为没有身份而被服务端丢掉。
+            // 顺序上仍然早于任何一次业务调用（所有公开入口都先 await 本 Task）。
+            await diagnostics.record(DiagnosticsEventType.sdkConfigured, fields: [
+                "log_level": .string(configuration.logLevel.label),
+                "purchases_completed_by": .string(configuration.purchasesCompletedBy.rawValue),
+                "has_app_user_id": .bool(configuration.appUserID != nil),
+                "diagnostics_enabled": .bool(configuration.diagnosticsEnabled),
+            ])
             await orchestrator.replayPendingPurchases()
         }
     }
@@ -495,7 +513,24 @@ public final class Purchases {
     func applicationDidEnterBackground() {
         AppStateProvider.setBackgrounded(true)
         Task { [orchestrator] in await orchestrator.syncAttributesIfNeeded() }
+        flushDiagnosticsInBackgroundTask()
+    }
+
+    /// §6-8：进后台的那一发要包在 `beginBackgroundTask` 里。
+    /// 不包的话系统会在几百毫秒内把进程挂起，这一批事件要等下次启动才发得出去 ——
+    /// 而「用户按了 home 就再也没回来」恰恰是最需要这批事件的场景。
+    private func flushDiagnosticsInBackgroundTask() {
+        #if canImport(UIKit) && !os(watchOS)
+        let application = UIApplication.shared
+        let box = BackgroundTaskBox()
+        box.begin(application)
+        Task { [diagnostics] in
+            await diagnostics.flushForBackground()
+            await MainActor.run { box.end(application) }
+        }
+        #else
         Task { [diagnostics] in await diagnostics.flushForBackground() }
+        #endif
     }
 
     func applicationDidBecomeActive() {
@@ -780,6 +815,30 @@ public final class Attribution: Sendable {
         }
     }
 }
+
+// MARK: - 后台任务盒子（§6-8）
+
+#if canImport(UIKit) && !os(watchOS)
+/// `beginBackgroundTask` / `endBackgroundTask` 的配对容器。
+/// 过期回调由系统**在主线程同步**调用（Apple 官方原文），所以 `assumeIsolated` 是安全的。
+@MainActor
+final class BackgroundTaskBox {
+
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    func begin(_ application: UIApplication) {
+        identifier = application.beginBackgroundTask(withName: "com.revenuedog.sdk.diagnostics") { [weak self] in
+            MainActor.assumeIsolated { self?.end(UIApplication.shared) }
+        }
+    }
+
+    func end(_ application: UIApplication) {
+        guard identifier != .invalid else { return }
+        application.endBackgroundTask(identifier)
+        identifier = .invalid
+    }
+}
+#endif
 
 // MARK: - 通知观察者盒子
 

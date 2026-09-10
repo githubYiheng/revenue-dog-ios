@@ -6,7 +6,8 @@
 //    1. 队列 ≥ 20 条
 //    2. 前台每 30s 定时（**有事件才发**）
 //    3. 进后台时（走既有前后台抽象，见 Purchases.applicationDidEnterBackground）
-//    4. 任一 `error` 级事件入队后 2s 防抖（连着来的错误只发一次）
+//    4. 任一 `warn` / `error` 级事件入队后 2s 防抖（§6-8：`finish_decision{kept}` 是 warn，
+//       「付了钱确认不了」必须和 error 一样快地到后端，不能等下一个 30s）
 //
 //  采样：`sample_rate_info` 由服务端下发、端上持久化，**只作用于 info**；warn / error 恒 100%。
 //  开关：`Configuration.with(diagnosticsEnabled:)`，默认 true；false 时不记不发并清空队列文件。
@@ -73,11 +74,18 @@ actor DiagnosticsRecorder {
     private let now: @Sendable () -> Date
     private let random: @Sendable () -> Double
     private let idProvider: @Sendable () -> String
+    /// **记录那一刻**的身份（§6-2）。一批事件可能横跨一次 logIn，所以身份必须逐条取。
+    private let appUserIDProvider: @Sendable () async -> String?
     private let startsPeriodicFlush: Bool
 
     private var enabled: Bool
     /// info 采样率（服务端下发，端上持久化）。默认 1.0 = 不采样。
     private var sampleRateInfo: Double = 1
+    /// 服务端硬开关（§6-9/§6-10 的 `disable_until_ms`）：该时刻前**不记不发**。
+    /// 只活在本进程内 —— 重启后最多多发一批，服务端再回一次 202 就又停了，不值得为它落盘。
+    private var disabledUntil: Date?
+    /// 会话内单调序号（§6-5）：同毫秒的事件靠它排序。
+    private var seq: Int64 = 0
     private var didStart = false
     private var errorDebounceTask: Task<Void, Never>?
     private var periodicTask: Task<Void, Never>?
@@ -86,6 +94,7 @@ actor DiagnosticsRecorder {
          uploader: DiagnosticsUploader,
          settings: any DiagnosticsSettingsStorage,
          enabled: Bool,
+         appUserIDProvider: @escaping @Sendable () async -> String? = { nil },
          scheduler: any DelayScheduler = TaskDelayScheduler(),
          startsPeriodicFlush: Bool = true,
          now: @escaping @Sendable () -> Date = { Date() },
@@ -95,6 +104,7 @@ actor DiagnosticsRecorder {
         self.uploader = uploader
         self.settings = settings
         self.enabled = enabled
+        self.appUserIDProvider = appUserIDProvider
         self.scheduler = scheduler
         self.startsPeriodicFlush = startsPeriodicFlush
         self.now = now
@@ -121,6 +131,10 @@ actor DiagnosticsRecorder {
         if let stored = await settings.sampleRateInfo() {
             sampleRateInfo = min(max(stored, 0), 1)
         }
+        // §6-8：先补发上次留下的在飞文件（进程被杀 / 上传失败），再开始正常记录。
+        if !queue.inflightFiles().isEmpty {
+            Task { [weak self] in await self?.flush() }
+        }
         if startsPeriodicFlush { startPeriodicFlush() }
     }
 
@@ -135,15 +149,19 @@ actor DiagnosticsRecorder {
                 level: String = DiagnosticsLevel.info,
                 fields: [String: DiagnosticsFieldValue?] = [:]) async {
         guard enabled else { return }
+        if let disabledUntil, now() < disabledUntil { return }   // 服务端硬开关（§6-9）
         // 采样只作用于 info；warn / error 恒 100%（契约 §1.2）。
         if level == DiagnosticsLevel.info, sampleRateInfo < 1 {
             guard sampleRateInfo > 0, random() < sampleRateInfo else { return }
         }
 
+        seq += 1
         let event = DiagnosticsEvent.make(type: type,
                                           level: level,
                                           fields: fields,
                                           id: idProvider(),
+                                          appUserID: await appUserIDProvider(),
+                                          seq: seq,
                                           tsMs: Int64((now().timeIntervalSince1970 * 1000).rounded()))
         let dropped = await queue.append(event)
         if dropped > 0 {
@@ -152,13 +170,16 @@ actor DiagnosticsRecorder {
 
         if await queue.count >= Self.uploadThreshold {
             triggerFlush()
-        } else if level == DiagnosticsLevel.error {
+        } else if level != DiagnosticsLevel.info {
+            // §6-8：warn 与 error 同样触发 2s 防抖 —— `finish_decision{kept}` 是 warn 级，
+            // 「付了钱但 finish 不了」不能等到下一个 30s 才被后端看见。
             scheduleErrorDebounce()
         }
     }
 
     /// 队列溢出告警。**这一条自己不再触发溢出告警**（否则会自激成无限告警）。
     private func recordQueueOverflow(dropped: Int) async {
+        seq += 1
         let event = DiagnosticsEvent.make(type: DiagnosticsEventType.sdkWarning,
                                           level: DiagnosticsLevel.warn,
                                           fields: [
@@ -166,6 +187,8 @@ actor DiagnosticsRecorder {
                                               "detail": .string("dropped_oldest=\(dropped)"),
                                           ],
                                           id: idProvider(),
+                                          appUserID: await appUserIDProvider(),
+                                          seq: seq,
                                           tsMs: Int64((now().timeIntervalSince1970 * 1000).rounded()))
         _ = await queue.append(event)
     }
@@ -176,6 +199,9 @@ actor DiagnosticsRecorder {
     @discardableResult
     func flush() async -> DiagnosticsUploadResult {
         guard enabled else { return DiagnosticsUploadResult(skipped: .empty) }
+        if let disabledUntil, now() < disabledUntil {
+            return DiagnosticsUploadResult(skipped: .backoff)
+        }
         let result = await uploader.upload()
         if let rate = result.sampleRateInfo {
             let clamped = min(max(rate, 0), 1)
@@ -184,6 +210,17 @@ actor DiagnosticsRecorder {
                 await settings.setSampleRateInfo(clamped)
                 Log.debug("诊断 info 采样率更新为 \(clamped)", category: "diagnostics")
             }
+        }
+        if let until = result.disableUntilMs {
+            disabledUntil = Date(timeIntervalSince1970: Double(until) / 1000)
+            await queue.clear()          // 服务端说了停，盘上就不该再留着
+            Log.info("诊断被服务端临时关闭至 \(disabledUntil!)", category: "diagnostics")
+            return result
+        }
+        // §6-13：上传失败**从不**触发新的诊断请求，只在本地计数；恢复之后补记一条告警。
+        if result.recoveredFailureCount > 0 {
+            await warn(DiagnosticsWarningCode.diagUploadFailed,
+                       detail: "consecutive=\(result.recoveredFailureCount)")
         }
         return result
     }
@@ -200,7 +237,7 @@ actor DiagnosticsRecorder {
         Task { [weak self] in await self?.flush() }
     }
 
-    /// error 级事件 2s 防抖：连着炸出来的错误合成一次上传。
+    /// warn / error 级事件 2s 防抖：连着炸出来的错误合成一次上传。
     private func scheduleErrorDebounce() {
         errorDebounceTask?.cancel()
         errorDebounceTask = Task { [weak self, scheduler] in
@@ -236,6 +273,13 @@ actor DiagnosticsRecorder {
 
     func queuedCount() async -> Int {
         await queue.count
+    }
+
+    var currentSeq: Int64 { seq }
+
+    var isTemporarilyDisabled: Bool {
+        guard let disabledUntil else { return false }
+        return now() < disabledUntil
     }
 }
 

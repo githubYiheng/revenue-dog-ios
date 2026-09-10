@@ -10,7 +10,7 @@
     "X-Platform" : "iOS",
     "X-Platform-Flavor" : "native",
     "X-StoreKit-Version" : "2",
-    "X-Version" : "0.1.0"
+    "X-Version" : "0.2.0"
   },
   "method" : "GET",
   "path" : "/v1/subscribers/%24RCAnonymousID%3A0123456789abcdef0123456789abcdef"

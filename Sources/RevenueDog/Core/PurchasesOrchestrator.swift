@@ -230,7 +230,7 @@ actor PurchasesOrchestrator {
             // 台账记录不分模式（#2）：currentEntitlements 启动扫描靠它识别「已上报过」的已 finish 交易
             await ledger?.record(txID)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
-            await publish(posted.customerInfo)
+            await publish(posted.customerInfo, source: .purchase)
             return posted.customerInfo
         case .failure(.finishable(let error)):
             // 确定性拒绝：重试无意义 —— finish（.revenueDog 模式）并删除上下文
@@ -294,7 +294,7 @@ actor PurchasesOrchestrator {
             await attributesStore.migrateIfOldIsAnonymous(from: previous, to: newAppUserID)
         }
         await syncAttributesIfNeeded()
-        await publish(info)
+        await publish(info, source: .login, requestID: trace.last?.requestID)
         await recordIdentityEvent(DiagnosticsEventType.identityLogin,
                                   trace: trace, startedAt: startedAt,
                                   extra: ["from_anonymous": .bool(fromAnonymous),
@@ -311,7 +311,7 @@ actor PurchasesOrchestrator {
             let anonymous = try await identity.logOut()
             await deviceCache.clearMemoryCache(appUserID: previous)
             let response = try await fetchCustomerInfo(appUserID: anonymous, trace: trace)
-            await publish(response.info)
+            await publish(response.info, source: .fetch, requestID: trace.last?.requestID)
             await recordIdentityEvent(DiagnosticsEventType.identityLogout,
                                       trace: trace, startedAt: startedAt, extra: [:], error: nil)
             return response.info
@@ -377,7 +377,7 @@ actor PurchasesOrchestrator {
         let trace = HTTPCallTrace()
         do {
             let response = try await fetchCustomerInfo(appUserID: appUserID, trace: trace)
-            await publish(response.info)
+            await publish(response.info, source: .fetch, requestID: trace.last?.requestID)
             await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: false,
                                           trace: trace, startedAt: startedAt, error: nil)
             return response.info
@@ -450,23 +450,26 @@ actor PurchasesOrchestrator {
             // M2：这里再用 StoreKit 批量拉 platform_product_identifier 对应的商品填 storeProduct。
             let offerings = Offerings(wireModel: response.body)
             await deviceCache.cache(offerings: offerings, appUserID: appUserID)
-            await recordOfferingsFetch(count: offerings.all.count, trace: trace,
-                                       startedAt: startedAt, error: nil)
+            await recordOfferingsFetch(count: offerings.all.count,
+                                       notFoundProductIDs: await missingStoreProductIDs(in: offerings),
+                                       trace: trace, startedAt: startedAt, error: nil)
             return offerings
         } catch {
             if let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
                 Log.warn("offerings 拉取失败，回落缓存: \(error)", category: "offerings")
                 await diagnostics.warn(DiagnosticsWarningCode.offeringsCacheFallback)
-                await recordOfferingsFetch(count: cached.all.count, trace: trace,
-                                           startedAt: startedAt, error: error)
+                await recordOfferingsFetch(count: cached.all.count, notFoundProductIDs: nil,
+                                           trace: trace, startedAt: startedAt, error: error)
                 return cached
             }
-            await recordOfferingsFetch(count: nil, trace: trace, startedAt: startedAt, error: error)
+            await recordOfferingsFetch(count: nil, notFoundProductIDs: nil,
+                                       trace: trace, startedAt: startedAt, error: error)
             throw error
         }
     }
 
     private func recordOfferingsFetch(count: Int?,
+                                      notFoundProductIDs: [String]?,
                                       trace: HTTPCallTrace,
                                       startedAt: Date,
                                       error: (any Error)?) async {
@@ -476,9 +479,23 @@ actor PurchasesOrchestrator {
                                      "status": trace.last?.statusCode.map { .int($0) },
                                      "request_id": trace.last?.requestID.map { .string($0) },
                                      "count": count.map { .int($0) },
+                                     "not_found_product_ids": notFoundProductIDs.flatMap {
+                                         $0.isEmpty ? nil : .strings(Array($0.prefix(50)))
+                                     },
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
                                      "error_code": Self.diagnosticsErrorCode(error),
                                  ])
+    }
+
+    /// §6-4：后端 offerings 里配了、但商店查不到的商品 id。
+    /// 这是接线期最常见的一类事故（ASC 里没建、没过审、地区不售），端上不查就只能靠用户报「买不了」。
+    /// best-effort：查不动（无 StoreKit / 抛错）就返回 nil，不影响 offerings 本身。
+    private func missingStoreProductIDs(in offerings: Offerings) async -> [String]? {
+        guard let storeKit else { return nil }
+        let wanted = Set(offerings.all.values.flatMap { $0.availablePackages.map(\.platformProductIdentifier) })
+        guard !wanted.isEmpty else { return [] }
+        guard let found = try? await storeKit.products(forIdentifiers: wanted) else { return nil }
+        return wanted.subtracting(found.map { $0.productIdentifier }).sorted()
     }
 
     // MARK: - 事件多播
@@ -518,9 +535,20 @@ actor PurchasesOrchestrator {
 
     /// 设计 §6 铁律 1/2：锁（actor 状态）内取出、锁外调用；观察者通知异步派发。
     /// M3：连续相同值去重（stream 消费者不吃重复帧）。
-    private func publish(_ customerInfo: CustomerInfo) async {
+    ///
+    /// §6-4：这里是 CustomerInfo **真正发生变化**的唯一收口，`customer_info_updated` 记在这
+    /// —— 「权益是什么时候变的、由哪条路带来的」是排查权益争议的主线。
+    private func publish(_ customerInfo: CustomerInfo,
+                         source: DiagnosticsCustomerInfoSource,
+                         requestID: String? = nil) async {
         guard customerInfo != lastPublished else { return }
         lastPublished = customerInfo
+        await diagnostics.record(DiagnosticsEventType.customerInfoUpdated, fields: [
+            "source": .string(source.rawValue),
+            // 只上权益 id（我方配置里的标识），不带到期时间之外的任何用户信息。
+            "active_entitlement_ids": .strings(Array(customerInfo.entitlements.active.keys.sorted().prefix(50))),
+            "request_id": requestID.map { .string($0) },
+        ])
         let continuations = Array(customerInfoContinuations.values)
         let observer = customerInfoObserver
         Task.detached {
@@ -799,7 +827,9 @@ actor PurchasesOrchestrator {
             await attributesStore.markSynced(pendingAttributes, appUserID: appUserID)
             await ledger?.record(latest.transactionIdentifier)
             await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: appUserID)
-            await publish(posted.customerInfo)
+            await publish(posted.customerInfo,
+                          source: userInitiated ? .restore : .sync,
+                          requestID: trace.last?.requestID)
             await onSuccess(candidateCount)
             return posted.customerInfo
         case .failure(.finishable(let error)), .failure(.retryable(let error)):
@@ -870,7 +900,7 @@ actor PurchasesOrchestrator {
             if let wire = try? JSONDecoder().decode(CustomerInfoWireModel.self, from: raw.body) {
                 let info = CustomerInfo(wireModel: wire)
                 await deviceCache.cache(customerInfo: info, appUserID: appUserID)
-                await publish(info)
+                await publish(info, source: .fetch)
             }
             return true
         } catch let error as PurchasesError {
@@ -968,7 +998,7 @@ actor PurchasesOrchestrator {
             switch result {
             case .success(let posted):
                 await deviceCache.cache(customerInfo: posted.customerInfo, appUserID: context.appUserID)
-                await publish(posted.customerInfo)
+                await publish(posted.customerInfo, source: .purchase)
                 if completedBy == .myApp {
                     await pendingPurchases.remove(forKey: context.key)
                     await ledger?.record(context.key)

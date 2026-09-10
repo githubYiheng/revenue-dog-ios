@@ -101,8 +101,7 @@ actor TransactionPoster {
                                          underlyingError: error)
             await recordFinishDecision(transactionID: transactionID,
                                        decision: DiagnosticsFinishDecision.kept,
-                                       reason: DiagnosticsFinishReason.retryableFailure,
-                                       level: DiagnosticsLevel.warn)
+                                       reason: DiagnosticsFinishReason.retryableFailure)
             return .failure(.retryable(wrapped))
         }
     }
@@ -119,13 +118,11 @@ actor TransactionPoster {
             if completedBy == .revenueDog {
                 await recordFinishDecision(transactionID: transactionID,
                                            decision: DiagnosticsFinishDecision.finished,
-                                           reason: DiagnosticsFinishReason.deterministic4xx,
-                                           level: DiagnosticsLevel.info)
+                                           reason: DiagnosticsFinishReason.deterministic4xx)
             } else {
                 await recordFinishDecision(transactionID: transactionID,
                                            decision: DiagnosticsFinishDecision.kept,
-                                           reason: DiagnosticsFinishReason.observerMode,
-                                           level: DiagnosticsLevel.info)
+                                           reason: DiagnosticsFinishReason.observerMode)
             }
         case .retryable(let error):
             let isAuth = error.httpStatusCode == 401 || error.httpStatusCode == 403
@@ -133,15 +130,18 @@ actor TransactionPoster {
                                        decision: DiagnosticsFinishDecision.kept,
                                        reason: isAuth
                                            ? DiagnosticsFinishReason.authFailureKeep
-                                           : DiagnosticsFinishReason.retryableFailure,
-                                       level: DiagnosticsLevel.warn)
+                                           : DiagnosticsFinishReason.retryableFailure)
         }
     }
 
+    /// §6-8：`decision == kept` 一律记 **warn**。「交易还挂着没 finish」不管出于哪种理由，
+    /// 都是需要有人看一眼的状态；warn 还会顺带触发 2s 防抖上传，不用等下一个 30s。
     private func recordFinishDecision(transactionID: String?,
                                       decision: String,
-                                      reason: String,
-                                      level: String) async {
+                                      reason: String) async {
+        let level = decision == DiagnosticsFinishDecision.kept
+            ? DiagnosticsLevel.warn
+            : DiagnosticsLevel.info
         await diagnostics.record(DiagnosticsEventType.finishDecision, level: level, fields: [
             "transaction_id": transactionID.map { .string($0) },
             "decision": .string(decision),
@@ -159,15 +159,13 @@ actor TransactionPoster {
         guard completedBy == .revenueDog else {                 // .myApp：宿主自管 finish
             await recordFinishDecision(transactionID: transaction?.transactionIdentifier,
                                        decision: DiagnosticsFinishDecision.kept,
-                                       reason: DiagnosticsFinishReason.observerMode,
-                                       level: DiagnosticsLevel.info)
+                                       reason: DiagnosticsFinishReason.observerMode)
             return false
         }
         guard let transaction else {                            // 重放路径无交易对象（仅 JWS）时不 finish
             await recordFinishDecision(transactionID: nil,
                                        decision: DiagnosticsFinishDecision.kept,
-                                       reason: DiagnosticsFinishReason.replayNoTransaction,
-                                       level: DiagnosticsLevel.info)
+                                       reason: DiagnosticsFinishReason.replayNoTransaction)
             return false
         }
 
@@ -182,8 +180,7 @@ actor TransactionPoster {
             await transaction.finish()
             await recordFinishDecision(transactionID: transaction.transactionIdentifier,
                                        decision: DiagnosticsFinishDecision.finished,
-                                       reason: DiagnosticsFinishReason.serverAck,
-                                       level: DiagnosticsLevel.info)
+                                       reason: DiagnosticsFinishReason.serverAck)
             return true
         }
         // 一次性但响应里没看到：不 finish（下次启动补投重试；服务端幂等）
@@ -191,8 +188,7 @@ actor TransactionPoster {
                  category: "poster")
         await recordFinishDecision(transactionID: transaction.transactionIdentifier,
                                    decision: DiagnosticsFinishDecision.kept,
-                                   reason: DiagnosticsFinishReason.consumableUnconfirmed,
-                                   level: DiagnosticsLevel.warn)
+                                   reason: DiagnosticsFinishReason.consumableUnconfirmed)
         return false
     }
 
