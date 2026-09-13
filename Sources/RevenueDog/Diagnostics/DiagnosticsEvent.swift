@@ -167,6 +167,11 @@ enum DiagnosticsWarningCode {
     static let diagUploadFailed = "diag_upload_failed"
     /// offerings 拉取失败，回落缓存。
     static let offeringsCacheFallback = "offerings_cache_fallback"
+    /// ADR 0046 第 5 条：身份门控下 configure 60 秒仍未 logIn / logOut（发现漏调 logIn 的宿主）。每进程最多一次。
+    static let identityPending = "identity_pending"
+    /// ADR 0046 第 4 条：身份待确认期间 purchase / restore / sync 等确认超时（10 秒），已抛 configurationError。
+    /// detail 带操作名（`op=purchase` / `op=restore_purchases` / `op=sync_purchases`）。
+    static let identityPendingTimeout = "identity_pending_timeout"
 }
 
 /// `receipt_post` / `http_error` 的 `error_class`（契约 §1.3）。

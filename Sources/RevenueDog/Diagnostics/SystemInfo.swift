@@ -50,7 +50,7 @@ struct SystemInfo: Sendable, Equatable {
     var storefront: String? = nil
 
     /// SDK 版本。**必须与 CHANGELOG 最新版本号一致** —— `scripts/sdk-release.sh` 门禁 7 会比对。
-    static let sdkVersionString = "0.2.1"
+    static let sdkVersionString = "0.3.0"
 
     /// 本 SDK 只有 SPM 分发形态（设计基线：SPM 分发、无 ObjC 层）。
     static let installationMethodString = "swift-package-manager"

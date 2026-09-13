@@ -92,6 +92,40 @@ actor PurchasesOrchestrator {
 
     private var didStart = false
 
+    // MARK: 身份门控（ADR 0046 ① / ADR 0047 收窄）
+
+    /// 「身份待确认」状态机。内部类型（禁 public enum 只约束公开面）。
+    enum IdentityGateState: Sendable, Equatable {
+        /// 开关开、configure 未传 appUserID，bootstrap 还没返回 —— 还不知道要不要门控。
+        case undetermined
+        /// 不门控：开关关 / configure 传了 appUserID / 启动身份是匿名的（全新安装或持久化匿名）。
+        case open
+        /// 以**持久化的具名身份**启动，等宿主首次 logIn / logOut 成功来确认。
+        case pending
+        /// 已确认（确认触发的那次启动补投可能还在跑）。
+        case confirmed
+    }
+
+    /// purchase / restore / sync 等身份确认的上限。
+    static let identityConfirmationTimeout: TimeInterval = 10
+    /// configure 后仍未确认就记一次 `identity_pending` 告警的延时。
+    static let identityPendingWarningDelay: TimeInterval = 60
+
+    /// 门控计时（10 秒确认超时 / 60 秒告警）的调度器；测试注入可手动放行的实现，不真睡。
+    private let identityGateScheduler: any DelayScheduler
+    private(set) var identityGate: IdentityGateState
+    /// `sdk_configured.identity_gated`：本次启动**实际**是否进入了身份待确认。
+    private(set) var launchWasIdentityGated = false
+    /// bootstrap 之前就到达的 updates 交易在这里等门控判定（P1 监听早于 bootstrap）。
+    private var identityGateDeterminationWaiters: [CheckedContinuation<Void, Never>] = []
+    /// purchase / restore / sync 的确认等待者：true = 已确认，false = 超时。
+    private var identityConfirmationWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var identityConfirmationTimeoutTasks: [UUID: Task<Void, Never>] = [:]
+    /// 身份确认触发的**那一次**启动补投（之后再 logIn 不重跑）。
+    private var identityConfirmationReplayTask: Task<Void, Never>?
+    private var identityPendingWarningTask: Task<Void, Never>?
+    private var didWarnIdentityPending = false
+
     init(configuration: Configuration,
          settings: RuntimeSettings,
          identity: IdentityManager,
@@ -101,6 +135,7 @@ actor PurchasesOrchestrator {
          storeKit: (any StoreKitProvider)?,
          ledgerFileURL: URL? = nil,
          delayScheduler: any DelayScheduler = TaskDelayScheduler(),
+         identityGateScheduler: any DelayScheduler = TaskDelayScheduler(),
          attributesDirectory: URL,
          attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage(),
          adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider(),
@@ -113,6 +148,11 @@ actor PurchasesOrchestrator {
         self.pendingPurchases = pendingPurchases
         self.storeKit = storeKit
         self.delayScheduler = delayScheduler
+        self.identityGateScheduler = identityGateScheduler
+        // ADR 0046 第 6 条：configure 传了 appUserID = 已确认；开关关 = 不门控。
+        // 其余情况要等 bootstrap 读出身份才知道（ADR 0047：只有持久化具名身份才门控）。
+        self.identityGate = configuration.waitsForLogInBeforeSync && configuration.appUserID == nil
+            ? .undetermined : .open
         self.attributesStore = SubscriberAttributesStore(directory: attributesDirectory)
         self.attributionState = attributionState
         self.adServicesTokenProvider = adServicesTokenProvider
@@ -142,8 +182,21 @@ actor PurchasesOrchestrator {
             }
         }
 
-        let appUserID = try await identity.bootstrap(configuredAppUserID: configuration.appUserID)
+        let appUserID: String
+        do {
+            appUserID = try await identity.bootstrap(configuredAppUserID: configuration.appUserID)
+        } catch {
+            // 只有 configure 传了非法 appUserID 才会 throw，那时门控本就是 .open；
+            // 防御性兜底：身份不明时站在保守一侧（门控 = 不上报），并放行等判定的交易。
+            if identityGate == .undetermined { determineIdentityGate(gated: true) }
+            throw error
+        }
         Log.info("RevenueDog 已配置，appUserID=\(appUserID)（匿名=\(IdentityManager.isAnonymous(appUserID))）")
+        if identityGate == .undetermined {
+            // ADR 0047：`bootstrap(nil)` 只会返回持久化值或新生成的匿名 ID，
+            // 所以「非匿名」⇔「持久化读出的具名身份」—— 只有它才门控。
+            determineIdentityGate(gated: !IdentityManager.isAnonymous(appUserID))
+        }
 
         // 启动重放由门面 `Purchases.start()` 在 start() 之后 await 一次（单一调用点，
         // 修复门禁核验发现的「冷启动双重重放」）；这里只做环境快照预取。
@@ -169,6 +222,15 @@ actor PurchasesOrchestrator {
     func handle(transaction: any StoreTransactionType,
                 source: DiagnosticsTransactionSource = .updates) async -> TransactionHandleOutcome {
         let txID = transaction.transactionIdentifier
+
+        // 身份门控（ADR 0046 ②a）：bootstrap 之前到达的交易先等门控判定；
+        // 待确认期间一律不上报、不 finish、不记台账 —— 交易留在 StoreKit 里，确认后的启动补投会再扫到。
+        if identityGate == .undetermined { await awaitIdentityGateDetermined() }
+        if identityGate == .pending {
+            Log.info("身份待确认：交易暂不上报（tx=\(txID)，source=\(source.rawValue)），留给确认后的启动补投",
+                     category: "purchase")
+            return .skipped
+        }
 
         // 诊断（契约 §1.3）：单一处理通道的入口是「端上看见了这笔交易」的唯一时刻。
         await diagnostics.record(DiagnosticsEventType.transactionObserved, fields: [
@@ -286,6 +348,10 @@ actor PurchasesOrchestrator {
     func logIn(_ newAppUserID: String) async throws -> (customerInfo: CustomerInfo, created: Bool) {
         let previous = try? await identity.appUserID
         guard previous != newAppUserID else {
+            // ADR 0046 第 3 条 / ADR 0048：同 id 早返回也算确认（宿主每次启动 logIn 同一个 uid 是常态）。
+            // 确认放在拉 CustomerInfo **之前**：宿主已声明当前身份就是持久化身份，身份问题到此解决；
+            // 随后拉取失败（离线 / 我方 5xx）只是数据没拿到，不能让补投和购买继续卡在门上。
+            confirmIdentityIfPending(trigger: "login")
             let info = try await customerInfo(fetchPolicy: .cachedOrFetched)
             return (info, false)
         }
@@ -323,6 +389,8 @@ actor PurchasesOrchestrator {
                                   extra: ["from_anonymous": .bool(fromAnonymous),
                                           "created": .bool(response.statusCode == 201)],
                                   error: nil)
+        // 身份已落盘切到新 id：此刻确认，补投用的就是它。失败路径（上面 throw）保持待确认。
+        confirmIdentityIfPending(trigger: "login")
         return (info, response.statusCode == 201)
     }
 
@@ -360,6 +428,8 @@ actor PurchasesOrchestrator {
             await publish(info, source: .fetch, requestID: trace.last?.requestID)
             await recordIdentityEvent(DiagnosticsEventType.identityLogout,
                                       trace: trace, startedAt: startedAt, extra: [:], error: nil)
+            // ADR 0046 第 3 条：logOut 成功同样确认身份（确认后的身份 = 服务端刚认过的匿名 ID）。
+            confirmIdentityIfPending(trigger: "logout")
             return info
         } catch {
             await recordIdentityEvent(DiagnosticsEventType.identityLogout,
@@ -624,15 +694,17 @@ actor PurchasesOrchestrator {
     // MARK: - 购买（M2，铁律 P1–P8）
 
     func purchase(package: Package) async throws -> PurchaseResult {
-        try await purchase(productIdentifier: package.platformProductIdentifier,
-                           presentedOfferingIdentifier: package.offeringIdentifier,
-                           presentedPackageIdentifier: package.identifier)
+        try await awaitIdentityConfirmation(operation: "purchase")
+        return try await purchase(productIdentifier: package.platformProductIdentifier,
+                                  presentedOfferingIdentifier: package.offeringIdentifier,
+                                  presentedPackageIdentifier: package.identifier)
     }
 
     func purchase(product: StoreProduct) async throws -> PurchaseResult {
-        try await purchase(productIdentifier: product.productIdentifier,
-                           presentedOfferingIdentifier: nil,
-                           presentedPackageIdentifier: nil)
+        try await awaitIdentityConfirmation(operation: "purchase")
+        return try await purchase(productIdentifier: product.productIdentifier,
+                                  presentedOfferingIdentifier: nil,
+                                  presentedPackageIdentifier: nil)
     }
 
     private func purchase(productIdentifier: String,
@@ -828,12 +900,14 @@ actor PurchasesOrchestrator {
     /// restore（用户显式动作，会弹 Apple ID 框）。契约 C（裁决 C2-C）：
     /// 端上只传「最新一笔交易 JWS + AppTransaction」，全量历史由后端凭锚点回填。
     func restorePurchases() async throws -> CustomerInfo {
-        try await syncInternal(userInitiated: true)
+        try await awaitIdentityConfirmation(operation: "restore_purchases")
+        return try await syncInternal(userInitiated: true)
     }
 
     /// 静默同步（不弹框），语义同 restore。
     func syncPurchases() async throws -> CustomerInfo {
-        try await syncInternal(userInitiated: false)
+        try await awaitIdentityConfirmation(operation: "sync_purchases")
+        return try await syncInternal(userInitiated: false)
     }
 
     private func syncInternal(userInitiated: Bool) async throws -> CustomerInfo {
@@ -1089,6 +1163,14 @@ actor PurchasesOrchestrator {
     /// 两类上下文：有 JWS 的直接补报（无交易对象 → 不 finish，finish 义务由本轮 unfinished
     /// 扫描配对完成）；只有发起键的（崩溃在弹窗前后）→ 交给 unfinished 扫描配对。
     func replayPendingPurchases() async {
+        // 身份门控（ADR 0046 ②a）：待确认期间不补投。门面 startTask 那次在这里变成空操作，
+        // 由身份确认时以确认后的身份再跑一次（`confirmIdentityIfPending`）。
+        if identityGate == .undetermined { await awaitIdentityGateDetermined() }
+        guard identityGate != .pending else {
+            Log.debug("身份待确认：启动补投推迟到首次 logIn / logOut 成功之后", category: "purchase")
+            return
+        }
+
         // 有 finish 义务待清的交易键（.revenueDog：JWS 补报成功但无交易对象可 finish）
         var awaitingFinish: Set<String> = []
 
@@ -1207,11 +1289,128 @@ actor PurchasesOrchestrator {
         // 只在观察者模式做：`.revenueDog` 下 Dog 自己发起购买、自己 finish，
         // updates + 启动扫描已经覆盖，前台再扫是纯浪费。
         guard settings.purchasesCompletedBy == .myApp else { return }
+        // 身份门控（ADR 0046 ②a）：待确认期间不重扫；已确认时先等确认触发的那次补投，不与它叠加。
+        guard identityGate != .pending, identityGate != .undetermined else { return }
+        if let replay = identityConfirmationReplayTask { await replay.value }
         // 单飞：前后台反复抖动不叠加扫描（每次扫描要遍历快照序列 + 读台账）。
         guard !isForegroundRescanning else { return }
         isForegroundRescanning = true
         defer { isForegroundRescanning = false }
         await replayPendingPurchases()
+    }
+
+    // MARK: - 身份门控（ADR 0046 ① / ADR 0047）
+
+    /// bootstrap 之后定下门控状态，并放行等判定的交易。
+    private func determineIdentityGate(gated: Bool) {
+        identityGate = gated ? .pending : .open
+        launchWasIdentityGated = gated
+        if gated {
+            Log.info("身份待确认（waitsForLogInBeforeSync，以持久化具名身份启动）：启动补投 / updates 上报 / "
+                     + "前台重扫推迟到首次 logIn 或 logOut 成功之后", category: "identity")
+            scheduleIdentityPendingWarning()
+        }
+        let waiters = identityGateDeterminationWaiters
+        identityGateDeterminationWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func awaitIdentityGateDetermined() async {
+        guard identityGate == .undetermined else { return }
+        await withCheckedContinuation { continuation in
+            identityGateDeterminationWaiters.append(continuation)
+        }
+    }
+
+    /// ADR 0046 第 5 条：configure 后 60 秒仍未确认 → 记一次 `identity_pending`（每进程最多一次）。
+    private func scheduleIdentityPendingWarning() {
+        identityPendingWarningTask = Task { [weak self, identityGateScheduler] in
+            do {
+                try await identityGateScheduler.sleep(seconds: Self.identityPendingWarningDelay)
+            } catch {
+                return   // 已确认（计时 Task 被取消）
+            }
+            guard !Task.isCancelled else { return }
+            await self?.warnIdentityStillPending()
+        }
+    }
+
+    private func warnIdentityStillPending() async {
+        guard identityGate == .pending, !didWarnIdentityPending else { return }
+        didWarnIdentityPending = true
+        Log.warn("configure 已过 \(Int(Self.identityPendingWarningDelay)) 秒仍未 logIn / logOut：开启 "
+                 + "waitsForLogInBeforeSync 时须先 logIn，启动补投与购买都在等身份确认", category: "identity")
+        await diagnostics.warn(DiagnosticsWarningCode.identityPending,
+                               detail: "after_s=\(Int(Self.identityPendingWarningDelay))")
+    }
+
+    /// 首次 logIn / logOut 成功：确认身份 → 以确认后的身份跑**一次**完整启动补投 → 放行等确认的调用方。
+    /// 非待确认状态（不门控 / 已确认）一律空操作，所以之后再 logIn 不会重跑补投。
+    private func confirmIdentityIfPending(trigger: String) {
+        guard identityGate == .pending else { return }
+        identityGate = .confirmed
+        identityPendingWarningTask?.cancel()
+        identityPendingWarningTask = nil
+        Log.info("身份已确认（\(trigger)）：以确认后的身份跑一次启动补投", category: "identity")
+        // 先建补投 Task、再放行等待者：等待者醒来第一件事就是 await 这个 Task。
+        identityConfirmationReplayTask = Task { [weak self] in await self?.replayPendingPurchases() }
+        let timeouts = identityConfirmationTimeoutTasks
+        identityConfirmationTimeoutTasks.removeAll()
+        for (_, task) in timeouts { task.cancel() }
+        let waiters = identityConfirmationWaiters
+        identityConfirmationWaiters.removeAll()
+        for (_, waiter) in waiters { waiter.resume(returning: true) }
+    }
+
+    /// purchase / restore / sync 的入口闸（ADR 0046 第 4 条）。不门控时不挂起、直接返回。
+    ///
+    /// 待确认：最多等 10 秒确认；确认后再等确认触发的那次补投完成，然后照常执行。
+    /// 超时：记 `identity_pending_timeout` 并抛 `configurationError` —— 不猜身份、不回退到持久化身份。
+    private func awaitIdentityConfirmation(operation: String) async throws {
+        if identityGate == .undetermined { await awaitIdentityGateDetermined() }
+        if identityGate == .pending {
+            guard await waitForIdentityConfirmation() else {
+                Log.warn("\(operation) 等身份确认超时（\(Int(Self.identityConfirmationTimeout)) 秒）：开启 "
+                         + "waitsForLogInBeforeSync 时须先 logIn", category: "identity")
+                await diagnostics.warn(DiagnosticsWarningCode.identityPendingTimeout, detail: "op=\(operation)")
+                throw PurchasesError(code: .configurationError,
+                                     message: "开启 waitsForLogInBeforeSync 时须先 logIn(_:)（或 logOut()）确认身份，"
+                                         + "再调用 \(operation)；\(Int(Self.identityConfirmationTimeout)) 秒内未确认，"
+                                         + "SDK 不猜身份，本次调用已放弃",
+                                     userInfo: ["operation": operation])
+            }
+        }
+        // 确认触发的那次启动补投还在跑：先等它完成，购买 / 恢复不与补投交叠。
+        if let replay = identityConfirmationReplayTask { await replay.value }
+    }
+
+    /// 挂起到身份确认（true）或超时（false）。超时计时走 `identityGateScheduler`。
+    private func waitForIdentityConfirmation() async -> Bool {
+        guard identityGate == .pending else { return true }
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            identityConfirmationWaiters[id] = continuation
+            // 计时在登记之后才起：计时先到也一定找得到这个等待者。
+            identityConfirmationTimeoutTasks[id] = Task { [weak self, identityGateScheduler] in
+                do {
+                    try await identityGateScheduler.sleep(seconds: Self.identityConfirmationTimeout)
+                } catch {
+                    return   // 已确认（计时 Task 被取消）
+                }
+                await self?.expireIdentityConfirmationWaiter(id)
+            }
+        }
+    }
+
+    private func expireIdentityConfirmationWaiter(_ id: UUID) {
+        identityConfirmationTimeoutTasks[id] = nil
+        // 确认与超时在 actor 上串行：谁先摘到等待者谁 resume，另一方拿到 nil 什么都不做。
+        identityConfirmationWaiters.removeValue(forKey: id)?.resume(returning: false)
+    }
+
+    /// 测试读视图：等身份确认触发的那次启动补投跑完（没有就立即返回）。
+    func awaitIdentityConfirmationReplay() async {
+        if let replay = identityConfirmationReplayTask { await replay.value }
     }
 
     // MARK: - 权益 diff 上报（M-3 客户端半边，迁移方案 v2.1 §5）

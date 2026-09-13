@@ -5,6 +5,32 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-13
+
+**次版本：公开 API 只「增」1 个符号**（基线 443 → 444：`Configuration.with(waitsForLogInBeforeSync:)`，diff 只有 `+` 行）。
+**默认关闭；不开启时行为与 0.2.1 一致。** 破坏性变更：无。
+
+### 新增
+
+- **`Configuration.with(waitsForLogInBeforeSync: Bool)`：冷启动上报等宿主身份就位**（ADR 0046 / 0047，默认 `false`）。
+  修的是「设备上持久化的是**旧的具名身份**，SDK 冷启动扫描抢在宿主 `logIn` 之前按旧身份上报，
+  把现役订阅归到旧客户名下」（bible-scroll C5 剧本 1：残留身份 C 冷启动扫描上报，0.7 秒后宿主才 `logIn(D)`）。
+  - **何时开启**：宿主自己管理身份、**每次启动都会调 `logIn(_:)`**（例如 Firebase uid 从 Keychain 异步恢复后再登录）。
+  - **何时生效**：开关为 `true`、`configure` 没传 `appUserID`、且启动时读出的持久化身份是**具名**的 ——
+    三条同时成立才进入「身份待确认」。全新安装（生成匿名 ID）、持久化的是匿名 ID、或 `configure` 传了
+    `appUserID` 时**不门控**，行为与 0.2.1 完全一致（首启付费墙早于 `logIn` 也照常能买）。
+  - **身份待确认期间**：不做启动补投（待重放购买 / `Transaction.unfinished` / `currentEntitlements` 扫描），
+    不上报 `Transaction.updates` 观察到的交易，不做前台重扫；这些交易**不 finish**，留在 StoreKit 里。
+    交易监听仍在 `configure` 时同步挂上。`logIn(_:)` / `logOut()` 只等身份初始化，**不再排在启动补投之后**。
+  - **确认**：本进程内首次 `logIn(_:)` 成功或 `logOut()` 成功；与当前身份**相同 id** 的 `logIn` 一调用即确认
+    （即使随后拉取 CustomerInfo 失败 —— 身份已由宿主声明，拉取失败只是数据没拿到）。
+    确认后以确认后的身份跑**一次**完整启动补投，之后再 `logIn` 不重跑；`logIn` / `logOut` 失败保持待确认。
+  - **待确认期间调 `purchase` / `restorePurchases` / `syncPurchases`**：最多等 10 秒确认，确认后先等那次补投完成再执行；
+    10 秒内没确认抛 `PurchasesError`（`code == .configurationError`，`userInfo["operation"]` 为操作名），
+    并记诊断告警 `identity_pending_timeout`。SDK **不猜身份**、不回退到持久化身份。
+  - `configure` 后 60 秒仍未确认：记一次诊断告警 `identity_pending`（每进程最多一次），用来发现漏调 `logIn` 的宿主。
+- 诊断事件 `sdk_configured` 新增字段 `waits_for_login_before_sync`（开关原值）与 `identity_gated`（本次启动是否实际进入门控）。
+
 ## [0.2.1] - 2026-09-13
 
 **补丁版本：公开 API 与 0.2.0 完全一致（基线 443 符号，零变化）。**

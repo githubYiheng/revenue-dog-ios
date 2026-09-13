@@ -27,6 +27,47 @@ SwiftPM 包，Swift 6 严格并发，**产品基线 iOS 16**。
 
 ## 宿主接线要点
 
+### 宿主自己管身份：`with(waitsForLogInBeforeSync:)`（0.3.0 起，默认关闭）
+
+宿主是身份源、**每次启动都会调 `logIn(_:)`**（例如 Firebase Auth 从 Keychain 异步恢复出 uid 之后再登录）时开启：
+
+```swift
+Purchases.configure(with: Configuration(apiKey: "pk_…")
+    .with(waitsForLogInBeforeSync: true))    // configure 时拿不到可靠 uid，所以不传 appUserID
+
+// 身份就绪之后（每次启动都调，包括与上次相同的 uid）
+_ = try await Purchases.shared.logIn(uid)
+```
+
+它防的是：设备上持久化着**上一次的具名身份**，而宿主这次启动的真实用户已经换了人 ——
+不开启时，SDK 冷启动扫描（`Transaction.unfinished` + `currentEntitlements`）排在宿主 `logIn` 之前、按旧身份上报，
+设备上的现役订阅会被归到旧客户名下。
+
+**什么时候真的会等**：开关开、`configure` 没传 `appUserID`、**且**启动时读出的持久化身份是**具名**的，三条同时成立。
+全新安装（SDK 生成匿名 ID）或持久化的是匿名 ID 时**不等**，行为与关闭开关完全一致 ——
+首启 onboarding 付费墙早于 `logIn`（离线、匿名注册失败）也照常能买。`configure` 传了 `appUserID` 时开关不起作用。
+
+**等待期间（「身份待确认」）**：
+- 不做启动补投、不上报 `Transaction.updates` 观察到的交易、不做前台重扫。这些交易**不 finish**，留在 StoreKit 里，
+  确认之后的补投会按确认后的身份上报。
+- `logIn(_:)` / `logOut()` 不再排在启动补投之后，只等身份初始化 —— 宿主多早调都行。
+- 本进程内**首次** `logIn(_:)` 成功（含与持久化身份相同的 uid）或 `logOut()` 成功即确认，随后以确认后的身份补投一次。
+  `logIn` / `logOut` 失败（离线、5xx）保持待确认，重试成功后才确认。
+- `purchase` / `restorePurchases` / `syncPurchases` **最多等 10 秒**确认；确认后先等那次补投完成再执行。
+  10 秒内没确认会抛 `configurationError`（SDK 不猜身份）：
+
+```swift
+do {
+    let result = try await Purchases.shared.purchase(package: package)
+} catch let error as PurchasesError where error.code == .configurationError {
+    // 开启 waitsForLogInBeforeSync 后没先 logIn：钱没扣、StoreKit 没弹框。
+    // 先 logIn(uid)，再让用户重试。这是接线问题，不该出现在线上。
+}
+```
+
+> 诊断：`sdk_configured.identity_gated` 表示这次启动是否真的在等；超时记 `identity_pending_timeout`（detail 带操作名）；
+> `configure` 后 60 秒仍未确认记一次 `identity_pending` —— 后台看到它，就是宿主有路径漏调了 `logIn`。
+
 ### 商品文案：`Package.storeProduct`（0.2.0 起不再恒 nil）
 
 `offerings()` 会用 StoreKit 2 一次批量把商品详情填进每个 `Package`。做定价文案直接读它：
@@ -289,7 +330,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 可覆盖变量：`SK_OS` / `SK_DEVICE` / `SK_DESTINATION` / `SK_SCHEME` / `SK_TEST_PLAN` /
 `SK_FILTER` / `SK_DERIVED_DATA` / `XCODEGEN`。
 
-### 场景表（23 条，iOS 18.5 全绿）
+### 场景表（24 条，iOS 18.5 全绿）
 
 | # | 场景 | 对照编号 | 关键断言 |
 |:-:|---|---|---|
@@ -316,6 +357,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 | ⑩ | 响应确认该交易 id → finish、上下文清空 | 坑 #6 | — |
 | ⑪ | 一次购买产出 `purchase_started → transaction_observed → receipt_post → finish_decision` | ADR 0028 | 事件字段合规、无 JWS/密钥外泄 |
 | ⑫ | `Package.storeProduct` 来自真 StoreKit | v0.2.0 A | 价格 / `subscriptionPeriod` 映射正确；消耗型无周期；商店没有的仍为 nil |
+| ⑬ | 持久化旧具名身份 C + 现役订阅（已 finish）→ 开关 `waitsForLogInBeforeSync` 开 → 宿主 `logIn(D)` | ADR 0046 / 0047（C5 剧本 1 事故形态） | 冷启动 1.5s 零上报；identify 先于收据；收据 `app_user_id == D`、`initiation_source == "queue"` |
 
 ### 做不到 / 没做的场景（写明理由，不硬凑）
 

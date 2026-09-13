@@ -50,6 +50,7 @@ Func Configuration.with(diagnosticsEnabled:)
 Func Configuration.with(logLevel:)
 Func Configuration.with(purchasesCompletedBy:)
 Func Configuration.with(transport:)
+Func Configuration.with(waitsForLogInBeforeSync:)
 Func CustomerInfo.__derived_struct_equals(_:_:)  [Implements]
 Func CustomerInfo.encode(to:)
 Func CustomerInfo.hash(into:)

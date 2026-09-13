@@ -216,6 +216,9 @@ struct SDKSession {
 
     /// - Parameters:
     ///   - directory: pending purchase / 台账 / 属性缓冲的根目录。传同一个 = 冷启动重放。
+    ///   - appUserID: configure 时显式传入的身份；nil = 匿名 configure（宿主稍后 logIn）。
+    ///   - persistedAppUserID: 启动前「容器里已持久化」的身份（ADR 0046 事故形态：残留旧具名身份）。
+    ///   - waitsForLogInBeforeSync: `Configuration.with(waitsForLogInBeforeSync:)`。
     ///   - receipts: `POST /v1/receipts` 的响应队列（只剩最后一个时**粘住**）。
     ///   - other: 其余端点（`/subscribers` 等）的兜底响应。
     ///   - retryPolicy: 默认 `.none` —— 让「上报失败几次」在断言里是个确定数，
@@ -225,7 +228,9 @@ struct SDKSession {
     ///     只有专门断言事件序列的诊断场景才打开。打开时队列落 `directory` 下的独立文件，
     ///     不会碰到 Application Support 里那份全局队列。
     static func start(directory: URL,
-                      appUserID: String = "storekit-test",
+                      appUserID: String? = "storekit-test",
+                      persistedAppUserID: String? = nil,
+                      waitsForLogInBeforeSync: Bool = false,
                       receipts: [MockTransport.Stub],
                       other: MockTransport.Stub = .json(FakeBackend.empty()),
                       retryPolicy: RetryPolicy = .none,
@@ -239,12 +244,13 @@ struct SDKSession {
             .with(baseURL: URL(string: "https://storekit.test.invalid")!)
             .with(logLevel: .debug)
             .with(diagnosticsEnabled: diagnosticsEnabled)
+            .with(waitsForLogInBeforeSync: waitsForLogInBeforeSync)
             // 假后端走**公开**注入点（v0.2.0 D 项）：这条路径宿主也能用，
             // 顺带让它一直有人跑 —— `Configuration.with(transport:)` 一旦回退成 internal，本 target 立刻红。
             .with(transport: transport)
 
         var dependencies = Purchases.Dependencies.live(configuration: configuration)
-        dependencies.identityStorage = InMemoryIdentityStorage()
+        dependencies.identityStorage = InMemoryIdentityStorage(appUserID: persistedAppUserID)
         dependencies.cacheStorage = InMemoryCacheStorage()
         dependencies.attributionState = InMemoryAttributionStateStorage()
         dependencies.pendingPurchasesDirectory = directory

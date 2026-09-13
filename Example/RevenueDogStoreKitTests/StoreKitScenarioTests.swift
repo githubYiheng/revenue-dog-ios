@@ -680,6 +680,71 @@ extension StoreKitScenarioDomain {
         }
     }
 
+    // MARK: - ⑬ 身份门控（ADR 0046 / 0047；C5 剧本 1 事故形态）
+
+    @MainActor
+    @Suite("⑬ 身份门控：持久化旧具名身份不抢在 logIn 之前上报（ADR 0046）")
+    struct IdentityGateScenarioTests {
+
+        @Test("持久化具名 C + 现役订阅 → 开关开 → 冷启动零上报 → 宿主 logIn(D) → 收据 app_user_id = D")
+        func staleNamedIdentityWaitsForLogIn() async throws {
+            let session = try await SKTestHarness.makeSession()
+            try await SKTestHarness.requireSessionIsLive()
+            let directory = try TempDirectory.make()
+            defer { TempDirectory.remove(directory); SDKSession.tearDown() }
+
+            // 事故形态：D 在另一个构建（RC 构建）里买的订阅，交易已被那边 finish，只留在 currentEntitlements。
+            _ = try await session.buyProduct(identifier: DemoProduct.monthly)
+            // buyProduct 刚返回时这笔交易在 unfinished 里**还不可见**（首跑实测：直接 finish 扫空了，前置等满 15s 失败）。
+            // 先等它可见，再在轮询里反复 finish —— 可见性与 finish 的生效都是异步的。
+            let visible = await SKObserve.wait { await SKObserve.unfinishedProductIDs().contains(DemoProduct.monthly) }
+            try #require(visible, "前置：buyProduct 的交易应先出现在 unfinished 里")
+            let seeded = await SKObserve.wait {
+                for await result in StoreKit.Transaction.unfinished {
+                    await result.unsafePayloadValue.finish()
+                }
+                let entitlements = await SKObserve.currentEntitlementProductIDs()
+                let unfinished = await SKObserve.unfinishedProductIDs()
+                return entitlements.contains(DemoProduct.monthly) && unfinished.isEmpty
+            }
+            try #require(seeded, "前置：订阅应已 finish 且仍在 currentEntitlements 里")
+
+            let staleC = "stale-named-C"
+            let currentD = "current-D"
+            let sdk = await SDKSession.start(
+                directory: directory,
+                appUserID: nil,                   // 宿主匿名 configure，身份就绪后再 logIn
+                persistedAppUserID: staleC,       // 容器里残留的旧具名身份
+                waitsForLogInBeforeSync: true,
+                receipts: [.json(FakeBackend.customerInfo(
+                    appUserID: currentD,
+                    subscriptions: [DemoProduct.monthly: FakeBackend.farFuture],
+                    entitlements: ["pro": (DemoProduct.monthly, FakeBackend.farFuture)]))])
+            #expect(sdk.purchases.appUserID == staleC)
+
+            // 真 StoreKit 的 updates / 快照读都是异步到达的：给足真实时间，门控期间必须一次都不上报。
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            #expect(await sdk.receiptCallCount() == 0, "身份待确认期间不应有任何收据上报（事故里这里按 C 报了）")
+
+            _ = try await sdk.purchases.logIn(currentD)
+            let reported = await SKObserve.wait(timeout: 20) { await sdk.receiptCallCount() > 0 }
+            #expect(reported, "logIn(D) 之后启动补投应把现役订阅上报")
+
+            let bodies = await sdk.receiptBodies()
+            let users = bodies.map { $0["app_user_id"] as? String ?? "nil" }
+            #expect(!bodies.isEmpty)
+            #expect(users.allSatisfy { $0 == currentD }, "收据必须按确认后的身份 D 上报：\(users)")
+            #expect(bodies.first?["product_id"] as? String == DemoProduct.monthly)
+            #expect(bodies.first?["initiation_source"] as? String == "queue")
+
+            // identify（C → D）先于任何收据
+            let paths = await sdk.transport.capturedRequests.map { $0.url?.path ?? "" }
+            let identifyIndex = try #require(paths.firstIndex(of: "/v1/subscribers/identify"))
+            let receiptIndex = try #require(paths.firstIndex(of: "/v1/receipts"))
+            #expect(identifyIndex < receiptIndex, "identify 必须先于收据：\(paths)")
+        }
+    }
+
     // MARK: - ⑨ intro / promo 资格
 
     @MainActor

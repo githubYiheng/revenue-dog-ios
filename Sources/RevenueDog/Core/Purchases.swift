@@ -45,6 +45,10 @@ public struct Configuration: Sendable {
     /// 与 `diagnosticsEnabled` 同理保持 **internal**：宿主要做的只是 `with(transport:)`，
     /// 读回来没有集成价值。
     internal private(set) var transport: (any HTTPTransport)?
+    /// 冷启动补投等宿主身份就位（ADR 0046 ① / ADR 0047 收窄）。默认 **false**。
+    ///
+    /// 与 `diagnosticsEnabled` 同理保持 **internal**：宿主要做的只是 `with(waitsForLogInBeforeSync:)`。
+    internal private(set) var waitsForLogInBeforeSync: Bool
 
     public static let defaultBaseURL = URL(string: "https://api.revdog.org")!
 
@@ -55,6 +59,7 @@ public struct Configuration: Sendable {
         self.baseURL = Configuration.defaultBaseURL
         self.logLevel = .info
         self.diagnosticsEnabled = true
+        self.waitsForLogInBeforeSync = false
     }
 
     public func with(appUserID: String?) -> Configuration {
@@ -118,6 +123,31 @@ public struct Configuration: Sendable {
     public func with(transport: any HTTPTransport) -> Configuration {
         var copy = self
         copy.transport = transport
+        return copy
+    }
+
+    /// **冷启动上报等宿主身份就位**（默认关闭）。
+    ///
+    /// 宿主自己管理身份、**每次启动都会调 `logIn(_:)`**（例如 Firebase uid 异步恢复后再登录）时开启。
+    /// 防的是「设备上持久化的是**旧的具名身份**，SDK 冷启动扫描抢在宿主 `logIn` 之前按旧身份上报」。
+    ///
+    /// 只有同时满足三条才进入「身份待确认」：开关为 true、`configure` 没传 `appUserID`、
+    /// 启动时读出的持久化身份是**具名**的。全新安装（生成匿名 ID）或持久化的是匿名 ID 时
+    /// **不门控**，行为与关闭开关完全一致。
+    ///
+    /// 身份待确认期间：
+    /// - 不做启动补投（待重放购买、`Transaction.unfinished` 与 `currentEntitlements` 扫描）、
+    ///   不上报 `Transaction.updates` 观察到的交易、不做前台重扫；这些交易不 finish，留在 StoreKit 里；
+    /// - `logIn(_:)` / `logOut()` 只等身份初始化，不等启动补投；
+    /// - 本进程内首次 `logIn(_:)` 成功（含与当前身份相同的 id）或 `logOut()` 成功即确认身份，
+    ///   随后以确认后的身份跑一次完整的启动补投；
+    /// - `purchase` / `restorePurchases` / `syncPurchases` 最多等 10 秒确认，确认后先等那次补投完成再执行；
+    ///   10 秒内没确认则抛 `configurationError`（SDK 不猜身份）。
+    ///
+    /// `configure` 显式传了 `appUserID` 时视为身份已确认，此开关不起作用。
+    public func with(waitsForLogInBeforeSync: Bool) -> Configuration {
+        var copy = self
+        copy.waitsForLogInBeforeSync = waitsForLogInBeforeSync
         return copy
     }
 }
@@ -237,6 +267,9 @@ public final class Purchases {
         /// 网络层退避等待的调度器。与 `delayScheduler`（P4 可见性轮询）分开：
         /// 故障注入测试要既不真睡、又能**记录**每次退避时长（验证 Retry-After 优先）。
         var networkDelayScheduler: any DelayScheduler = TaskDelayScheduler()
+        /// 身份门控（ADR 0046/0047）的计时调度器：10 秒确认超时 + 60 秒 `identity_pending` 告警。
+        /// 与上面两个分开：门控单测要能**逐个放行**这两个计时，而不拖慢 P4 轮询或网络退避。
+        var identityGateScheduler: any DelayScheduler = TaskDelayScheduler()
         /// ASA 归因端状态（install_id + 已采集标记）。测试注入 InMemory 版避免污染 UserDefaults。
         var attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage()
         /// AdServices token 取值面（坑 #83/#84：协议隔离，模拟器/无框架平台优雅降级）。
@@ -388,6 +421,7 @@ public final class Purchases {
                                                   storeKit: dependencies.storeKit,
                                                   ledgerFileURL: ledgerFileURL,
                                                   delayScheduler: dependencies.delayScheduler,
+                                                  identityGateScheduler: dependencies.identityGateScheduler,
                                                   attributesDirectory: attributesDirectory,
                                                   attributionState: dependencies.attributionState,
                                                   adServicesTokenProvider: dependencies.adServicesTokenProvider,
@@ -503,7 +537,12 @@ public final class Purchases {
                 "purchases_completed_by": .string(configuration.purchasesCompletedBy.rawValue),
                 "has_app_user_id": .bool(configuration.appUserID != nil),
                 "diagnostics_enabled": .bool(configuration.diagnosticsEnabled),
+                // ADR 0046/0047：开关原值 + 本次启动**实际**是否进入身份待确认（持久化具名身份才门控）。
+                "waits_for_login_before_sync": .bool(configuration.waitsForLogInBeforeSync),
+                "identity_gated": .bool(await orchestrator.launchWasIdentityGated),
             ])
+            // 门控状态下这里是空操作（补投推迟到身份确认之后），于是 startTask 只剩身份与缓存初始化，
+            // `logIn` / `logOut` 等它不会再排在补投后面。不门控时与 0.2.1 逐字一致。
             await orchestrator.replayPendingPurchases()
         }
     }
@@ -568,6 +607,7 @@ public final class Purchases {
         // 依据 verify/storekit2-multi-listener.md §1 结论 3：**观察方不能指望从 `updates`
         // 看到购买方 `purchase()` 返回的那笔**（Apple 只保证走 `PurchaseResult`）。
         // 先 await 启动流程，避免与启动扫描叠加、也避免身份未就绪就上报。
+        // 身份门控（ADR 0046）：待确认期间编排层直接跳过重扫；已确认时先等确认触发的那次补投。
         Task { [weak self] in
             await self?.awaitStart()
             await self?.orchestrator.rescanOnForegroundIfObserving()
@@ -585,8 +625,17 @@ public final class Purchases {
     }
 
     /// 等待启动期初始化完成（身份解析）。公开方法内部先 await 它，保证顺序正确。
+    ///
+    /// 身份门控（ADR 0046）下 startTask 不含启动补投，于是这里只等身份与缓存初始化；
+    /// `purchase` / `restorePurchases` / `syncPurchases` 另在编排层等身份确认。
     private func awaitStart() async {
         await startTask?.value
+    }
+
+    /// 测试读视图：等「身份确认触发的那次启动补投」跑完（没有就立即返回）。
+    func awaitIdentityConfirmationReplay() async {
+        await awaitStart()
+        await orchestrator.awaitIdentityConfirmationReplay()
     }
 
     // MARK: - 身份
