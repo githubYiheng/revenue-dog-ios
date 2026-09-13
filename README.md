@@ -172,7 +172,8 @@ finish 判定结果与理由、当前生效的权益 id。系统信息走既有�
 
 > **宿主需要自己做的两件事**：
 > 1. **App Store 隐私营养标签**：SDK 的 `PrivacyInfo.xcprivacy` 只覆盖 SDK 自己这一层；提交时宿主要在
->    App Store Connect 的 App Privacy 问卷里勾上 **User ID / Device ID / Diagnostics**（均为 linked，非 tracking）。
+>    App Store Connect 的 App Privacy 问卷里勾上 **Purchase History / User ID / Device ID / Other Diagnostic Data**
+>    （均为 linked，非 tracking；各项用途见下方「隐私清单」段）。
 >    Xcode 的 Product → Archive → Generate Privacy Report 会把 SDK 清单聚合出来，照着填即可。
 > 2. **`app_user_id` 不得是个人信息**：传给 `configure(appUserID:)` / `logIn(_:)` 的值会随事件上行并留存，
 >    请用稳定的内部 uid（Firebase uid 这类），**不要**用邮箱、手机号、姓名。
@@ -189,9 +190,11 @@ SDK 侧声明：
 - Required Reason API 只有一条：`NSPrivacyAccessedAPICategoryUserDefaults` / `CA92.1`
   （身份与归因状态存自家私有键）。文件时间戳 / 系统启动时间 / 磁盘空间 / 键盘 类 API 全仓零使用，因此不声明。
 - 收集的数据类型：购买历史、用户 ID、设备 ID（`install_id` / AdServices token）、其它诊断数据；全部 `Linked = true`、`Tracking = false`。
-- 用途：购买历史 / 设备 ID / 其它诊断数据均含 **App Functionality + Analytics**（诊断事件在后台既按用户反查、
-  也按版本做分布聚合，后者只能落在 Analytics —— 逐条核实见 `docs/research/verify/privacy-manifest-diagnostics.md`）；
-  用户 ID 只含 App Functionality。
+- 用途：购买历史 / 其它诊断数据含 **App Functionality + Analytics**；设备 ID 含
+  **App Functionality + Developer's Advertising or Marketing + Analytics**（AdServices token 用于衡量宿主自己的
+  Apple Ads 投放，属开发者自有广告而非第三方广告，见 `docs/research/verify/ios-privacy-manifest.md` §3.3）；
+  用户 ID 只含 App Functionality。诊断事件在后台既按用户反查、也按版本做分布聚合，后者只能落在 Analytics ——
+  逐条核实见 `docs/research/verify/privacy-manifest-diagnostics.md`。
 
 > **维护触发条件**：诊断请求头里的平台 / OS 版本 / 机型 / SDK 与宿主版本**已随诊断事件写进 D1 留存 30 天**
 > （ADR 0028），核实结论是它们被既有的 `OtherDiagnosticData` / `DeviceID` 覆盖，无需新增数据类型；
