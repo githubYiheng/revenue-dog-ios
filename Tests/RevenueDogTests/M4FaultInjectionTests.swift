@@ -803,3 +803,138 @@ struct M4CacheInvalidationTests {
     }
 }
 }
+
+// MARK: - 6. logOut 原子性（待办 59 / 审计 A4）
+
+/// 流帧记录器（本组专用）：断言「失败的 logOut 一帧都不推」。
+private actor LogOutFrameRecorder {
+    private(set) var all: [CustomerInfo] = []
+    var count: Int { all.count }
+    func record(_ info: CustomerInfo) { all.append(info) }
+}
+
+private func waitForFrames(_ recorder: LogOutFrameRecorder,
+                           timeoutMs: Int = 2000,
+                           _ condition: @Sendable (Int) -> Bool) async -> Bool {
+    for _ in 0..<(timeoutMs / 20) {
+        if condition(await recorder.count) { return true }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    return condition(await recorder.count)
+}
+
+extension PurchasesSingletonDomain {
+@MainActor
+@Suite("M4 故障注入 · logOut 原子性", .serialized)
+struct M4LogOutAtomicityTests {
+
+    /// GET /v1/subscribers/{id} 的实际出站请求（bootstrap 可能也打过，取最后一次）。
+    private static func lastSubscriberGETPath(_ transport: MockTransport) async -> String? {
+        await transport.capturedRequests.last {
+            ($0.httpMethod ?? "GET") == "GET" && ($0.url?.path.hasPrefix("/v1/subscribers/") ?? false)
+        }?.url?.lastPathComponent
+    }
+
+    @Test("A4：具名用户 + 已有缓存 → logOut 时断网 → 抛错，且本地身份/缓存/门面/流一个字节都不动")
+    func failedLogOutChangesNothingLocally() async throws {
+        let dir = tempDirectory()
+        let identityStorage = InMemoryIdentityStorage()
+        let transport = MockTransport()
+        let provider = FakeStoreKitProvider(products: [FakeProduct(productIdentifier: "com.demo.monthly")])
+        let purchases = makeRig(directory: dir, transport: transport, storeKit: provider,
+                                identityStorage: identityStorage,
+                                cacheStorage: InMemoryCacheStorage())
+
+        // 先登成具名用户（带回一份 CustomerInfo 进缓存）。
+        await transport.enqueue(.json(subscriberJSON()), forPath: identifyPath)
+        _ = try await purchases.logIn("user_59")
+        #expect(purchases.appUserID == "user_59")
+        #expect(purchases.isAnonymous == false)
+        let cachedBefore = try #require(purchases.cachedCustomerInfo)
+        #expect(await identityStorage.storedAppUserID() == "user_59")
+
+        // 在 logOut 之前挂上流订阅：订阅即回放最近值 → 基线 1 帧。
+        let frames = LogOutFrameRecorder()
+        let stream = purchases.customerInfoStream
+        let collector = Task.detached { for await info in stream { await frames.record(info) } }
+        #expect(await waitForFrames(frames) { $0 >= 1 })
+
+        // 断网 → logOut 必须抛错。
+        await transport.failTransportAlways()
+        await #expect(throws: PurchasesError.self) { _ = try await purchases.logOut() }
+
+        // 门面三件套原样。
+        #expect(purchases.appUserID == "user_59")
+        #expect(purchases.isAnonymous == false)
+        #expect(purchases.cachedCustomerInfo == cachedBefore)
+        // 持久化身份原样（磁盘上没有半个匿名 ID）。
+        #expect(await identityStorage.storedAppUserID() == "user_59")
+        // 编排层内部身份与门面一致 —— 「门面与内部身份永不分叉」。
+        // `.cachedOnly` 走的是编排层 `identity.appUserID` 那一读：内部要是偷偷切成了新匿名 ID，
+        // 这里就会因为新身份没有缓存而抛 customerInfoError。
+        #expect(try await purchases.customerInfo(fetchPolicy: .cachedOnly) == cachedBefore)
+        // 流一帧都没多推。
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        #expect(await frames.count == 1)
+        collector.cancel()
+
+        // 归因仍算在旧 uid 上：落盘的购买上下文写的是 user_59。
+        await provider.scriptPurchase { productID in
+            .success(FakeTransaction(transactionIdentifier: "tx-logout-59",
+                                     originalTransactionIdentifier: "tx-logout-59",
+                                     productIdentifier: productID, purchaseDate: Date(),
+                                     expirationDate: Date().addingTimeInterval(3600),
+                                     jwsRepresentation: "h.logout59.s", finishFlag: FinishFlag()))
+        }
+        await #expect(throws: PurchasesError.self) { _ = try await purchases.purchase(product: monthly()) }
+        let contexts = await PendingPurchaseStore(directory: dir).all()
+        #expect(contexts.count == 1)
+        #expect(contexts.first?.appUserID == "user_59")
+    }
+
+    @Test("A4：logOut 成功 → 落盘的匿名 ID 与服务端刚 get-or-create 的那个逐字相同")
+    func successfulLogOutPersistsTheServerConfirmedID() async throws {
+        let identityStorage = InMemoryIdentityStorage()
+        let transport = MockTransport()
+        let purchases = makeRig(directory: tempDirectory(), transport: transport, storeKit: nil,
+                                identityStorage: identityStorage,
+                                cacheStorage: InMemoryCacheStorage())
+
+        await transport.enqueue(.json(subscriberJSON()), forPath: identifyPath)
+        _ = try await purchases.logIn("user_59")
+        let getsBeforeLogOut = await Self.lastSubscriberGETPath(transport)
+
+        // 泛队列承接 GET /v1/subscribers/{候选匿名 ID}（identify 走的是自己的路径 stub）。
+        await transport.enqueue(.json(subscriberJSON()))
+        let info = try await purchases.logOut()
+
+        let requested = try #require(await Self.lastSubscriberGETPath(transport))
+        #expect(requested != getsBeforeLogOut)            // 确实是 logOut 打出去的那一次
+        #expect(IdentityManager.isAnonymous(requested))
+        // 核心断言：持久化的 ID == 服务端已经认过的那个 ID。
+        #expect(await identityStorage.storedAppUserID() == requested)
+        #expect(purchases.appUserID == requested)
+        #expect(purchases.isAnonymous)
+        #expect(purchases.cachedCustomerInfo == info)
+        // 新身份下缓存已就位（编排层读的也是这个 ID）—— 门面与内部身份一致。
+        #expect(try await purchases.customerInfo(fetchPolicy: .cachedOnly) == info)
+    }
+
+    @Test("A4：匿名态 logOut 仍抛 invalidAppUserIdError，且一个请求都不发")
+    func logOutWhileAnonymousStillThrows() async throws {
+        let transport = MockTransport()
+        let purchases = makeRig(directory: tempDirectory(), transport: transport, storeKit: nil,
+                                identityStorage: InMemoryIdentityStorage(),
+                                cacheStorage: InMemoryCacheStorage())
+        await Purchases.awaitConfigured()
+        let before = await transport.callCount
+        do {
+            _ = try await purchases.logOut()
+            Issue.record("匿名态 logOut 应当抛错")
+        } catch let error as PurchasesError {
+            #expect(error.code == .invalidAppUserIdError)
+        }
+        #expect(await transport.callCount == before)   // 守卫在任何副作用之前
+    }
+}
+}

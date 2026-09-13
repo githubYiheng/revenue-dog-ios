@@ -599,6 +599,13 @@ public final class Purchases {
         return result
     }
 
+    /// 登出，换回一个**服务端已经认过**的新匿名身份。
+    ///
+    /// **不变式：门面与内部身份永不分叉。** 门面这三个同步可读属性（`appUserID` /
+    /// `isAnonymous` / `cachedCustomerInfo`）只在 `orchestrator.logOut()` 返回成功之后才更新；
+    /// 而编排层的 logOut 本身是原子的（先服务端 get-or-create 成功、再落盘切身份，
+    /// 见 `PurchasesOrchestrator.logOut()`）。于是失败时两边都停在旧 uid 上 ——
+    /// 不会出现「门面还是旧用户、内部已经是新匿名 ID」（或反过来）这种两边各说各话的状态。
     public func logOut() async throws -> CustomerInfo {
         await awaitStart()
         let info = try await orchestrator.logOut()

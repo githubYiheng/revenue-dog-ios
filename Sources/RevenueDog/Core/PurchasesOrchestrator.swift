@@ -326,18 +326,41 @@ actor PurchasesOrchestrator {
         return (info, response.statusCode == 201)
     }
 
+    /// logOut（待办 59 / 审计 A4：与 `logIn` 同形 —— **先服务端成功、再切本地身份**）。
+    ///
+    /// 旧实现是「先切本地身份、再拉 CustomerInfo」：一旦拉取失败（离线、5xx），设备就被留在
+    /// 一个**后端从没见过**的匿名 ID 上，而门面 `appUserID` 因为抛错没同步 —— 身份分裂两次。
+    /// 现在顺序钉死：
+    ///   ① 匿名态直接抛 `invalidAppUserIdError`（语义不变），且发生在任何副作用之前；
+    ///      同一步顺带生成**不落盘**的匿名候选（纯函数，不改任何状态）。
+    ///   ② 把**旧身份**的待发属性刷出去（与 logIn 同款处理：`syncAttributesIfNeeded()`
+    ///      自己吞错只记日志，失败不致命，继续往下走）。
+    ///   ③ 拿候选 ID 打 `GET /v1/subscribers/{id}`（服务端 get-or-create）。
+    ///   ④ **仅当 ③ 成功**：落盘身份切换（落的就是服务端刚认过的那个 ID）→ 摘掉旧身份内存缓存
+    ///      → 新身份写缓存 → publish。
+    ///   ⑤ ③ 失败：身份（内存 + 磁盘）、设备缓存、门面、流**一个字节都不动**，原样抛出；
+    ///      购买/恢复归因（:646 / :891 实时读 `identity.appUserID`）因此仍算在旧 uid 上。
     func logOut() async throws -> CustomerInfo {
         let startedAt = Date()
         let trace = HTTPCallTrace()
         do {
             let previous = try await identity.appUserID
-            let anonymous = try await identity.logOut()
+            // ①：匿名态守卫 + 候选生成。候选只是个局部变量，IdentityManager 里没有任何痕迹。
+            let candidate = try await identity.candidateAnonymousAppUserID()
+            // ②：坑 #52 同款 —— 切身份前先把旧身份的属性刷出去，保证旧用户的属性不丢。
+            await syncAttributesIfNeeded()
+            // ③：服务端确认候选身份。失败直接落 catch，此时本地什么都还没改。
+            let response = try await httpClient.perform(.getCustomerInfo(appUserID: candidate),
+                                                       as: CustomerInfoWireModel.self, trace: trace)
+            let info = CustomerInfo(wireModel: response.body)
+            // ④：提交段。先落身份（持久化的 ID == 服务端刚 get-or-create 的那个），再动缓存与流。
+            try await identity.commitLogOut(to: candidate)
             await deviceCache.clearMemoryCache(appUserID: previous)
-            let response = try await fetchCustomerInfo(appUserID: anonymous, trace: trace)
-            await publish(response.info, source: .fetch, requestID: trace.last?.requestID)
+            await deviceCache.cache(customerInfo: info, appUserID: candidate)
+            await publish(info, source: .fetch, requestID: trace.last?.requestID)
             await recordIdentityEvent(DiagnosticsEventType.identityLogout,
                                       trace: trace, startedAt: startedAt, extra: [:], error: nil)
-            return response.info
+            return info
         } catch {
             await recordIdentityEvent(DiagnosticsEventType.identityLogout,
                                       trace: trace, startedAt: startedAt, extra: [:], error: error)

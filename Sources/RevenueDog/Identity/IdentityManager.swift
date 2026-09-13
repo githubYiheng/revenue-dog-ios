@@ -205,16 +205,42 @@ actor IdentityManager {
         return appUserID
     }
 
-    /// logOut：换回新的匿名身份（缓存按 appUserID 哈希隔离，设计 §4）。
-    @discardableResult
-    func logOut() async throws -> String {
+    // MARK: logOut 两段式（待办 59 / 审计 A4）
+    //
+    // logOut 必须与 logIn 同形：**先服务端成功、再切本地身份**。所以这里刻意不提供
+    // 「一步切完」的 `logOut()` —— 那种写法会在离线时把设备留在一个后端从没见过的
+    // 匿名 ID 上（身份分裂）。调用方必须走 候选 → 服务端确认 → 提交 两段。
+
+    /// 第一段：生成一个**尚未持久化**的匿名 ID 候选（内存里都不记）。
+    ///
+    /// 匿名态调用照旧抛 `invalidAppUserIdError`（语义与旧 `logOut()` 逐字一致，只是
+    /// 判定提前到了这一步，仍然发生在任何副作用之前）。
+    /// 生成器与 `bootstrap` 共用 `generateAnonymousAppUserID()`，格式完全相同。
+    func candidateAnonymousAppUserID() throws -> String {
         if isAnonymous {
             throw PurchasesError(code: .invalidAppUserIdError,
                                  message: "当前已是匿名身份，logOut 无意义")
         }
-        let anonymous = Self.generateAnonymousAppUserID()
-        try await set(anonymous)
-        return anonymous
+        return Self.generateAnonymousAppUserID()
+    }
+
+    /// 第二段：把身份切到**服务端已经确认过**的那个匿名 ID（缓存按 appUserID 哈希隔离，设计 §4）。
+    ///
+    /// 必须接收预生成的 ID、而不是自己再生成一个：落盘的 ID 必须与服务端刚刚
+    /// get-or-create 出来的那个逐字相同，否则设备会拿着一个后端不认识的匿名身份上路。
+    @discardableResult
+    func commitLogOut(to anonymousAppUserID: String) async throws -> String {
+        guard Self.isAnonymous(anonymousAppUserID) else {
+            throw PurchasesError(code: .invalidAppUserIdError,
+                                 message: "commitLogOut 只接受匿名 App User ID",
+                                 userInfo: ["app_user_id": anonymousAppUserID])
+        }
+        if isAnonymous {
+            throw PurchasesError(code: .invalidAppUserIdError,
+                                 message: "当前已是匿名身份，logOut 无意义")
+        }
+        try await set(anonymousAppUserID)
+        return anonymousAppUserID
     }
 
     private func set(_ appUserID: String) async throws {

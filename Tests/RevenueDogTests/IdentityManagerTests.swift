@@ -150,14 +150,29 @@ struct IdentityLifecycleTests {
         }
     }
 
-    @Test("logOut 换回新的匿名身份；匿名态再 logOut 报错")
+    @Test("logOut 两段式：候选不落盘；提交后换回新匿名身份；匿名态再要候选就报错")
     func logOut() async throws {
-        let manager = IdentityManager(storage: InMemoryIdentityStorage())
+        let storage = InMemoryIdentityStorage()
+        let manager = IdentityManager(storage: storage)
         try await manager.bootstrap(configuredAppUserID: "user_42")
 
-        let anonymous = try await manager.logOut()
-        #expect(IdentityManager.isAnonymous(anonymous))
+        // 第一段：候选只是个返回值 —— 内存与磁盘上的身份都还是旧的。
+        let candidate = try await manager.candidateAnonymousAppUserID()
+        #expect(IdentityManager.isAnonymous(candidate))
+        #expect(try await manager.appUserID == "user_42")
+        #expect(await storage.storedAppUserID() == "user_42")
 
-        await #expect(throws: PurchasesError.self) { try await manager.logOut() }
+        // 第二段：落盘的就是那个候选（服务端已认过的那一个），逐字相同。
+        let anonymous = try await manager.commitLogOut(to: candidate)
+        #expect(anonymous == candidate)
+        #expect(try await manager.appUserID == candidate)
+        #expect(await storage.storedAppUserID() == candidate)
+
+        // 匿名态再 logOut 无意义：第一段就报错。
+        await #expect(throws: PurchasesError.self) { try await manager.candidateAnonymousAppUserID() }
+        // 具名 ID 不许从 commitLogOut 混进来。
+        try await manager.logIn("user_43")
+        await #expect(throws: PurchasesError.self) { try await manager.commitLogOut(to: "user_44") }
+        #expect(try await manager.appUserID == "user_43")
     }
 }
