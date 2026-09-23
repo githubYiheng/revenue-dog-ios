@@ -73,7 +73,12 @@ extension StoreProductType {
 
     /// 转成公开模型（`Package.storeProduct` 的唯一构造点）。
     func makeStoreProduct() async -> StoreProduct {
-        StoreProduct(productIdentifier: productIdentifier,
+        // 0.4.0：SK2 的 `priceFormatStyle.currencyCode` 是非可选 String，这里拿到 nil 只可能是替身 / 未来适配层的缺陷。
+        // 不改口径（类型仍 String?），只留痕，让桥接层「nil → 码 12」有据可查。
+        if currencyCode == nil {
+            Log.warn("商品 \(productIdentifier) 的 currencyCode 为 nil（StoreKit 路径本应恒有值）", category: "storekit")
+        }
+        return StoreProduct(productIdentifier: productIdentifier,
                      localizedTitle: localizedTitle,
                      localizedDescription: localizedDescription,
                      price: price,
@@ -242,9 +247,12 @@ struct SK2Product: StoreProductType {
               let offer = subscription.introductoryOffer else { return nil }
         // 资格是组级语义（坑 #91）；端上结论仅用于文案（裁决 #124）。
         let isEligible = await subscription.isEligibleForIntroOffer
-        return IntroductoryOffer(type: Self.offerType(offer.paymentMode),
+        let type = Self.offerType(offer.paymentMode)
+        return IntroductoryOffer(type: type,
                                  period: Self.period(offer.period),
                                  periodCount: offer.periodCount,
+                                 // R9：freeTrial 恒 0，其余取商店原值（payAsYouGo = 每周期价，payUpFront = 整段价）
+                                 price: IntroductoryOffer.price(for: type, offerPrice: offer.price),
                                  displayPrice: offer.displayPrice,
                                  isEligible: isEligible)
     }

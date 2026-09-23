@@ -23,7 +23,8 @@ struct SystemInfo: Sendable, Equatable {
     var platformVersion: String
     /// `X-Platform-Device`：机型标识（`iPhone15,2` / `Mac14,7`）。
     var platformDevice: String
-    /// `X-Platform-Flavor`：原生 = `native`。
+    /// `X-Platform-Flavor`：原生 = `native`；混合框架（Flutter 插件）经 SPI 入口
+    /// `Configuration.with(platformFlavor:flavorVersion:)` 注入（R1，对照 RC `PlatformInfo.flavor`）。
     var platformFlavor: String
     /// `X-Version`：SDK 版本。
     var sdkVersion: String
@@ -48,9 +49,12 @@ struct SystemInfo: Sendable, Equatable {
     /// `X-Storefront`：商店国家码（裁决 #123：走 `Storefront.current`，不依赖交易字段）。
     /// 启动期异步取到前为 nil —— 头按需省略。
     var storefront: String? = nil
+    /// `X-Platform-Flavor-Version`：混合框架插件自身的版本（0.4.0 起，R1）。
+    /// 原生宿主为 nil —— 头按需省略（对照 RC：`PlatformInfo.version` 同样只有混合框架才带）。
+    var platformFlavorVersion: String? = nil
 
     /// SDK 版本。**必须与 CHANGELOG 最新版本号一致** —— `scripts/sdk-release.sh` 门禁 7 会比对。
-    static let sdkVersionString = "0.3.1"
+    static let sdkVersionString = "0.4.0"
 
     /// 本 SDK 只有 SPM 分发形态（设计基线：SPM 分发、无 ObjC 层）。
     static let installationMethodString = "swift-package-manager"
@@ -105,13 +109,18 @@ struct SystemInfo: Sendable, Equatable {
         #endif
     }
 
-    static func current(isBackgrounded: Bool = false) -> SystemInfo {
+    /// 原生宿主的 flavor 值（`Configuration` 的默认值）。
+    static let nativeFlavor = "native"
+
+    static func current(isBackgrounded: Bool = false,
+                        platformFlavor: String = SystemInfo.nativeFlavor,
+                        platformFlavorVersion: String? = nil) -> SystemInfo {
         let bundle = Bundle.main
         return SystemInfo(
             platform: currentPlatform,
             platformVersion: ProcessInfo.processInfo.operatingSystemVersionString,
             platformDevice: currentDevice,
-            platformFlavor: "native",
+            platformFlavor: platformFlavor,
             sdkVersion: sdkVersionString,
             clientVersion: bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
             clientBuildVersion: bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
@@ -122,7 +131,8 @@ struct SystemInfo: Sendable, Equatable {
             isDebugBuild: currentIsDebugBuild,
             installationMethod: installationMethodString,
             preferredLocales: Array(Locale.preferredLanguages.prefix(5)),
-            storefront: StoreEnvironmentCache.storefront
+            storefront: StoreEnvironmentCache.storefront,
+            platformFlavorVersion: platformFlavorVersion
         )
     }
 
@@ -145,6 +155,7 @@ struct SystemInfo: Sendable, Equatable {
             "X-Preferred-Locales": preferredLocales.joined(separator: ","),
         ]
         if let storefront { all["X-Storefront"] = storefront }
+        if let platformFlavorVersion { all["X-Platform-Flavor-Version"] = platformFlavorVersion }
         return all
     }
 }

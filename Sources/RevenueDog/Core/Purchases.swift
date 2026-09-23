@@ -49,6 +49,10 @@ public struct Configuration: Sendable {
     ///
     /// 与 `diagnosticsEnabled` 同理保持 **internal**：宿主要做的只是 `with(waitsForLogInBeforeSync:)`。
     internal private(set) var waitsForLogInBeforeSync: Bool
+    /// `X-Platform-Flavor`（R1）。原生宿主恒为 `"native"`；只有混合框架插件经 SPI 入口改写。
+    internal private(set) var platformFlavor: String
+    /// `X-Platform-Flavor-Version`（R1）。nil = 不发这个头（原生宿主）。
+    internal private(set) var platformFlavorVersion: String?
 
     public static let defaultBaseURL = URL(string: "https://api.revdog.org")!
 
@@ -60,6 +64,8 @@ public struct Configuration: Sendable {
         self.logLevel = .info
         self.diagnosticsEnabled = true
         self.waitsForLogInBeforeSync = false
+        self.platformFlavor = SystemInfo.nativeFlavor
+        self.platformFlavorVersion = nil
     }
 
     public func with(appUserID: String?) -> Configuration {
@@ -148,6 +154,21 @@ public struct Configuration: Sendable {
     public func with(waitsForLogInBeforeSync: Bool) -> Configuration {
         var copy = self
         copy.waitsForLogInBeforeSync = waitsForLogInBeforeSync
+        return copy
+    }
+
+    /// **混合框架插件专用**（SPI，非宿主承诺）：声明本 SDK 由哪个混合框架包装（R1）。
+    ///
+    /// 影响的只有两个请求头：`X-Platform-Flavor`（默认 `native`）与 `X-Platform-Flavor-Version`
+    /// （nil 时不发）。后端据此区分原生 / Flutter 流量；SDK 行为不因此改变。
+    /// 对照 RC：`Configuration.Builder.with(platformInfo:)`（purchases-hybrid-common 在 configure 入口注入）；
+    /// 我方不做成宿主可见 API —— 原生宿主没有理由改它，所以放在 `@_spi(RevenueDogInternal)` 后面，
+    /// 插件以 `@_spi(RevenueDogInternal) import RevenueDog` 使用。
+    @_spi(RevenueDogInternal)
+    public func with(platformFlavor: String, flavorVersion: String?) -> Configuration {
+        var copy = self
+        copy.platformFlavor = platformFlavor
+        copy.platformFlavorVersion = flavorVersion
         return copy
     }
 }
@@ -361,11 +382,19 @@ public final class Purchases {
         self.settings = settings
 
         let identity = IdentityManager(storage: dependencies.identityStorage)
+        // R1：flavor / flavor 版本从配置显式传进 SystemInfo（诊断上传同走这个 client，头一并带上）。
+        let platformFlavor = configuration.platformFlavor
+        let platformFlavorVersion = configuration.platformFlavorVersion
         let httpClient = HTTPClient(apiKey: configuration.apiKey,
                                     baseURL: configuration.baseURL,
                                     transport: dependencies.transport,
                                     retryPolicy: dependencies.networkRetryPolicy,
-                                    scheduler: dependencies.networkDelayScheduler)
+                                    scheduler: dependencies.networkDelayScheduler,
+                                    systemInfoProvider: {
+                                        SystemInfo.current(isBackgrounded: AppStateProvider.isBackgrounded,
+                                                           platformFlavor: platformFlavor,
+                                                           platformFlavorVersion: platformFlavorVersion)
+                                    })
         self.httpClient = httpClient
         let cacheInvalidation = CustomerInfoCacheInvalidation()
         self.cacheInvalidation = cacheInvalidation
@@ -506,6 +535,40 @@ public final class Purchases {
     /// 门面层的 `sdk_warning` 出口（fire-and-forget，绝不阻塞调用方）。
     private nonisolated func recordWarning(_ code: String, detail: String? = nil) {
         Task { [diagnostics] in await diagnostics.warn(code, detail: detail) }
+    }
+
+    // MARK: - 混合框架插件的内部记诊断入口（SPI，裁定 10）
+
+    /// **混合框架插件专用**（SPI，非宿主承诺）：往 SDK 的诊断管线记一条 info 级事件。
+    ///
+    /// 插件用它记桥接层才看得见的事实（被忽略的选项、字段回退、剔除的 package 等）。
+    /// `name` 必须满足 `^[a-z_]{1,64}$`（sdk-diagnostics §1 wire 硬限）—— 不合法时 `Log.warn` 并丢弃，
+    /// **不抛**（记诊断失败绝不该影响调用方）。诊断关闭时为空操作（recorder 自身已如此）。
+    /// 对照 RC：hybrid-common 没有等价入口（RC 诊断不对插件开放）；我方需要插件侧的可观测性，自建。
+    @_spi(RevenueDogInternal)
+    public func recordDiagnosticsEvent(_ name: String, fields: [String: String]) async {
+        guard Self.isValidDiagnosticsEventName(name) else {
+            Log.warn("诊断事件名不合法（须匹配 ^[a-z_]{1,64}$），丢弃：\(name)", category: "diagnostics")
+            return
+        }
+        // 与其它公开入口一样先等启动收敛：事件要带记录时刻的 app_user_id（§6-2），身份解析前记会被服务端丢。
+        await awaitStart()
+        await diagnostics.record(name,
+                                 level: DiagnosticsLevel.info,
+                                 fields: fields.mapValues { DiagnosticsFieldValue.string($0) })
+    }
+
+    /// **混合框架插件专用**（SPI，非宿主承诺）：记一条 `sdk_warning{code, detail}`（warn 级，不采样）。
+    @_spi(RevenueDogInternal)
+    public func recordDiagnosticsWarning(_ code: String, detail: String?) async {
+        await awaitStart()
+        await diagnostics.warn(code, detail: detail)
+    }
+
+    /// `^[a-z_]{1,64}$`（不用 Regex 字面量：逐字符判定即可，且不引入额外可用性约束）。
+    nonisolated static func isValidDiagnosticsEventName(_ name: String) -> Bool {
+        guard (1...64).contains(name.utf8.count) else { return false }
+        return name.utf8.allSatisfy { ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "z")) || $0 == UInt8(ascii: "_") }
     }
 
     private func start() {

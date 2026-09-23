@@ -116,11 +116,12 @@ struct PurchaseFlowTests {
     func happyPathSubscription() async throws {
         let (purchases, transport, provider) = makePurchases()
         let flag = FinishFlag()
+        let purchaseDate = Date(timeIntervalSince1970: 1_789_000_000)
         await provider.scriptPurchase { productID in
             .success(FakeTransaction(transactionIdentifier: "tx-100",
                                      originalTransactionIdentifier: "tx-100",
                                      productIdentifier: productID,
-                                     purchaseDate: Date(),
+                                     purchaseDate: purchaseDate,
                                      expirationDate: Date().addingTimeInterval(3600),
                                      jwsRepresentation: "h.p.s",
                                      finishFlag: flag))
@@ -132,6 +133,9 @@ struct PurchaseFlowTests {
                                   price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
         #expect(result.transactionIdentifier == "tx-100")
         #expect(!result.userCancelled)
+        // 0.4.0（R12）：成功路径两字段必须非 nil，取自交易
+        #expect(result.productIdentifier == "com.demo.monthly")
+        #expect(result.purchaseDate == purchaseDate)
         #expect(flag.value) // 后端 200 后 finish
 
         let receiptRequest = await transport.capturedRequests.last
@@ -260,6 +264,8 @@ struct PurchaseFlowTests {
             product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
                                   price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
         #expect(result.userCancelled)
+        #expect(result.productIdentifier == nil)
+        #expect(result.purchaseDate == nil)
         let receiptCalls = await transport.capturedRequests.filter { $0.url?.path == "/v1/receipts" }
         #expect(receiptCalls.isEmpty)
     }

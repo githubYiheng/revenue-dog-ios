@@ -5,6 +5,50 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23
+
+**次版本：公开 API 只「增」**（基线 444 → 498 行；diff 只有 `+` 行，其中 SPI 3 行）。**破坏性变更：无**，现有 `init` 全部保留、不标 deprecated。
+用途：Flutter 插件的 M0 原生挂点（`docs/plan/flutter-sdk-design.md` §9、ADR 0100）；公开模型的补齐原生宿主同样可用。
+
+### 新增（公开）
+
+- **`IntroductoryOffer.price: Decimal`**（R9）：优惠价数值。`freeTrial` 恒 0；`payAsYouGo` 为每周期价、`payUpFront` 为整段价，
+  均取 `Product.SubscriptionOffer.price`。新构造器 `init(type:period:periodCount:price:displayPrice:isEligible:)`；
+  旧 5 参构造器保留、`price` 填 0（不标 deprecated：次版本不给宿主添告警）。对照 RC：`StoreProductDiscount.price`。
+- **`PurchaseResult.productIdentifier: String?` / `purchaseDate: Date?`**（R12）：SDK 发起的购买成功时
+  （`transactionIdentifier != nil`）两者恒非 nil，取成交交易的 `productID` / `purchaseDate`；取消 / 待定为 nil。
+  新构造器 `init(customerInfo:transactionIdentifier:productIdentifier:purchaseDate:userCancelled:isPending:)`；旧两个构造器保留、两字段填 nil。
+  对照 RC：`StoreTransaction.productIdentifier` / `purchaseDate`。
+- **`CustomerInfo` 明细**（R6）：`subscriptionsByProductIdentifier: [String: SubscriptionInfo]`、
+  `nonSubscriptionTransactions: [NonSubscriptionTransaction]`（按购买时间升序、nil 在前、同时间按 id；跳过 id 为空的条目）、
+  `allExpirationDates: [String: Date?]`、`allPurchaseDates: [String: Date?]`（订阅取本周期购买时间，一次性取该商品最新一笔）、
+  `latestExpirationDate: Date?`。全部由同一份 wire 派生，不改 wire 解码的宽容规则。
+  不变式：活跃订阅明细的键集合 == `activeSubscriptionProductIdentifiers`；`allPurchaseDates` 的键 == `allPurchasedProductIdentifiers`；
+  非订阅交易 id 集合 == `nonSubscriptionTransactionIdentifiers`。
+- **新类型 `SubscriptionInfo`**（20 个字段，与 RC 同名；`isActive` 与活跃订阅集合同一规则同一参照时间，
+  `willRenew` 与 `EntitlementInfo.willRenew` 共用同一内部规则）与 **`NonSubscriptionTransaction`**（8 个字段，`transactionIdentifier` = 后端 `id`）。
+- **`EntitlementInfo.productPlanIdentifier: String?`**（R7）：权益上的 `product_plan_identifier`，缺失回退到对应订阅上的同名字段。
+- `StoreProduct.currencyCode`：文档写明 0.4.0 起 StoreKit 路径恒有值（类型保持 `String?`，nil 只可能来自宿主自造的 fixture）；
+  SDK 构造商品时若拿到 nil 记一条 `Log.warn`。
+
+### 新增（SPI，非宿主承诺）
+
+以下入口在 `@_spi(RevenueDogInternal)` 后面，只供混合框架插件使用（`@_spi(RevenueDogInternal) import RevenueDog`）。
+**不属于对宿主的公开承诺**，签名可能随插件需要调整；它们在基线清单里带 `[SPIAccessControl]` 标注。
+
+- `Configuration.with(platformFlavor:flavorVersion:)`（R1）：改写 `X-Platform-Flavor`（默认 `native`），
+  并在 `flavorVersion` 非 nil 时发新头 **`X-Platform-Flavor-Version`**。原生宿主不调它时请求头与 0.3.1 完全一致。
+  对照 RC：`Configuration.Builder.with(platformInfo:)`。
+- `Purchases.recordDiagnosticsEvent(_:fields:)`：记一条 info 级诊断事件（字段全为字符串）；事件名须匹配 `^[a-z_]{1,64}$`，
+  不合法时 `Log.warn` 并丢弃，不抛。`Purchases.recordDiagnosticsWarning(_:detail:)`：记 `sdk_warning{code, detail}`。
+  诊断关闭时两者均为空操作（裁定 10）。
+
+### 兼容性
+
+- **CustomerInfo 缓存**：设备缓存落盘的是 `CustomerInfo` 的 `Codable` 编码。0.3.x 写下的缓存在 0.4.0 照常解码
+  （新增键缺失 → 明细为空 / nil，`EntitlementInfo.productPlanIdentifier` 为 nil），下一次拉取即补齐；有专门的旧格式解码单测。
+- `X-Version` 变为 `0.4.0`（出站请求快照同步）。
+
 ## [0.3.1] - 2026-09-23
 
 **修订号：公开 API 无差异**（基线 444 不变）。破坏性变更：无。

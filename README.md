@@ -78,11 +78,12 @@ guard let package = try await Purchases.shared.offerings().current?.monthly,
 
 product.displayPrice              // "¥68.00"（== localizedPriceString，StoreKit 2 命名别名）
 product.price                     // Decimal(68)
-product.currencyCode              // "CNY"
+product.currencyCode              // "CNY"（0.4.0 起 StoreKit 路径恒有值，类型仍是 String?）
 product.subscriptionPeriod        // SubscriptionPeriod(unit: .month, value: 1)
 if let offer = product.introductoryOffer, offer.isEligible {
     // offer.type ∈ .freeTrial / .payAsYouGo / .payUpFront
     // offer.period（单个周期）/ offer.periodCount（重复几次）/ offer.displayPrice
+    // offer.price（0.4.0）：Decimal 数值价，freeTrial 恒 0；payAsYouGo = 每周期价，payUpFront = 整段价
     // payAsYouGo 的文案要两者一起用："\(offer.displayPrice) / \(offer.period)" × periodCount
 }
 ```
@@ -104,6 +105,7 @@ do {
         // **不要**发权益、**不要**报错；提示「等待批准」，监听 customerInfoStream 等结果
     } else {
         // 已上报后端并落库，result.customerInfo 就是最新权益
+        // 0.4.0：result.productIdentifier / result.purchaseDate 取自成交交易，成功时恒非 nil
     }
 } catch let error as PurchasesError {
     switch error.code {
@@ -122,6 +124,22 @@ do {
     }
 }
 ```
+
+### CustomerInfo 明细（0.4.0 起）
+
+与 RC 同名的明细字段，全部由同一份 `GET /v1/subscribers` 响应派生：
+
+```swift
+let info = try await Purchases.shared.customerInfo()
+info.subscriptionsByProductIdentifier["com.demo.monthly"]   // SubscriptionInfo：到期 / 续订 / 宽限 / 退款 / isActive / willRenew …
+info.nonSubscriptionTransactions                            // [NonSubscriptionTransaction]，按购买时间升序
+info.allExpirationDates / info.allPurchaseDates             // [商品 id: Date?]
+info.latestExpirationDate                                   // 订阅里最晚的到期时间
+info.entitlements["pro"]?.productPlanIdentifier            // Play base plan；App Store 通常为 nil
+```
+
+> `SubscriptionInfo.isActive` 与 `activeSubscriptionProductIdentifiers` 同一规则、同一参照时间；
+> 从 0.3.x 升级后第一次读到的**旧缓存**里这些明细为空，下一次拉取（前台 5 分钟 TTL / 回前台刷新）即补齐。
 
 ### 集成测试：把假后端接进来（仅测试用）
 

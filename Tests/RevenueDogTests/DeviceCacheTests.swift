@@ -67,7 +67,8 @@ struct EntitlementGracePolicyTests {
                                           isSandbox: false,
                                           unsubscribeDetectedAt: nil,
                                           billingIssueDetectedAt: nil,
-                                          requestDate: requestDate)
+                                          requestDate: requestDate,
+                                          productPlanIdentifier: nil)
         let infos = EntitlementInfos(all: ["pro": entitlement], requestDate: requestDate)
 
         // 本地钟被往回拨一年 → 仍以服务端时间判定 → 有效（因为服务端时间 < 到期时间）。

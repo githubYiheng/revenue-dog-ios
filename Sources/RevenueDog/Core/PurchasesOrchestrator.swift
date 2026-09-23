@@ -811,8 +811,11 @@ actor PurchasesOrchestrator {
                                            outcome: DiagnosticsPurchaseOutcome.success,
                                            transactionID: transaction.transactionIdentifier,
                                            startedAt: purchaseStartedAt, error: nil)
+                // R12：成功路径的商品 id / 购买时间一律取**交易**（非 nil 由类型保证）。
                 return PurchaseResult(customerInfo: info,
                                       transactionIdentifier: transaction.transactionIdentifier,
+                                      productIdentifier: transaction.productIdentifier,
+                                      purchaseDate: transaction.purchaseDate,
                                       userCancelled: false,
                                       isPending: false)
             }

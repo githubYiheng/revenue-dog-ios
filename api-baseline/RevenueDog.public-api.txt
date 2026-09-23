@@ -17,8 +17,10 @@ Constructor IntroductoryOffer.OfferType.init(from:)
 Constructor IntroductoryOffer.OfferType.init(rawValue:)
 Constructor IntroductoryOffer.init(from:)
 Constructor IntroductoryOffer.init(type:period:periodCount:displayPrice:isEligible:)
+Constructor IntroductoryOffer.init(type:period:periodCount:price:displayPrice:isEligible:)
 Constructor Money.init(amount:currency:)
 Constructor Money.init(from:)
+Constructor NonSubscriptionTransaction.init(from:)
 Constructor Offering.init(from:)
 Constructor Offerings.init(from:)
 Constructor OwnershipType.init(from:)
@@ -28,6 +30,7 @@ Constructor PackageType.init(from:)
 Constructor PackageType.init(rawValue:)
 Constructor PeriodType.init(from:)
 Constructor PeriodType.init(rawValue:)
+Constructor PurchaseResult.init(customerInfo:transactionIdentifier:productIdentifier:purchaseDate:userCancelled:isPending:)
 Constructor PurchaseResult.init(customerInfo:transactionIdentifier:userCancelled:)
 Constructor PurchaseResult.init(customerInfo:transactionIdentifier:userCancelled:isPending:)
 Constructor PurchasesCompletedBy.init(from:)
@@ -38,6 +41,7 @@ Constructor Store.init(rawValue:)
 Constructor StoreProduct.init(from:)
 Constructor StoreProduct.init(productIdentifier:localizedTitle:localizedDescription:price:currencyCode:localizedPriceString:)
 Constructor StoreProduct.init(productIdentifier:localizedTitle:localizedDescription:price:currencyCode:localizedPriceString:subscriptionPeriod:introductoryOffer:)
+Constructor SubscriptionInfo.init(from:)
 Constructor SubscriptionPeriod.Unit.init(from:)
 Constructor SubscriptionPeriod.Unit.init(rawValue:)
 Constructor SubscriptionPeriod.init(from:)
@@ -48,6 +52,7 @@ Func Configuration.with(appUserID:)
 Func Configuration.with(baseURL:)
 Func Configuration.with(diagnosticsEnabled:)
 Func Configuration.with(logLevel:)
+Func Configuration.with(platformFlavor:flavorVersion:)  [SPIAccessControl]
 Func Configuration.with(purchasesCompletedBy:)
 Func Configuration.with(transport:)
 Func Configuration.with(waitsForLogInBeforeSync:)
@@ -88,6 +93,9 @@ Func Money.__derived_struct_equals(_:_:)  [Implements]
 Func Money.decimalString(_:)
 Func Money.encode(to:)
 Func Money.hash(into:)
+Func NonSubscriptionTransaction.__derived_struct_equals(_:_:)  [Implements]
+Func NonSubscriptionTransaction.encode(to:)
+Func NonSubscriptionTransaction.hash(into:)
 Func Offering.__derived_struct_equals(_:_:)  [Implements]
 Func Offering.encode(to:)
 Func Offering.hash(into:)
@@ -115,6 +123,8 @@ Func Purchases.logOut()  [Custom,Final]
 Func Purchases.offerings()  [Custom,Final]
 Func Purchases.purchase(package:)  [Custom,Final]
 Func Purchases.purchase(product:)  [Custom,Final]
+Func Purchases.recordDiagnosticsEvent(_:fields:)  [Custom,Final,SPIAccessControl]
+Func Purchases.recordDiagnosticsWarning(_:detail:)  [Custom,Final,SPIAccessControl]
 Func Purchases.reportEntitlementDiff(rcActive:rcRequestDate:rcSDKVersion:)  [Custom,DiscardableResult,Final]
 Func Purchases.restorePurchases()  [Custom,Final]
 Func Purchases.setATTConsentStatus(_:)  [Custom,Final]
@@ -171,6 +181,9 @@ Func Store.hash(into:)
 Func StoreProduct.__derived_struct_equals(_:_:)  [Implements]
 Func StoreProduct.encode(to:)
 Func StoreProduct.hash(into:)
+Func SubscriptionInfo.__derived_struct_equals(_:_:)  [Implements]
+Func SubscriptionInfo.encode(to:)
+Func SubscriptionInfo.hash(into:)
 Func SubscriptionPeriod.Unit.__derived_struct_equals(_:_:)  [Implements]
 Func SubscriptionPeriod.Unit.encode(to:)
 Func SubscriptionPeriod.Unit.hash(into:)
@@ -193,6 +206,7 @@ Struct IntroductoryOffer
 Struct IntroductoryOffer.OfferType
 Struct LogLevel
 Struct Money
+Struct NonSubscriptionTransaction
 Struct Offering
 Struct Offerings
 Struct OwnershipType
@@ -205,6 +219,7 @@ Struct PurchasesError
 Struct PurchasesErrorCode
 Struct Store
 Struct StoreProduct
+Struct SubscriptionInfo
 Struct SubscriptionPeriod
 Struct SubscriptionPeriod.Unit
 Subscript EntitlementInfos.subscript(_:)
@@ -217,17 +232,22 @@ Var Configuration.defaultBaseURL  [HasInitialValue,HasStorage]
 Var Configuration.logLevel  [HasStorage,SetterAccess]
 Var Configuration.purchasesCompletedBy  [HasStorage,SetterAccess]
 Var CustomerInfo.activeSubscriptionProductIdentifiers  [HasStorage]
+Var CustomerInfo.allExpirationDates  [HasStorage]
+Var CustomerInfo.allPurchaseDates  [HasStorage]
 Var CustomerInfo.allPurchasedProductIdentifiers  [HasStorage]
 Var CustomerInfo.entitlements  [HasStorage]
 Var CustomerInfo.firstSeen  [HasStorage]
 Var CustomerInfo.hashValue
 Var CustomerInfo.lastSeen  [HasStorage]
+Var CustomerInfo.latestExpirationDate  [HasStorage]
 Var CustomerInfo.managementURL  [HasStorage]
 Var CustomerInfo.nonSubscriptionTransactionIdentifiers  [HasStorage]
+Var CustomerInfo.nonSubscriptionTransactions  [HasStorage]
 Var CustomerInfo.originalAppUserID  [HasStorage]
 Var CustomerInfo.originalApplicationVersion  [HasStorage]
 Var CustomerInfo.originalPurchaseDate  [HasStorage]
 Var CustomerInfo.requestDate  [HasStorage]
+Var CustomerInfo.subscriptionsByProductIdentifier  [HasStorage]
 Var EntitlementDiffResult.Diff.expiresMismatch  [HasStorage]
 Var EntitlementDiffResult.Diff.hashValue
 Var EntitlementDiffResult.Diff.onlyDog  [HasStorage]
@@ -248,6 +268,7 @@ Var EntitlementInfo.originalPurchaseDate  [HasStorage]
 Var EntitlementInfo.ownershipType  [HasStorage]
 Var EntitlementInfo.periodType  [HasStorage]
 Var EntitlementInfo.productIdentifier  [HasStorage]
+Var EntitlementInfo.productPlanIdentifier  [HasStorage]
 Var EntitlementInfo.requestDate  [HasStorage]
 Var EntitlementInfo.store  [HasStorage]
 Var EntitlementInfo.unsubscribeDetectedAt  [HasStorage]
@@ -284,6 +305,7 @@ Var IntroductoryOffer.hashValue
 Var IntroductoryOffer.isEligible  [HasStorage]
 Var IntroductoryOffer.period  [HasStorage]
 Var IntroductoryOffer.periodCount  [HasStorage]
+Var IntroductoryOffer.price  [HasStorage]
 Var IntroductoryOffer.type  [HasStorage]
 Var LogLevel.debug  [HasInitialValue,HasStorage]
 Var LogLevel.description
@@ -299,6 +321,15 @@ Var Money.amount  [HasStorage]
 Var Money.currency  [HasStorage]
 Var Money.description
 Var Money.hashValue
+Var NonSubscriptionTransaction.displayName  [HasStorage]
+Var NonSubscriptionTransaction.hashValue
+Var NonSubscriptionTransaction.isSandbox  [HasStorage]
+Var NonSubscriptionTransaction.originalPurchaseDate  [HasStorage]
+Var NonSubscriptionTransaction.productIdentifier  [HasStorage]
+Var NonSubscriptionTransaction.purchaseDate  [HasStorage]
+Var NonSubscriptionTransaction.store  [HasStorage]
+Var NonSubscriptionTransaction.storeTransactionID  [HasStorage]
+Var NonSubscriptionTransaction.transactionIdentifier  [HasStorage]
 Var Offering.annual
 Var Offering.availablePackages  [HasStorage]
 Var Offering.hashValue
@@ -345,6 +376,8 @@ Var PeriodType.trial  [HasInitialValue,HasStorage]
 Var PeriodType.unknown  [HasInitialValue,HasStorage]
 Var PurchaseResult.customerInfo  [HasStorage]
 Var PurchaseResult.isPending  [HasStorage]
+Var PurchaseResult.productIdentifier  [HasStorage]
+Var PurchaseResult.purchaseDate  [HasStorage]
 Var PurchaseResult.transactionIdentifier  [HasStorage]
 Var PurchaseResult.userCancelled  [HasStorage]
 Var PurchaseUIContext.sceneProvider  [Custom,HasInitialValue,HasStorage]
@@ -430,6 +463,27 @@ Var StoreProduct.localizedTitle  [HasStorage]
 Var StoreProduct.price  [HasStorage]
 Var StoreProduct.productIdentifier  [HasStorage]
 Var StoreProduct.subscriptionPeriod  [HasStorage]
+Var SubscriptionInfo.autoResumeDate  [HasStorage]
+Var SubscriptionInfo.billingIssuesDetectedAt  [HasStorage]
+Var SubscriptionInfo.displayName  [HasStorage]
+Var SubscriptionInfo.expiresDate  [HasStorage]
+Var SubscriptionInfo.gracePeriodExpiresDate  [HasStorage]
+Var SubscriptionInfo.hashValue
+Var SubscriptionInfo.isActive  [HasStorage]
+Var SubscriptionInfo.isSandbox  [HasStorage]
+Var SubscriptionInfo.managementURL  [HasStorage]
+Var SubscriptionInfo.originalPurchaseDate  [HasStorage]
+Var SubscriptionInfo.ownershipType  [HasStorage]
+Var SubscriptionInfo.periodType  [HasStorage]
+Var SubscriptionInfo.productIdentifier  [HasStorage]
+Var SubscriptionInfo.productPlanIdentifier  [HasStorage]
+Var SubscriptionInfo.purchaseDate  [HasStorage]
+Var SubscriptionInfo.refundedAt  [HasStorage]
+Var SubscriptionInfo.requestDate  [HasStorage]
+Var SubscriptionInfo.store  [HasStorage]
+Var SubscriptionInfo.storeTransactionID  [HasStorage]
+Var SubscriptionInfo.unsubscribeDetectedAt  [HasStorage]
+Var SubscriptionInfo.willRenew  [HasStorage]
 Var SubscriptionPeriod.Unit.day  [HasInitialValue,HasStorage]
 Var SubscriptionPeriod.Unit.description
 Var SubscriptionPeriod.Unit.hashValue

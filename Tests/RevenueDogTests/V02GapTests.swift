@@ -88,6 +88,7 @@ struct V02OfferingsProductTests {
                     introOffer: IntroductoryOffer(type: .freeTrial,
                                                   period: SubscriptionPeriod(unit: .week, value: 2),
                                                   periodCount: 1,
+                                                  price: 0,
                                                   displayPrice: "$0.00",
                                                   isEligible: true))
     }
@@ -198,6 +199,9 @@ struct V02PurchaseResultTests {
         #expect(result.isPending)
         #expect(result.transactionIdentifier == nil)
         #expect(!result.userCancelled)
+        // 0.4.0（R12）：待定没有交易 → 商品 id / 购买时间为 nil
+        #expect(result.productIdentifier == nil)
+        #expect(result.purchaseDate == nil)
     }
 
     @Test("B：成功购买 isPending == false")
@@ -230,6 +234,8 @@ struct V02PurchaseResultTests {
         let result = try await purchases.purchase(product: Self.monthly())
         #expect(result.userCancelled)
         #expect(!result.isPending)
+        #expect(result.productIdentifier == nil)
+        #expect(result.purchaseDate == nil)
     }
 
     /// C 的暂时性一半：5xx / 网络错误 / 401 / 403 全都是「交易保留、SDK 会重放」。

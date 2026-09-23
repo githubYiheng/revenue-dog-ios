@@ -429,12 +429,15 @@ struct EntitlementWireModel: Codable, Sendable, Equatable {
     let gracePeriodExpiresDate: WireDateValue
     @DefaultDecodable<DecodableDefaults.EmptyString> var productIdentifier: String
     let purchaseDate: WireDateValue
+    /// 0.4.0（R7）：契约允许键缺失（老后端 / RC 形状都可能不带）；缺失回退到对应订阅上的同名字段。
+    @IgnoreDecodeErrors var productPlanIdentifier: String?
 
     enum CodingKeys: String, CodingKey {
         case expiresDate = "expires_date"
         case gracePeriodExpiresDate = "grace_period_expires_date"
         case productIdentifier = "product_identifier"
         case purchaseDate = "purchase_date"
+        case productPlanIdentifier = "product_plan_identifier"
     }
 }
 
@@ -561,6 +564,25 @@ struct BackendErrorWireModel: Codable, Sendable, Equatable {
     }
 }
 
+// MARK: - 共用判定规则（权益 / 订阅明细 / 活跃订阅集合只此一份，不许各写各的）
+
+enum SubscriptionStatusRules {
+
+    /// 有效判定：宽限期未过 → 有效；无到期（终身）→ 有效；否则到期晚于参照时间才有效。
+    /// `referenceDate` 由 `EntitlementGracePolicy.referenceDate(requestDate:now:)` 给出（设计 §4）。
+    static func isActive(expirationDate: Date?, gracePeriodExpiresDate: Date?, referenceDate: Date) -> Bool {
+        if let gracePeriodExpiresDate, gracePeriodExpiresDate > referenceDate { return true }
+        guard let expirationDate else { return true }
+        return expirationDate > referenceDate
+    }
+
+    /// 会续订：有到期时间、没检测到关闭自动续订、也没检测到扣款问题。
+    static func willRenew(expirationDate: Date?, unsubscribeDetectedAt: Date?, billingIssuesDetectedAt: Date?) -> Bool {
+        guard expirationDate != nil else { return false }
+        return unsubscribeDetectedAt == nil && billingIssuesDetectedAt == nil
+    }
+}
+
 // MARK: - 公开模型：EntitlementInfo
 
 public struct EntitlementInfo: Sendable, Hashable, Codable {
@@ -582,14 +604,21 @@ public struct EntitlementInfo: Sendable, Hashable, Codable {
     public let billingIssueDetectedAt: Date?
     /// 响应的服务端时间，用于 3 天 grace 的到期判定（设计 §4）。
     public let requestDate: Date?
+    /// 商店侧的计划标识（0.4.0，R7）。取权益上的 `product_plan_identifier`，缺失回退到
+    /// `subscriptions[productIdentifier].product_plan_identifier`；App Store 商品通常为 nil
+    /// （Play 的 base plan id 才有值）。对照 RC：`EntitlementInfo.productPlanIdentifier` 同名同义。
+    ///
+    /// 可选类型 → 合成的 `Codable` 用 `decodeIfPresent`，0.3.x 写下的缓存照常解码（该字段为 nil）。
+    public let productPlanIdentifier: String?
 
     /// 非订阅（一次性购买）授予的权益。
     public var isLifetime: Bool { expirationDate == nil }
 
     /// 检测到关闭自动续订，但订阅可能仍有效（以 expirationDate 为准）。
     public var willRenew: Bool {
-        guard expirationDate != nil else { return false }
-        return unsubscribeDetectedAt == nil && billingIssueDetectedAt == nil
+        SubscriptionStatusRules.willRenew(expirationDate: expirationDate,
+                                          unsubscribeDetectedAt: unsubscribeDetectedAt,
+                                          billingIssuesDetectedAt: billingIssueDetectedAt)
     }
 
     /// 权益是否有效。
@@ -597,9 +626,9 @@ public struct EntitlementInfo: Sendable, Hashable, Codable {
     /// `referenceDate` 由 `EntitlementGracePolicy.referenceDate(requestDate:now:)` 给出
     /// ——3 天内用服务端时间，超 3 天回落本地时钟（设计 §4）。
     public func isActive(referenceDate: Date) -> Bool {
-        if let gracePeriodExpiresDate, gracePeriodExpiresDate > referenceDate { return true }
-        guard let expirationDate else { return true }
-        return expirationDate > referenceDate
+        SubscriptionStatusRules.isActive(expirationDate: expirationDate,
+                                         gracePeriodExpiresDate: gracePeriodExpiresDate,
+                                         referenceDate: referenceDate)
     }
 }
 
@@ -627,6 +656,107 @@ public struct EntitlementInfos: Sendable, Hashable, Codable {
     }
 }
 
+// MARK: - 公开模型：SubscriptionInfo（0.4.0，R6）
+
+/// 单个订阅商品的明细（`CustomerInfo.subscriptionsByProductIdentifier` 的值）。
+///
+/// 全部字段来自 `subscriber.subscriptions[productId]`（契约 §2.2），解析时一次算好；
+/// `isActive` 与 `CustomerInfo.activeSubscriptionProductIdentifiers` **同一规则、同一参照时间**，
+/// `willRenew` 与 `EntitlementInfo.willRenew` 同一规则（`SubscriptionStatusRules`）。
+/// 对照 RC：`SubscriptionInfo`（purchases-ios 4.x+ / Dart 19 字段）逐字段同名；RC 的 `price` 本版不带
+/// （后端 `price` 是服务端记账口径，不是商店价，宿主不读）。
+public struct SubscriptionInfo: Sendable, Hashable, Codable {
+
+    public let productIdentifier: String
+    /// 本周期（最近一次购买 / 续订）的购买时间。
+    public let purchaseDate: Date?
+    public let originalPurchaseDate: Date?
+    /// 到期时间；nil 只可能来自后端缺字段（订阅本应有到期）。
+    public let expiresDate: Date?
+    public let store: Store
+    public let isSandbox: Bool
+    public let periodType: PeriodType
+    public let ownershipType: OwnershipType
+    public let unsubscribeDetectedAt: Date?
+    public let billingIssuesDetectedAt: Date?
+    public let gracePeriodExpiresDate: Date?
+    public let refundedAt: Date?
+    public let autoResumeDate: Date?
+    public let storeTransactionID: String?
+    /// 商店侧的计划标识（Play base plan）；App Store 通常为 nil。
+    public let productPlanIdentifier: String?
+    /// 后端下发的展示名（`display_name`）。
+    public let displayName: String?
+    /// 订阅管理页（= 客户级 `CustomerInfo.managementURL`，后端只下发一份）。
+    public let managementURL: URL?
+    /// 解析时按 3 天 grace 参照时间算出的有效性（设计 §4）。
+    public let isActive: Bool
+    /// 有到期时间、且未检测到关闭自动续订 / 扣款问题。
+    public let willRenew: Bool
+    /// 响应的服务端时间（`request_date`）。
+    public let requestDate: Date?
+
+    init(productIdentifier: String,
+         wire: SubscriptionWireModel,
+         managementURL: URL?,
+         requestDate: Date?,
+         referenceDate: Date) {
+        self.productIdentifier = productIdentifier
+        self.purchaseDate = wire.purchaseDate.date
+        self.originalPurchaseDate = wire.originalPurchaseDate.date
+        self.expiresDate = wire.expiresDate.date
+        self.store = wire.store
+        self.isSandbox = wire.isSandbox
+        self.periodType = wire.periodType
+        self.ownershipType = wire.ownershipType
+        self.unsubscribeDetectedAt = wire.unsubscribeDetectedAt.date
+        self.billingIssuesDetectedAt = wire.billingIssuesDetectedAt.date
+        self.gracePeriodExpiresDate = wire.gracePeriodExpiresDate.date
+        self.refundedAt = wire.refundedAt.date
+        self.autoResumeDate = wire.autoResumeDate.date
+        self.storeTransactionID = wire.storeTransactionID
+        self.productPlanIdentifier = wire.productPlanIdentifier
+        self.displayName = wire.displayName
+        self.managementURL = managementURL
+        self.isActive = SubscriptionStatusRules.isActive(expirationDate: wire.expiresDate.date,
+                                                         gracePeriodExpiresDate: wire.gracePeriodExpiresDate.date,
+                                                         referenceDate: referenceDate)
+        self.willRenew = SubscriptionStatusRules.willRenew(expirationDate: wire.expiresDate.date,
+                                                           unsubscribeDetectedAt: wire.unsubscribeDetectedAt.date,
+                                                           billingIssuesDetectedAt: wire.billingIssuesDetectedAt.date)
+        self.requestDate = requestDate
+    }
+}
+
+// MARK: - 公开模型：NonSubscriptionTransaction（0.4.0，R6）
+
+/// 一笔非订阅（消耗型 / 非消耗型）交易，来自 `subscriber.non_subscriptions[productId][]`。
+/// 对照 RC：`NonSubscriptionTransaction`（`transactionIdentifier` = 后端 `id`，与 RC 同）。
+public struct NonSubscriptionTransaction: Sendable, Hashable, Codable {
+
+    /// 后端交易 id（wire `id`）；与 `CustomerInfo.nonSubscriptionTransactionIdentifiers` 同一口径。
+    public let transactionIdentifier: String
+    public let productIdentifier: String
+    public let purchaseDate: Date?
+    public let originalPurchaseDate: Date?
+    public let store: Store
+    /// 商店侧交易 id（App Store `transactionId` / Play `orderId`）。
+    public let storeTransactionID: String?
+    public let isSandbox: Bool
+    public let displayName: String?
+
+    init(productIdentifier: String, wire: NonSubscriptionWireModel) {
+        self.transactionIdentifier = wire.id
+        self.productIdentifier = productIdentifier
+        self.purchaseDate = wire.purchaseDate.date
+        self.originalPurchaseDate = wire.originalPurchaseDate.date
+        self.store = wire.store
+        self.storeTransactionID = wire.storeTransactionID
+        self.isSandbox = wire.isSandbox
+        self.displayName = wire.displayName
+    }
+}
+
 // MARK: - 公开模型：CustomerInfo
 
 public struct CustomerInfo: Sendable, Hashable, Codable {
@@ -647,6 +777,77 @@ public struct CustomerInfo: Sendable, Hashable, Codable {
     public let nonSubscriptionTransactionIdentifiers: Set<String>
     /// 服务端签发的账户令牌（32hex）；购买时转 UUID 写 `appAccountToken`（#22 辅助归户链）。
     let accountToken: String?
+
+    // ---- 0.4.0（R6）：补齐 RC `CustomerInfo` 的明细字段，全部由同一份 wire 派生 ----
+    //
+    // 缓存兼容：`DeviceCache` 落盘的是本结构的 `Codable` 编码（不是 wire JSON）。0.3.x 写下的缓存没有
+    // 下面这些键 → 自定义 `init(from:)` 用 `decodeIfPresent` 兜底为空 / nil，直到下一次拉取覆盖
+    // （前台 5 分钟 TTL / 回前台刷新）。兜底期间下面的不变式对**旧缓存**不成立，这是有意的：
+    // 旧缓存里没有派生所需的原始数据，编造比留空更糟。
+
+    /// 订阅明细，键 = 订阅商品 id。不变式：`isActive == true` 的键集合 == `activeSubscriptionProductIdentifiers`。
+    public let subscriptionsByProductIdentifier: [String: SubscriptionInfo]
+    /// 全部非订阅交易（展平）：按 `purchaseDate` 升序（nil 排最前），同时间按 `transactionIdentifier` 升序；
+    /// 跳过 `id` 为空的条目。不变式：id 集合 == `nonSubscriptionTransactionIdentifiers`。
+    public let nonSubscriptionTransactions: [NonSubscriptionTransaction]
+    /// 订阅商品 id → 到期时间（值可 nil）。对照 RC `expirationDate(forProductIdentifier:)` 的底表。
+    public let allExpirationDates: [String: Date?]
+    /// 商品 id → 购买时间（值可 nil）。键 == `allPurchasedProductIdentifiers`；
+    /// 订阅取本周期 `purchase_date`，一次性商品取该商品最新一笔的 `purchase_date`。
+    public let allPurchaseDates: [String: Date?]
+    /// 订阅里非 nil 到期时间的最大值；没有则 nil。
+    public let latestExpirationDate: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case originalAppUserID
+        case firstSeen
+        case lastSeen
+        case managementURL
+        case requestDate
+        case entitlements
+        case originalApplicationVersion
+        case originalPurchaseDate
+        case allPurchasedProductIdentifiers
+        case activeSubscriptionProductIdentifiers
+        case nonSubscriptionTransactionIdentifiers
+        case accountToken
+        case subscriptionsByProductIdentifier
+        case nonSubscriptionTransactions
+        case allExpirationDates
+        case allPurchaseDates
+        case latestExpirationDate
+    }
+
+    /// 键名与 0.3.x 合成实现逐字一致（属性名）；0.4.0 新增的五个键缺失时兜底（见上）。
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.originalAppUserID = try container.decode(String.self, forKey: .originalAppUserID)
+        self.firstSeen = try container.decodeIfPresent(Date.self, forKey: .firstSeen)
+        self.lastSeen = try container.decodeIfPresent(Date.self, forKey: .lastSeen)
+        self.managementURL = try container.decodeIfPresent(URL.self, forKey: .managementURL)
+        self.requestDate = try container.decodeIfPresent(Date.self, forKey: .requestDate)
+        self.entitlements = try container.decode(EntitlementInfos.self, forKey: .entitlements)
+        self.originalApplicationVersion = try container.decodeIfPresent(String.self,
+                                                                        forKey: .originalApplicationVersion)
+        self.originalPurchaseDate = try container.decodeIfPresent(Date.self, forKey: .originalPurchaseDate)
+        self.allPurchasedProductIdentifiers = try container.decode(Set<String>.self,
+                                                                   forKey: .allPurchasedProductIdentifiers)
+        self.activeSubscriptionProductIdentifiers = try container.decode(
+            Set<String>.self, forKey: .activeSubscriptionProductIdentifiers)
+        self.nonSubscriptionTransactionIdentifiers = try container.decode(
+            Set<String>.self, forKey: .nonSubscriptionTransactionIdentifiers)
+        self.accountToken = try container.decodeIfPresent(String.self, forKey: .accountToken)
+        // 0.4.0 新增：旧缓存没有这些键 → 空 / nil。键在但形状坏了照常抛（缓存层会当作未命中）。
+        self.subscriptionsByProductIdentifier = try container.decodeIfPresent(
+            [String: SubscriptionInfo].self, forKey: .subscriptionsByProductIdentifier) ?? [:]
+        self.nonSubscriptionTransactions = try container.decodeIfPresent(
+            [NonSubscriptionTransaction].self, forKey: .nonSubscriptionTransactions) ?? []
+        self.allExpirationDates = try container.decodeIfPresent([String: Date?].self,
+                                                                forKey: .allExpirationDates) ?? [:]
+        self.allPurchaseDates = try container.decodeIfPresent([String: Date?].self,
+                                                              forKey: .allPurchaseDates) ?? [:]
+        self.latestExpirationDate = try container.decodeIfPresent(Date.self, forKey: .latestExpirationDate)
+    }
 
     init(wireModel: CustomerInfoWireModel, now: Date = Date()) {
         let subscriber = wireModel.subscriber
@@ -680,7 +881,8 @@ public struct CustomerInfo: Sendable, Hashable, Codable {
                 isSandbox: subscription?.isSandbox ?? nonSubscription?.isSandbox ?? false,
                 unsubscribeDetectedAt: subscription?.unsubscribeDetectedAt.date,
                 billingIssueDetectedAt: subscription?.billingIssuesDetectedAt.date,
-                requestDate: requestDate
+                requestDate: requestDate,
+                productPlanIdentifier: wire.productPlanIdentifier ?? subscription?.productPlanIdentifier
             )
         }
         self.entitlements = EntitlementInfos(all: entitlements, requestDate: requestDate)
@@ -689,19 +891,52 @@ public struct CustomerInfo: Sendable, Hashable, Codable {
         allProducts.formUnion(subscriber.nonSubscriptions.keys)
         self.allPurchasedProductIdentifiers = allProducts
 
-        self.activeSubscriptionProductIdentifiers = Set(
-            subscriber.subscriptions
-                .filter { _, value in
-                    guard let expires = value.expiresDate.date else { return true }
-                    if let grace = value.gracePeriodExpiresDate.date, grace > reference { return true }
-                    return expires > reference
-                }
-                .map(\.key)
-        )
+        // 订阅明细与活跃集合**同源**：活跃集合就是明细里 isActive 的键（同一规则、同一 reference）。
+        let managementURL = self.managementURL
+        let subscriptions = Dictionary(uniqueKeysWithValues: subscriber.subscriptions.map { productID, wire in
+            (productID, SubscriptionInfo(productIdentifier: productID,
+                                         wire: wire,
+                                         managementURL: managementURL,
+                                         requestDate: requestDate,
+                                         referenceDate: reference))
+        })
+        self.subscriptionsByProductIdentifier = subscriptions
+        self.activeSubscriptionProductIdentifiers = Set(subscriptions.filter { $0.value.isActive }.keys)
 
         self.nonSubscriptionTransactionIdentifiers = Set(
             subscriber.nonSubscriptions.values.flatMap { $0 }.map(\.id).filter { !$0.isEmpty }
         )
+        self.nonSubscriptionTransactions = subscriber.nonSubscriptions
+            .flatMap { productID, transactions in
+                transactions
+                    .filter { !$0.id.isEmpty }       // 与 nonSubscriptionTransactionIdentifiers 同一过滤
+                    .map { NonSubscriptionTransaction(productIdentifier: productID, wire: $0) }
+            }
+            .sorted(by: CustomerInfo.nonSubscriptionOrder)
+
+        self.allExpirationDates = subscriptions.mapValues(\.expiresDate)
+        self.latestExpirationDate = subscriptions.values.compactMap(\.expiresDate).max()
+
+        // 键 == allPurchasedProductIdentifiers（订阅 ∪ 一次性）；同 id 两边都有时订阅优先。
+        var purchaseDates: [String: Date?] = [:]
+        for (productID, transactions) in subscriber.nonSubscriptions {
+            // 「最新一笔」= 购买时间最大的那笔（不依赖后端数组顺序）；全无日期 → nil。
+            purchaseDates[productID] = .some(transactions.compactMap(\.purchaseDate.date).max())
+        }
+        for (productID, subscription) in subscriptions {
+            purchaseDates[productID] = .some(subscription.purchaseDate)
+        }
+        self.allPurchaseDates = purchaseDates
+    }
+
+    /// 非订阅交易的稳定顺序：`purchaseDate` 升序、nil 最前，同时间按 `transactionIdentifier` 升序。
+    static func nonSubscriptionOrder(_ lhs: NonSubscriptionTransaction, _ rhs: NonSubscriptionTransaction) -> Bool {
+        switch (lhs.purchaseDate, rhs.purchaseDate) {
+        case (nil, .some): return true
+        case (.some, nil): return false
+        case let (.some(left), .some(right)) where left != right: return left < right
+        default: return lhs.transactionIdentifier < rhs.transactionIdentifier
+        }
     }
 }
 
@@ -904,6 +1139,10 @@ public struct IntroductoryOffer: Sendable, Hashable, Codable {
     /// `payAsYouGo` 靠它才做得出「$1.99/月 × 3 个月」这种文案（`period` 只是「1 个月」）；
     /// `freeTrial` / `payUpFront` 通常是 1，但一律**如实带**，不在端上做归一化。
     public let periodCount: Int
+    /// 优惠价的数值（0.4.0，R9）：`freeTrial` 恒为 0；`payAsYouGo` 是**每个周期**的价格、
+    /// `payUpFront` 是整段优惠的一次性价格（均为 `Product.SubscriptionOffer.price` 原值，商店币种）。
+    /// 对照 RC：`StoreProductDiscount.price`（Decimal）同义；宿主用 `price == 0` 判免费试用。
+    public let price: Decimal
     /// 本地化价格串（免费试用为商店给出的零价串）。
     public let displayPrice: String
     /// 当前 Apple ID 是否**还有资格**享受该优惠（`Product.SubscriptionInfo.isEligibleForIntroOffer`）。
@@ -912,16 +1151,41 @@ public struct IntroductoryOffer: Sendable, Hashable, Codable {
     /// 只用于展示文案，计费与权益一律以服务端为准。
     public let isEligible: Bool
 
+    /// 0.4.0 起的完整构造器（带数值价）。
     public init(type: OfferType,
                 period: SubscriptionPeriod,
                 periodCount: Int,
+                price: Decimal,
                 displayPrice: String,
                 isEligible: Bool) {
         self.type = type
         self.period = period
         self.periodCount = periodCount
+        self.price = price
         self.displayPrice = displayPrice
         self.isEligible = isEligible
+    }
+
+    /// 0.3.x 构造器：保留只为不破宿主源码（测试 fixture / 预览），`price` 一律填 0。
+    /// 非免费试用的优惠请改用带 `price:` 的构造器，否则数值价是错的。
+    /// 不标 deprecated（主代理裁定）：次版本不给宿主添告警，基线保持纯「增」。
+    public init(type: OfferType,
+                period: SubscriptionPeriod,
+                periodCount: Int,
+                displayPrice: String,
+                isEligible: Bool) {
+        self.init(type: type,
+                  period: period,
+                  periodCount: periodCount,
+                  price: 0,
+                  displayPrice: displayPrice,
+                  isEligible: isEligible)
+    }
+
+    /// SK2 映射的数值价规则（R9）：免费试用恒 0（不信任商店给出的值），其余取 `Product.SubscriptionOffer.price`。
+    /// 抽成纯函数，单测不依赖 StoreKit 真身。
+    static func price(for type: OfferType, offerPrice: Decimal) -> Decimal {
+        type == .freeTrial ? 0 : offerPrice
     }
 }
 
@@ -933,6 +1197,10 @@ public struct StoreProduct: Sendable, Hashable, Codable {
     public let localizedTitle: String
     public let localizedDescription: String
     public let price: Decimal
+    /// ISO 4217 币种码（`Product.priceFormatStyle.currencyCode`）。
+    ///
+    /// 0.4.0 起 StoreKit 路径**恒有值**（SK2 该属性是非可选 `String`）；类型保持 `String?` 只为不破源码。
+    /// nil 只可能来自宿主自行构造的 fixture。
     public let currencyCode: String?
     public let localizedPriceString: String
     /// 订阅周期。非订阅商品（消耗型 / 非消耗型 / 永久）为 nil。
@@ -992,10 +1260,19 @@ public struct PurchaseResult: Sendable {
     /// 交易稍后会从 `Transaction.updates` 流出并由 SDK 自动上报，宿主此刻**不要**发放权益，
     /// 请提示「等待批准」并监听 `customerInfoStream`。
     public let isPending: Bool
+    /// 成交交易的商品 id（0.4.0，R12）。SDK 发起的购买成功时（`transactionIdentifier != nil`）**恒非 nil**，
+    /// 取交易的 `productID`（升降级时可能与发起购买的商品不同，以交易为准）；取消 / 待定为 nil。
+    /// 对照 RC：`StoreTransaction.productIdentifier`。
+    public let productIdentifier: String?
+    /// 成交交易的购买时间（0.4.0，R12）。成功时**恒非 nil**（交易的 `purchaseDate`）；取消 / 待定为 nil。
+    /// 对照 RC：`StoreTransaction.purchaseDate`。
+    public let purchaseDate: Date?
 
     public init(customerInfo: CustomerInfo, transactionIdentifier: String?, userCancelled: Bool) {
         self.init(customerInfo: customerInfo,
                   transactionIdentifier: transactionIdentifier,
+                  productIdentifier: nil,
+                  purchaseDate: nil,
                   userCancelled: userCancelled,
                   isPending: false)
     }
@@ -1004,8 +1281,25 @@ public struct PurchaseResult: Sendable {
                 transactionIdentifier: String?,
                 userCancelled: Bool,
                 isPending: Bool) {
+        self.init(customerInfo: customerInfo,
+                  transactionIdentifier: transactionIdentifier,
+                  productIdentifier: nil,
+                  purchaseDate: nil,
+                  userCancelled: userCancelled,
+                  isPending: isPending)
+    }
+
+    /// 0.4.0 起的完整构造器（带成交交易的商品 id 与购买时间）。
+    public init(customerInfo: CustomerInfo,
+                transactionIdentifier: String?,
+                productIdentifier: String?,
+                purchaseDate: Date?,
+                userCancelled: Bool,
+                isPending: Bool) {
         self.customerInfo = customerInfo
         self.transactionIdentifier = transactionIdentifier
+        self.productIdentifier = productIdentifier
+        self.purchaseDate = purchaseDate
         self.userCancelled = userCancelled
         self.isPending = isPending
     }
