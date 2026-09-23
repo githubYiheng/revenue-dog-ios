@@ -84,6 +84,10 @@ actor PurchasesOrchestrator {
     private var inFlightTransactionIDs: Set<String> = []
     /// M-2b 前台重扫的单飞闸（前后台抖动不叠加扫描）。
     private var isForegroundRescanning = false
+    /// 回前台刷新 CustomerInfo 的单飞闸（同上）。
+    private var isForegroundRefreshing = false
+    /// 进程内第一次回前台（ADR 0075 第 1 条，Android / RC Android 同款）：那一次无条件刷新。
+    private var firstTimeInForeground = true
 
     /// customerInfoStream 的多播出口（设计 §6 铁律 2：观察者通知一律异步派发）。
     private var customerInfoContinuations: [UUID: AsyncStream<CustomerInfo>.Continuation] = [:]
@@ -1285,6 +1289,33 @@ actor PurchasesOrchestrator {
     /// 复用**同一条**启动扫描路径 `replayPendingPurchases()`
     /// （= 待重放上下文 + `Transaction.unfinished` + `Transaction.currentEntitlements`），
     /// 不写第二套；去重全靠台账（#10 / #2），已上报过的不会重发。
+    /// 回前台按 TTL 刷新 CustomerInfo（RC `updateAllCachesIfNeeded` 的 CustomerInfo 半边；
+    /// Android SDK 同款 `refreshCustomerInfoOnForeground`）。
+    ///
+    /// 权益到期判定 3 天内以服务端 `request_date` 为参照（设计 §4），**缓存不刷新就不会自己变成过期**——
+    /// 试用未转化、服务端已收权，端上仍按上一份缓存显示有效，直到下一次拉取。宿主不是每次都会主动调
+    /// `customerInfo()`，所以回前台这一刻由 SDK 自己按 5 分钟 TTL 补一次；冷启动 `didBecomeActive`
+    /// 也会触发，等于启动期就把缓存拉齐（此前启动只解析身份、不拉 CustomerInfo）。
+    ///
+    /// - 进程内第一次：无条件拉（`fetchCurrent`，ADR 0075 第 1 条）；之后缓存未过期就不发请求、
+    ///   不推 observer（`notStaleCachedOrFetched`）。
+    /// - 身份门控（ADR 0046）待确认：跳过且**不消耗**「第一次」—— 持久化的是待确认的旧具名身份，
+    ///   拉了就是把旧客户的权益推给宿主；确认那次 `logIn` / `logOut` 自己会拉。
+    /// - 失败只记日志、沿用缓存（`customerInfo()` 内部已对 5xx 回落 stale 缓存）。
+    func refreshCustomerInfoOnForeground() async {
+        guard identityGate != .pending, identityGate != .undetermined else { return }
+        guard !isForegroundRefreshing else { return }
+        isForegroundRefreshing = true
+        defer { isForegroundRefreshing = false }
+        let firstTime = firstTimeInForeground
+        firstTimeInForeground = false
+        do {
+            _ = try await customerInfo(fetchPolicy: firstTime ? .fetchCurrent : .notStaleCachedOrFetched)
+        } catch {
+            Log.warn("回前台刷新 CustomerInfo 失败（沿用缓存）：\(error)", category: "customer-info")
+        }
+    }
+
     func rescanOnForegroundIfObserving() async {
         // 只在观察者模式做：`.revenueDog` 下 Dog 自己发起购买、自己 finish，
         // updates + 启动扫描已经覆盖，前台再扫是纯浪费。

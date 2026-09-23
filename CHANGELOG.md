@@ -5,6 +5,18 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-23
+
+**修订号：公开 API 无差异**（基线 444 不变）。破坏性变更：无。
+
+### 修复
+
+- **回前台按 TTL 刷新 CustomerInfo**（RC `updateAllCachesIfNeeded` / Android SDK 同款）。此前 `didBecomeActive` 只做观察者模式的
+  交易重扫，不刷新 CustomerInfo；而权益到期判定 3 天内以服务端 `request_date` 为参照，缓存不刷新就不会自己变成过期 ——
+  试用未转化、服务端已收权的用户，端上要等宿主主动调 `customerInfo()` 才看到权益下掉。现在回前台（含冷启动那一次）刷新：
+  进程内第一次无条件拉，之后缓存超 5 分钟才拉，结果推给 `customerInfoStream` / delegate；缓存新鲜不发请求、不重复推；身份待确认
+  （`waitsForLogInBeforeSync`）期间跳过；拉取失败沿用缓存。公开 API 无变化。
+
 ## [0.3.0] - 2026-09-13
 
 **次版本：公开 API 只「增」1 个符号**（基线 443 → 444：`Configuration.with(waitsForLogInBeforeSync:)`，diff 只有 `+` 行）。

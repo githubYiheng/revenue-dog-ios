@@ -608,8 +608,12 @@ public final class Purchases {
         // 看到购买方 `purchase()` 返回的那笔**（Apple 只保证走 `PurchaseResult`）。
         // 先 await 启动流程，避免与启动扫描叠加、也避免身份未就绪就上报。
         // 身份门控（ADR 0046）：待确认期间编排层直接跳过重扫；已确认时先等确认触发的那次补投。
+        //
+        // 回前台先按 TTL 刷新 CustomerInfo（RC / Android 同款，见编排层 `refreshCustomerInfoOnForeground`），
+        // 再做观察者模式的重扫：试用到期、服务端已收权的用户，回前台这一刻就能拿到最新权益。
         Task { [weak self] in
             await self?.awaitStart()
+            await self?.orchestrator.refreshCustomerInfoOnForeground()
             await self?.orchestrator.rescanOnForegroundIfObserving()
         }
     }
