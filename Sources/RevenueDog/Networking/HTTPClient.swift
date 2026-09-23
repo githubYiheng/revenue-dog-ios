@@ -403,7 +403,12 @@ actor HTTPClient {
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
-    private let decoder = JSONDecoder()
+    private let decoder = HTTPClient.makeResponseDecoder()
+
+    /// 后端响应体的解码器（唯一出处）。日期由 wire 模型自己按字符串解析（`WireDateValue`），
+    /// 这里**不设** `dateDecodingStrategy`。SPI 测试工厂（`CustomerInfo/Offerings.fromBackendResponse`）
+    /// 走同一个构造，保证与网络路径解码一致。
+    static func makeResponseDecoder() -> JSONDecoder { JSONDecoder() }
 
     init(apiKey: String,
          baseURL: URL,

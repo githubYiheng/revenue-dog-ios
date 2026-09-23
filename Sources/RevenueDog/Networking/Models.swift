@@ -1053,6 +1053,14 @@ public struct Offerings: Sendable, Hashable, Codable {
         }
         return Offerings(all: filled, currentOfferingIdentifier: currentOfferingIdentifier)
     }
+
+    /// 同上，入参为商品数组（按 `productIdentifier` 建索引；同 id 重复时后者覆盖前者，
+    /// 与编排层逐个写字典的旧行为一致）。编排层与 SPI 工厂 `fromBackendResponse(_:products:)` 共用这一处。
+    func fillingStoreProducts(_ products: [StoreProduct]) -> Offerings {
+        let byIdentifier = Dictionary(products.map { ($0.productIdentifier, $0) },
+                                      uniquingKeysWith: { _, last in last })
+        return fillingStoreProducts(from: byIdentifier)
+    }
 }
 
 // MARK: - 公开模型：订阅周期与介绍性优惠（由 StoreKit 填充，供宿主做定价文案）

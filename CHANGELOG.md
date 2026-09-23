@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-23
+
+**修订号**（基线 498 → 500 行；diff 只有 `+` 行，2 行全是 SPI）。**破坏性变更：无**。
+为什么是修订号而不是次版本：新增的两个入口都在 `@_spi(RevenueDogInternal)` 后面，**不是对宿主的公开承诺**，
+宿主可见的公开面零变化；基线行数变化只是 SPI 按 0.4.0 先例入清单（带 `[SPIAccessControl]`）。主代理裁定。
+用途：Flutter 插件 Bridge 单测构造与网络路径逐字段一致的模型，与 Android 0.2.0 `RevenueDogTestModels` 对称（主代理裁定 7）。
+
+### 新增（SPI，非宿主承诺）
+
+- `CustomerInfo.fromBackendResponse(_ data: Data, now: Date = Date()) throws -> CustomerInfo`：`GET /v1/subscribers/{id}`
+  响应体（契约 §2.2）→ 公开模型。与网络路径**同一解码**（同一个响应解码器 → `CustomerInfoWireModel` → `CustomerInfo(wireModel:now:)`）；
+  `now` 为 `isActive` 的本地参照时间（仍受 `request_date` 3 天 grace 规则约束），可注入以得到确定结果。
+- `Offerings.fromBackendResponse(_ data: Data, products: [StoreProduct]) throws -> Offerings`：offerings 响应体 → 公开模型，
+  按 `platformProductIdentifier` 挂上 `products`；挂不上的 package `storeProduct == nil`，与真实路径一致。
+- 两者遇坏 JSON / 缺契约必填字段时抛解码错误，不崩。
+
+### 内部
+
+- 挂 `StoreProduct` 的逻辑收成 `Offerings.fillingStoreProducts(_:)` 一处，编排层 `offerings()` 与上面的工厂共用（不复制）；
+  后端响应解码器收成 `HTTPClient.makeResponseDecoder()` 一处。行为不变。
+- `X-Version` 变为 `0.4.1`（出站请求快照同步）。
+
 ## [0.4.0] - 2026-09-23
 
 **次版本：公开 API 只「增」**（基线 444 → 498 行；diff 只有 `+` 行，其中 SPI 3 行）。**破坏性变更：无**，现有 `init` 全部保留、不标 deprecated。

@@ -58,6 +58,7 @@ Func Configuration.with(transport:)
 Func Configuration.with(waitsForLogInBeforeSync:)
 Func CustomerInfo.__derived_struct_equals(_:_:)  [Implements]
 Func CustomerInfo.encode(to:)
+Func CustomerInfo.fromBackendResponse(_:now:)  [SPIAccessControl]
 Func CustomerInfo.hash(into:)
 Func EntitlementDiffResult.Diff.__derived_struct_equals(_:_:)  [Implements]
 Func EntitlementDiffResult.Diff.encode(to:)
@@ -102,6 +103,7 @@ Func Offering.hash(into:)
 Func Offering.package(ofType:)
 Func Offerings.__derived_struct_equals(_:_:)  [Implements]
 Func Offerings.encode(to:)
+Func Offerings.fromBackendResponse(_:products:)  [SPIAccessControl]
 Func Offerings.hash(into:)
 Func OwnershipType.__derived_struct_equals(_:_:)  [Implements]
 Func OwnershipType.encode(to:)

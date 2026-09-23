@@ -628,12 +628,12 @@ actor PurchasesOrchestrator {
         guard !wanted.isEmpty else { return (offerings, []) }
         guard let found = try? await storeKit.products(forIdentifiers: wanted) else { return (offerings, nil) }
 
-        var products: [String: StoreProduct] = [:]
+        var products: [StoreProduct] = []
         for product in found {
-            products[product.productIdentifier] = await product.makeStoreProduct()
+            products.append(await product.makeStoreProduct())
         }
-        let notFound = wanted.subtracting(products.keys).sorted()
-        return (offerings.fillingStoreProducts(from: products), notFound)
+        let notFound = wanted.subtracting(products.map(\.productIdentifier)).sorted()
+        return (offerings.fillingStoreProducts(products), notFound)
     }
 
     // MARK: - 事件多播
