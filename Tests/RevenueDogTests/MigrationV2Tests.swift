@@ -367,7 +367,8 @@ struct MigrationV2Tests {
         let (purchases, _, _) = makeMigrationPurchases(transport: transport)
 
         let requestDate = Date(timeIntervalSince1970: 1_787_961_600)      // 固定，方便断言毫秒
-        let proExpires = Date(timeIntervalSince1970: 1_790_553_600)
+        // 相对当前时间取（整秒）：写死的日期一过期，这条权益就不再算 active
+        let proExpires = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 + 30 * 86_400).rounded())
         // MockTransport 只剩一条 stub 时是「粘性」复用，所以两条必须在第一次请求之前排好。
         await transport.enqueue(.json(subscriberWithEntitlementsJSON(requestDate: requestDate,
                                                                     proExpires: proExpires)))

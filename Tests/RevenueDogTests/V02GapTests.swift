@@ -278,6 +278,9 @@ struct V02PurchaseResultTests {
         let result = try #require(events.last { $0.type == DiagnosticsEventType.purchaseResult })
         #expect(result.fields["error_code"] == .string("purchasePendingServerConfirmation"))
         #expect(result.fields["outcome"] == .string(DiagnosticsPurchaseOutcome.error))
+        // ADR 0129：一次失败只记一条（0.4.1 会在外层 catch 再记一条不带 transaction_id 的）
+        #expect(events.filter { $0.type == DiagnosticsEventType.purchaseResult }.count == 1)
+        #expect(result.fields["transaction_id"] == .string("tx-c-\(status)"))
     }
 
     @Test("C：确定性 4xx（400）→ purchaseRejectedByServer，交易已 finish，带后端错误体码")

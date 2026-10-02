@@ -82,6 +82,12 @@ actor PurchasesOrchestrator {
     private(set) var appTransactionJWS: String?
     /// 内存级同交易去重（purchase() 直接结果与 updates 流可能双到）。
     private var inFlightTransactionIDs: Set<String> = []
+    /// 进行中的 `purchase()`，按商品 id 登记（对齐 RC `inFlightPurchasesByProductID`，ADR 0129）：
+    /// updates 流里同商品的交易排在它后面处理，保证带上下文的购买上报先到、`purchase()` 拿到真实结果。
+    private var inFlightPurchaseTokens: [String: Set<UUID>] = [:]
+    /// 这些进行中的购买已经有终局的交易 id（后端 2xx 收下，或确定性拒绝并已 finish）；放行等待者时一并交给它们。
+    private var inFlightPurchaseSettledIDs: [String: Set<String>] = [:]
+    private var inFlightPurchaseWaiters: [String: [CheckedContinuation<Set<String>, Never>]] = [:]
     /// M-2b 前台重扫的单飞闸（前后台抖动不叠加扫描）。
     private var isForegroundRescanning = false
     /// 回前台刷新 CustomerInfo 的单飞闸（同上）。
@@ -245,6 +251,17 @@ actor PurchasesOrchestrator {
             "environment": StoreEnvironmentCache.appTransactionEnvironment.map { .string($0) },
         ])
 
+        // ADR 0129（对齐 RC）：updates 流里的交易排在同商品进行中的 `purchase()` 之后。
+        // StoreKit 会把刚买的那笔同时投给 updates，且可能比 `purchase()` 的返回值更早到；
+        // 让它先处理的话，`purchase()` 那一路会被下面的去重判 `.skipped`、宿主收到 901。
+        // 确知的续订不等（它不可能是这次购买）。
+        // 与 RC 的一处不同：等完之后，购买那一路已经有终局的同一笔（后端收下 / 确定性拒绝）不再报第二次
+        // （坑 #14：一笔交易一次带归因的 POST）；购买那一路没有终局的（可重试失败 / 取消 / pending）照常往下走。
+        if source == .updates, !transaction.isKnownRenewal {
+            let settled = await awaitInFlightPurchaseIfNeeded(productIdentifier: transaction.productIdentifier)
+            if settled.contains(txID) { return .skipped }
+        }
+
         // 内存级去重：同一交易同时从 purchase() 与 updates 到达时只处理一次
         if inFlightTransactionIDs.contains(txID) { return .skipped }
         inFlightTransactionIDs.insert(txID)
@@ -334,6 +351,38 @@ actor PurchasesOrchestrator {
             Log.warn("交易上报暂时失败，保留待重放（tx=\(txID)）：\(error.description)", category: "purchase")
             _ = try? await pendingPurchases.incrementReplayCount(forKey: txID)
             return .pendingServerConfirmation(error)
+        }
+    }
+
+    // MARK: - 进行中的购买（ADR 0129）
+
+    /// 登记一次进行中的购买。必须在发起 StoreKit 购买**之前**调用，这样交易一出现在 updates 里就一定查得到。
+    private func beginInFlightPurchase(productIdentifier: String) -> UUID {
+        let token = UUID()
+        inFlightPurchaseTokens[productIdentifier, default: []].insert(token)
+        return token
+    }
+
+    /// 购买结束（成功 / 失败 / 取消 / pending 都算）：该商品没有其它进行中的购买时放行等待者。
+    /// - Parameter settledTransactionID: 这次购买已有终局的交易 id（后端 2xx 收下，或确定性拒绝）；没有终局传 nil。
+    private func endInFlightPurchase(productIdentifier: String, token: UUID, settledTransactionID: String?) {
+        if let settledTransactionID {
+            inFlightPurchaseSettledIDs[productIdentifier, default: []].insert(settledTransactionID)
+        }
+        inFlightPurchaseTokens[productIdentifier]?.remove(token)
+        guard inFlightPurchaseTokens[productIdentifier]?.isEmpty != false else { return }
+        inFlightPurchaseTokens.removeValue(forKey: productIdentifier)
+        let settled = inFlightPurchaseSettledIDs.removeValue(forKey: productIdentifier) ?? []
+        let waiters = inFlightPurchaseWaiters.removeValue(forKey: productIdentifier) ?? []
+        for waiter in waiters { waiter.resume(returning: settled) }
+    }
+
+    /// 同商品有进行中的购买就等它结束。返回那些购买已有终局的交易 id（没有进行中的购买时为空）。
+    private func awaitInFlightPurchaseIfNeeded(productIdentifier: String) async -> Set<String> {
+        guard inFlightPurchaseTokens[productIdentifier]?.isEmpty == false else { return [] }
+        Log.debug("updates 交易等待同商品进行中的购买先完成上报（product=\(productIdentifier)）", category: "purchase")
+        return await withCheckedContinuation { continuation in
+            inFlightPurchaseWaiters[productIdentifier, default: []].append(continuation)
         }
     }
 
@@ -721,6 +770,13 @@ actor PurchasesOrchestrator {
         // 诊断（契约 §1.3）：`purchase()` 进入。initiation_key 在下面才算得出来，
         // 但「进入」这个事实必须在任何一次 throw 之前落下 —— 否则「用户点了买、然后什么都没发生」
         // 这种最常见的报障在事件流里根本看不见。
+        // ADR 0129：先登记、再做任何 await —— 交易到达 updates 时一定查得到这次购买。
+        let inFlightToken = beginInFlightPurchase(productIdentifier: productIdentifier)
+        var settledTransactionID: String?
+        defer {
+            endInFlightPurchase(productIdentifier: productIdentifier, token: inFlightToken,
+                                settledTransactionID: settledTransactionID)
+        }
         let purchaseStartedAt = Date()
         let initiationKey = PendingPurchaseStore.initiationKey(productIdentifier: productIdentifier)
         await diagnostics.record(DiagnosticsEventType.purchaseStarted, fields: [
@@ -729,6 +785,8 @@ actor PurchasesOrchestrator {
             "initiation_key": .string(initiationKey),
         ])
 
+        // 扣款后上报失败那条 error 已在抛出点记过；外层 catch 不再记第二条。
+        var failureRecorded = false
         do {
             guard completedBy == .revenueDog else {
                 throw PurchasesError(code: .configurationError,
@@ -807,6 +865,7 @@ actor PurchasesOrchestrator {
             // 单一处理通道（C2-A）：直接结果与 updates 汇入同一 handle()
             let outcome = await handle(transaction: transaction, source: .purchase)
             if let info = outcome.customerInfo {
+                settledTransactionID = transaction.transactionIdentifier
                 await recordPurchaseResult(productIdentifier: productIdentifier,
                                            outcome: DiagnosticsPurchaseOutcome.success,
                                            transactionID: transaction.transactionIdentifier,
@@ -821,15 +880,19 @@ actor PurchasesOrchestrator {
             }
             // C：**钱已经扣了**，上报没成 —— 两种后果完全不同，必须给宿主两个码位，
             // 不再共用一个裸 `.networkError`（宿主拿它没法决定给不给用户兜底）。
+            // 确定性拒绝也是终局（已 finish、上下文已删），updates 那一路不必再报一次拿同一个 4xx。
+            if case .rejectedByServer = outcome { settledTransactionID = transaction.transactionIdentifier }
             let postFailure = Self.postFailureError(outcome, transactionID: transaction.transactionIdentifier)
             await recordPurchaseResult(productIdentifier: productIdentifier,
                                        outcome: DiagnosticsPurchaseOutcome.error,
                                        transactionID: transaction.transactionIdentifier,
                                        startedAt: purchaseStartedAt, error: postFailure)
+            failureRecorded = true
             throw postFailure
         }
         } catch {
             // `purchase()` 抛出（含商品不存在 / 弹窗前失败 / StoreKit 取消）：一律留一条 error 级事件。
+            if failureRecorded { throw error }
             await recordPurchaseResult(productIdentifier: productIdentifier,
                                        outcome: Self.isUserCancelledOutcome(error)
                                            ? DiagnosticsPurchaseOutcome.cancelled

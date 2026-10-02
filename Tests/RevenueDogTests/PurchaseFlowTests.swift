@@ -270,6 +270,133 @@ struct PurchaseFlowTests {
         #expect(receiptCalls.isEmpty)
     }
 
+    @Test("ADR 0129：同一笔交易先从 updates 到达 —— purchase() 仍返回成功，只有一次带上下文的上报")
+    func updatesArrivingBeforePurchaseReturnsWaitsBehindPurchase() async throws {
+        let (purchases, transport, provider) = makePurchases()
+        await transport.enqueue(.json(subscriberJSON())) // customerInfo 预热 + 触发 start()（挂 updates 消费者）
+        _ = try await purchases.customerInfo()
+
+        let flag = FinishFlag()
+        let tx = FakeTransaction(transactionIdentifier: "tx-600", originalTransactionIdentifier: "tx-600",
+                                 productIdentifier: "com.demo.monthly", purchaseDate: Date(),
+                                 expirationDate: Date().addingTimeInterval(3600),
+                                 jwsRepresentation: "h.p7.s", finishFlag: flag)
+        // 生产实证的时序（audit/2026-10-02-ios-901-inflight-race.md）：StoreKit 先把交易投给 updates，
+        // 约 0.5 秒后 `Product.purchase()` 才返回。
+        await provider.scriptPurchaseAsync { [provider] _ in
+            await provider.emit(tx)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            return .success(tx)
+        }
+        await transport.enqueue(.json(subscriberJSON())) // 购买上报
+
+        let result = try await purchases.purchase(
+            product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
+                                  price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
+        #expect(result.transactionIdentifier == "tx-600")
+        #expect(flag.value)
+
+        // updates 那一路等购买结束后发现同一笔已报上去，不再报第二次（坑 #14）
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        let bodies = try await transport.requests(forPath: "/receipts").map {
+            try JSONSerialization.jsonObject(with: $0.httpBody!) as! [String: Any]
+        }
+        #expect(bodies.count == 1)
+        #expect(bodies.first?["initiation_source"] as? String == "purchase")
+    }
+
+    @Test("ADR 0129：别的商品的 updates 交易不等进行中的购买")
+    func updatesForOtherProductDoesNotWait() async throws {
+        let (purchases, transport, provider) = makePurchases()
+        await transport.enqueue(.json(subscriberJSON()))
+        _ = try await purchases.customerInfo()
+
+        let other = FakeTransaction(transactionIdentifier: "tx-701", originalTransactionIdentifier: "tx-701",
+                                    productIdentifier: "com.demo.coins", purchaseDate: Date(),
+                                    expirationDate: nil, jwsRepresentation: "h.p8.s", finishFlag: FinishFlag())
+        let otherPostedDuringPurchase = FinishFlag()
+        await provider.scriptPurchaseAsync { [provider, transport] productID in
+            await provider.emit(other)
+            // 购买还没返回，另一个商品的交易就该已经报上去了
+            for _ in 0..<100 {
+                if await transport.callCount(forPath: "/receipts") == 1 { otherPostedDuringPurchase.markFinished(); break }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            return .userCancelled
+        }
+        // 预热那条 stub 是粘性的：另一商品的上报与取消后的 customerInfo 都复用它，无需再排。
+
+        let result = try await purchases.purchase(
+            product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
+                                  price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
+        #expect(result.userCancelled)
+        #expect(otherPostedDuringPurchase.value)
+    }
+
+    @Test("ADR 0129：购买上报可重试失败 → purchase() 报带状态码的 901；等在后面的 updates 一路照常再报，不被跳过")
+    func retryablePurchaseFailureLetsWaitingUpdatesRepost() async throws {
+        let (purchases, transport, provider) = makePurchases()
+        await transport.enqueue(.json(subscriberJSON()))
+        _ = try await purchases.customerInfo()
+
+        let flag = FinishFlag()
+        let tx = FakeTransaction(transactionIdentifier: "tx-900", originalTransactionIdentifier: "tx-900",
+                                 productIdentifier: "com.demo.monthly", purchaseDate: Date(),
+                                 expirationDate: Date().addingTimeInterval(3600),
+                                 jwsRepresentation: "h.p10.s", finishFlag: flag)
+        await provider.scriptPurchaseAsync { [provider] _ in
+            await provider.emit(tx)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            return .success(tx)
+        }
+        await transport.enqueue(.failure(statusCode: 500), forPath: "/receipts") // 路径队列粘住：每次都 500
+
+        var thrown: PurchasesError?
+        do {
+            _ = try await purchases.purchase(
+                product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
+                                      price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
+        } catch let error as PurchasesError {
+            thrown = error
+        }
+        let error = try #require(thrown)
+        #expect(error.code == .purchasePendingServerConfirmation)
+        #expect(error.httpStatusCode == 500) // 真上报失败带状态码；竞态误报的 901 不带
+        let countAtThrow = await transport.callCount(forPath: "/receipts")
+        #expect(countAtThrow >= 1) // 购买那一路确实自己报了（没被 updates 抢走）
+
+        let reposted = await waitUntil { await transport.callCount(forPath: "/receipts") > countAtThrow }
+        #expect(reposted)
+        #expect(!flag.value) // 5xx 绝不 finish
+    }
+
+    @Test("ADR 0129：购买以取消结束也放行等待者 —— 同商品的 updates 交易随后照常上报")
+    func waitersReleasedWhenPurchaseEndsWithoutTransaction() async throws {
+        let (purchases, transport, provider) = makePurchases()
+        await transport.enqueue(.json(subscriberJSON()))
+        _ = try await purchases.customerInfo()
+
+        let flag = FinishFlag()
+        let earlier = FakeTransaction(transactionIdentifier: "tx-800", originalTransactionIdentifier: "tx-800",
+                                      productIdentifier: "com.demo.monthly", purchaseDate: Date(),
+                                      expirationDate: Date().addingTimeInterval(3600),
+                                      jwsRepresentation: "h.p9.s", finishFlag: flag)
+        await provider.scriptPurchaseAsync { [provider] _ in
+            await provider.emit(earlier)
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            return .userCancelled
+        }
+        let result = try await purchases.purchase(
+            product: StoreProduct(productIdentifier: "com.demo.monthly", localizedTitle: "", localizedDescription: "",
+                                  price: 9.99, currencyCode: "USD", localizedPriceString: "$9.99"))
+        #expect(result.userCancelled)
+        await transport.enqueue(.json(subscriberJSON()))
+        let posted = await waitUntil { await transport.callCount(forPath: "/receipts") == 1 }
+        #expect(posted)
+        let finished = await waitUntil { flag.value }
+        #expect(finished)
+    }
+
     @Test("#10：.myApp 模式 —— SDK 拒绝发起购买；updates 观察上报但不 finish；台账去重")
     func observerMode() async throws {
         let (purchases, transport, provider) = makePurchases(completedBy: .myApp)

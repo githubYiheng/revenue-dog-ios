@@ -39,11 +39,19 @@ protocol StoreTransactionType: Sendable {
     var appAccountToken: UUID? { get }
     /// SK2 JWS 原文 —— 上报 `POST /v1/receipts` 的 `fetch_token`（裁决 F8：不做 base64）。
     var jwsRepresentation: String? { get }
+    /// **确知**是续订（SK2 `Transaction.reason == .renewal`，iOS 17+）。iOS 16 拿不到 reason，一律 false。
+    /// 续订从来不是 `purchase()` 发起的，不需要排在进行中的购买后面（对齐 RC，ADR 0129）。
+    var isKnownRenewal: Bool { get }
     /// 是否已 finish。
     var isFinished: Bool { get async }
 
     /// **铁律 P2**：后端 200 落库前绝不调用。
     func finish() async
+}
+
+extension StoreTransactionType {
+    /// 默认「不确知」：测试替身与拿不到 reason 的系统版本都落在这里。
+    var isKnownRenewal: Bool { false }
 }
 
 /// 商品抽象。**internal**，理由同 `StoreTransactionType`。
@@ -200,6 +208,11 @@ struct SK2Transaction: StoreTransactionType {
     var revocationDate: Date? { underlying.revocationDate }
     var isUpgraded: Bool { underlying.isUpgraded }
     var appAccountToken: UUID? { underlying.appAccountToken }
+
+    var isKnownRenewal: Bool {
+        if #available(iOS 17.0, macOS 14.0, *) { return underlying.reason == .renewal }
+        return false
+    }
 
     var isFinished: Bool {
         get async {

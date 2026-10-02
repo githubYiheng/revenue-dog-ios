@@ -5,6 +5,23 @@
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-10-02
+
+**修订号**（公开 API 基线无差异）。**破坏性变更：无**。宿主无需改代码，升级即可。
+
+### 修复
+
+- **扣款成功后误报 `purchasePendingServerConfirmation`（901）**：StoreKit 会把刚买的那笔交易同时投给 `Transaction.updates`，
+  有时比 `Product.purchase()` 的返回值更早到。0.4.1 里先到的 updates 一路占住内存去重，`purchase()` 这一路被判「跳过」，
+  宿主在上报还没返回时就收到 901（生产 80 笔购买里 6 笔；后端全部 200，钱与权益无损，1–3 秒后经 `customerInfoStream` 到账）。
+  现在 `purchase()` 发起前按商品登记「进行中的购买」，updates 里同商品的交易排在它后面处理（做法同 RevenueCat purchases-ios 的
+  `inFlightPurchasesByProductID`）；购买那一路已报上去的同一笔不再报第二次。确知的续订（iOS 17+ `Transaction.reason == .renewal`）不排队。ADR 0129。
+- 扣款后上报失败时 `purchase_result` 诊断事件记了两条（第二条不带 `transaction_id`）；现在只记一条。
+
+### 内部
+
+- `X-Version` 变为 `0.4.2`（出站请求快照同步）。
+
 ## [0.4.1] - 2026-09-23
 
 **修订号**（基线 498 → 500 行；diff 只有 `+` 行，2 行全是 SPI）。**破坏性变更：无**。
