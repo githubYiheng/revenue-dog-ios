@@ -192,6 +192,7 @@ Func SubscriptionPeriod.Unit.hash(into:)
 Func SubscriptionPeriod.__derived_struct_equals(_:_:)  [Implements]
 Func SubscriptionPeriod.encode(to:)
 Func SubscriptionPeriod.hash(into:)
+Func SubscriptionPeriod.normalized()
 Protocol HTTPTransport
 Protocol LogSink
 Protocol PurchasesDelegate  [Custom]

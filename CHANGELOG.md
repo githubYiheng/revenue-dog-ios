@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-10
+
+**只修一处兼容**：订阅周期归一化（ADR 0135）。公开 API **只增**一个方法，运行时行为只在 StoreKit 报「7 day / 12 month」时有别。
+
+### 修复：StoreKit 把 1 周报成 7 天时，`subscriptionPeriod` 现在给 `week`
+
+- 现象：iOS 26.3 沙盒（storefront USA）对 ASC 配成 ONE_WEEK 的商品，`Product.subscription.subscriptionPeriod` 返回 `unit=.day, value=7`；年卡返回 `year/1`。RC SDK 一直在 `SubscriptionPeriod.normalized()` 里把它折回 `week/1`（`StoreKitWorkarounds.swift`，注释引 react-native-purchases#348），所以 RC 时代按 `unit == .week` 匹配的付费墙没事；我方 0.4.2 透传原值，Bible Widget 直切时周卡匹配不到（10-10 00:02 真机实证）。
+- 修法：`SubscriptionPeriod.normalized()`（新增，public）：day 为 7 的倍数 → week，month 为 12 的倍数 → year，其余原样，幂等；`StoreProduct.subscriptionPeriod` 与 `IntroductoryOffer.period` 由 StoreKit 填充时一律先过它（与 RC 的两处调用点一一对应）。
+- 宿主无需改代码；已在自己映射层做了同样归一化的宿主可删可留（幂等）。
+
 ## [0.4.2] - 2026-10-02
 
 **修订号**（公开 API 基线无差异）。**破坏性变更：无**。宿主无需改代码，升级即可。

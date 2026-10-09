@@ -1099,6 +1099,20 @@ public struct SubscriptionPeriod: Sendable, Hashable, Codable, CustomStringConve
     /// 单位数量（`value = 3` + `unit = .month` = 三个月）。
     public let value: Int
 
+    /// 把 StoreKit 偶发的「7 day」「12 month」折成「1 week」「1 year」（day 为 7 的倍数、month 为 12 的倍数才折，
+    /// 否则原样）。与 RC `SubscriptionPeriod.normalized()` 同规则，幂等。SDK 填充 `StoreProduct.subscriptionPeriod`
+    /// 与 `IntroductoryOffer.period` 时已调用，宿主一般不需要再调。
+    public func normalized() -> SubscriptionPeriod {
+        switch unit {
+        case .day where value > 0 && value % 7 == 0:
+            return SubscriptionPeriod(unit: .week, value: value / 7)
+        case .month where value > 0 && value % 12 == 0:
+            return SubscriptionPeriod(unit: .year, value: value / 12)
+        default:
+            return self
+        }
+    }
+
     public init(unit: Unit, value: Int) {
         self.unit = unit
         self.value = value

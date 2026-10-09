@@ -270,6 +270,9 @@ struct SK2Product: StoreProductType {
                                  isEligible: isEligible)
     }
 
+    /// StoreKit 偶尔把 1 周的商品 / 优惠报成 `7 day`（ADR 0135，实测 iOS 26.3 沙盒），
+    /// 按 RC `SubscriptionPeriod.normalized()` 同款规则归一化：day 为 7 的倍数折 week、month 为 12 的倍数折 year。
+    /// 商品周期与介绍性优惠周期都经此处。
     private static func period(_ period: Product.SubscriptionPeriod) -> SubscriptionPeriod {
         let unit: SubscriptionPeriod.Unit
         switch period.unit {
@@ -281,7 +284,7 @@ struct SK2Product: StoreProductType {
             Log.warn("未知订阅周期单位，按 unknown 处理", category: "storekit")
             unit = .unknown
         }
-        return SubscriptionPeriod(unit: unit, value: period.value)
+        return SubscriptionPeriod(unit: unit, value: period.value).normalized()
     }
 
     private static func offerType(_ mode: Product.SubscriptionOffer.PaymentMode) -> IntroductoryOffer.OfferType {
