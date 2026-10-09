@@ -13,7 +13,14 @@ struct SubscriptionPeriodNormalizationTests {
         #expect(SubscriptionPeriod(unit: .month, value: 24).normalized() == SubscriptionPeriod(unit: .year, value: 2))
     }
 
-    @Test("不整除、week / year / unknown、零值一律原样；幂等")
+    @Test("与 RC 逐字同规则：0 与负数也按倍数折（RC isMultiple(of:) 语义）")
+    func matchesRevenueCatEdgeSemantics() {
+        #expect(SubscriptionPeriod(unit: .day, value: 0).normalized() == SubscriptionPeriod(unit: .week, value: 0))
+        #expect(SubscriptionPeriod(unit: .month, value: 0).normalized() == SubscriptionPeriod(unit: .year, value: 0))
+        #expect(SubscriptionPeriod(unit: .day, value: -7).normalized() == SubscriptionPeriod(unit: .week, value: -1))
+    }
+
+    @Test("不整除、week / year / unknown 一律原样；幂等")
     func leavesOthersUntouched() {
         for period in [
             SubscriptionPeriod(unit: .day, value: 3),
@@ -23,7 +30,6 @@ struct SubscriptionPeriodNormalizationTests {
             SubscriptionPeriod(unit: .week, value: 1),
             SubscriptionPeriod(unit: .year, value: 1),
             SubscriptionPeriod(unit: .unknown, value: 7),
-            SubscriptionPeriod(unit: .day, value: 0),
         ] {
             #expect(period.normalized() == period)
         }
