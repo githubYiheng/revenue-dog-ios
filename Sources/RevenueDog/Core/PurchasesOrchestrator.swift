@@ -49,6 +49,49 @@ enum TransactionHandleOutcome: Sendable {
     }
 }
 
+/// 一次 StoreKit 商品请求（含重试）的终局（ADR 0155）。在途合并时由多个调用方共享。
+private struct StoreProductsFetchResult: Sendable {
+    /// 最后一次成功时 StoreKit 返回的商品（可能不全）；重试后仍抛错时为空。
+    let products: [any StoreProductType]
+    /// StoreKit 实际调用次数（1...3）。
+    let attempts: Int
+    /// 重试后仍抛的错误；nil = 最后一次成功。
+    let error: (any Error)?
+}
+
+/// 在途的 StoreKit 商品请求（键 = 排序后的缺失 id 拼接）。
+/// `id` 防止旧请求摘掉替换它的新登记；`startedAt` 用于超龄判断（超龄不再接新等待者）。
+private struct InFlightStoreProductFetch {
+    let id: UUID
+    let startedAt: ContinuousClock.Instant
+    let task: Task<StoreProductsFetchResult, Never>
+}
+
+/// 统一商品查找入口的结果（ADR 0155）：offerings 补商品与购买路径共用。
+private struct StoreProductsLookup {
+    /// 查到的商品（本调用方自己的缓存快照 ∪ 本次 StoreKit 结果），只含请求的 id。
+    let products: [String: any StoreProductType]
+    /// 本调用方实际调 StoreKit 的次数（全命中缓存 / 合并进别人的请求 = 0）。
+    let attempts: Int
+    /// 从进程内缓存取到的商品数（按本调用方自己的快照）。
+    let fromCache: Int
+    /// 本次 StoreKit 查到的商品数（合并进来的调用方按共享结果算）。
+    let fetched: Int
+    /// 重试后仍抛的错误。
+    let error: (any Error)?
+
+    /// 无 StoreKit / 无需查找。
+    static let none = StoreProductsLookup(products: [:], attempts: 0, fromCache: 0, fetched: 0, error: nil)
+}
+
+/// 一个调用方补齐 storeProduct 的结果，连同 `offerings_fetch` 的商品诊断字段（ADR 0155 第 5 条）。
+private struct StoreProductsResolution {
+    let offerings: Offerings
+    /// 商店查不到的 id；只在最终 StoreKit 调用成功（或无需调用）时有值，抛错 / 无 StoreKit 时为 nil。
+    let notFoundProductIDs: [String]?
+    let lookup: StoreProductsLookup
+}
+
 actor PurchasesOrchestrator {
 
     let configuration: Configuration
@@ -136,6 +179,26 @@ actor PurchasesOrchestrator {
     private var identityPendingWarningTask: Task<Void, Never>?
     private var didWarnIdentityPending = false
 
+    // MARK: 商品（ADR 0155）
+
+    /// 第 n 次失败后、第 n+1 次尝试前的退避（1 s、2 s）。
+    static let storeProductsBackoffs: [Duration] = [.seconds(1), .seconds(2)]
+    /// StoreKit 商品请求最多尝试几次（首试 + 每个退避一次重试 = 3）；只对**抛错**重试。
+    static let storeProductsMaxAttempts = storeProductsBackoffs.count + 1
+    /// 在途请求超过这个时长就不再接新等待者（新调用方自己发请求）。
+    static let storeProductsInFlightMaxAgeDefault: Duration = .seconds(10)
+
+    /// 进程内商品缓存（键 = 商品 id，storefront 变化整体失效）。
+    private var storeProductCache = StoreProductCache()
+    /// 在途的 StoreKit 商品请求，键 = 排序后的缺失 id 拼接。同一缺失集合同一时刻只发一次。
+    private var inFlightStoreProductFetches: [String: InFlightStoreProductFetch] = [:]
+    /// 加入在途请求（而不是自己发）的次数。只做观测：单测用它确认并发合并真的发生了。
+    private(set) var storeProductFetchJoinCount = 0
+    /// 商品重试的退避等待。测试注入记录型实现，不真睡。
+    private let storeProductsBackoff: @Sendable (Duration) async -> Void
+    /// 在途请求的合并时限（默认 10 s；测试注入短值）。
+    private let storeProductsInFlightMaxAge: Duration
+
     init(configuration: Configuration,
          settings: RuntimeSettings,
          identity: IdentityManager,
@@ -149,7 +212,9 @@ actor PurchasesOrchestrator {
          attributesDirectory: URL,
          attributionState: any AttributionStateStorage = UserDefaultsAttributionStateStorage(),
          adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider(),
-         diagnostics: DiagnosticsRecorder) {
+         diagnostics: DiagnosticsRecorder,
+         storeProductsBackoff: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+         storeProductsInFlightMaxAge: Duration = PurchasesOrchestrator.storeProductsInFlightMaxAgeDefault) {
         self.configuration = configuration
         self.settings = settings
         self.identity = identity
@@ -167,6 +232,8 @@ actor PurchasesOrchestrator {
         self.attributionState = attributionState
         self.adServicesTokenProvider = adServicesTokenProvider
         self.diagnostics = diagnostics
+        self.storeProductsBackoff = storeProductsBackoff
+        self.storeProductsInFlightMaxAge = storeProductsInFlightMaxAge
         self.poster = TransactionPoster(httpClient: httpClient, diagnostics: diagnostics)
         self.ledger = (ledgerFileURL ?? (try? SyncedTransactionLedger.defaultFileURL()))
             .map { SyncedTransactionLedger(fileURL: $0) }
@@ -606,11 +673,16 @@ actor PurchasesOrchestrator {
         let appUserID = try await identity.appUserID
         let isBackgrounded = AppStateProvider.isBackgrounded
 
+        let cacheReadStartedAt = Date()
         let stale = await deviceCache.isOfferingsStale(appUserID: appUserID, isAppBackgrounded: isBackgrounded)
         if !stale, let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
             // 缓存里**不存** storeProduct（价格/文案是商店的当下事实，不该被我们冻在磁盘上），
-            // 读取时现补一次。
-            return await resolveStoreProducts(in: cached).offerings
+            // 读取时现补（先取进程内商品缓存，只把缺的交给 StoreKit，ADR 0155）。
+            let resolved = await resolveStoreProducts(in: cached)
+            // ADR 0155 第 5 条：磁盘缓存命中也记一条，商品拉取的盲区补上。
+            await recordOfferingsFetch(count: cached.all.count, cacheHit: true, products: resolved,
+                                       trace: HTTPCallTrace(), startedAt: cacheReadStartedAt, error: nil)
+            return resolved.offerings
         }
 
         let startedAt = Date()
@@ -622,26 +694,34 @@ actor PurchasesOrchestrator {
             // 缓存的是**后端下发的那份**（不含 storeProduct），读取时再补。
             await deviceCache.cache(offerings: offerings, appUserID: appUserID)
             let resolved = await resolveStoreProducts(in: offerings)
-            await recordOfferingsFetch(count: offerings.all.count,
-                                       notFoundProductIDs: resolved.notFoundProductIDs,
+            await recordOfferingsFetch(count: offerings.all.count, cacheHit: false, products: resolved,
                                        trace: trace, startedAt: startedAt, error: nil)
             return resolved.offerings
         } catch {
             if let cached = await deviceCache.cachedOfferings(appUserID: appUserID) {
                 Log.warn("offerings 拉取失败，回落缓存: \(error)", category: "offerings")
                 await diagnostics.warn(DiagnosticsWarningCode.offeringsCacheFallback)
-                await recordOfferingsFetch(count: cached.all.count, notFoundProductIDs: nil,
+                let resolved = await resolveStoreProducts(in: cached)
+                await recordOfferingsFetch(count: cached.all.count, cacheHit: true, products: resolved,
                                            trace: trace, startedAt: startedAt, error: error)
-                return await resolveStoreProducts(in: cached).offerings
+                return resolved.offerings
             }
-            await recordOfferingsFetch(count: nil, notFoundProductIDs: nil,
+            // 远端失败且无磁盘缓存：没有 offerings，cache_hit 不适用（nil，与 Android 同口径）。
+            await recordOfferingsFetch(count: nil, cacheHit: nil, products: nil,
                                        trace: trace, startedAt: startedAt, error: error)
             throw error
         }
     }
 
+    /// `offerings_fetch` 的统一出口（三条路径：远端成功 / 远端失败回落磁盘缓存 / 磁盘缓存命中）。
+    ///
+    /// `duration_ms` 含补商品的 StoreKit 时间（含重试退避）。商品字段见 ADR 0155 第 5 条：
+    /// `products_attempts`（本调用方实际调 StoreKit 的次数，0 = 全命中进程内缓存 / 无需查 / 合并进别人的请求）、
+    /// `products_from_cache`、`products_fetched`、`products_error_code`（重试后仍抛错才有）；
+    /// `not_found_product_ids` 只在最终 StoreKit 调用**成功**时写（非空才写）—— 抛错时不写，throw 与 not-found 可分。
     private func recordOfferingsFetch(count: Int?,
-                                      notFoundProductIDs: [String]?,
+                                      cacheHit: Bool?,
+                                      products: StoreProductsResolution?,
                                       trace: HTTPCallTrace,
                                       startedAt: Date,
                                       error: (any Error)?) async {
@@ -651,7 +731,12 @@ actor PurchasesOrchestrator {
                                      "status": trace.last?.statusCode.map { .int($0) },
                                      "request_id": trace.last?.requestID.map { .string($0) },
                                      "count": count.map { .int($0) },
-                                     "not_found_product_ids": notFoundProductIDs.flatMap {
+                                     "cache_hit": cacheHit.map { .bool($0) },
+                                     "products_attempts": products.map { .int($0.lookup.attempts) },
+                                     "products_from_cache": products.map { .int($0.lookup.fromCache) },
+                                     "products_fetched": products.map { .int($0.lookup.fetched) },
+                                     "products_error_code": Self.diagnosticsErrorCode(products?.lookup.error),
+                                     "not_found_product_ids": products?.notFoundProductIDs.flatMap {
                                          $0.isEmpty ? nil : .strings(Array($0.prefix(50)))
                                      },
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
@@ -659,30 +744,150 @@ actor PurchasesOrchestrator {
                                  ])
     }
 
-    /// 用 StoreKit **一次批量**拉齐 offerings 里全部 `platform_product_identifier`，
-    /// 填 `Package.storeProduct`，顺带算出「后端配了但商店查不到」的商品 id。
+    /// 补齐 offerings 里全部 `platform_product_identifier` 的 `Package.storeProduct`，
+    /// 顺带算出「后端配了但商店查不到」的商品 id。商品走统一查找入口 `lookUpStoreProducts`（ADR 0155）。
     ///
-    /// 两件事共用同一次 `Product.products(for:)`：
-    /// - `Package.storeProduct`（宿主做定价文案的唯一来源）；
-    /// - §6-4 诊断字段 `offerings_fetch.not_found_product_ids` —— 接线期最常见的一类事故
-    ///   （ASC 里没建、没过审、地区不售），端上不查就只能靠用户报「买不了」。
-    ///
-    /// best-effort：查不动（无 StoreKit / 抛错）就原样返回，`notFoundProductIDs` 为 nil ——
-    /// 商品详情缺失绝不能让 offerings 本身失败。
-    private func resolveStoreProducts(
-        in offerings: Offerings,
-    ) async -> (offerings: Offerings, notFoundProductIDs: [String]?) {
-        guard let storeKit else { return (offerings, nil) }
-        let wanted = Set(offerings.all.values.flatMap { $0.availablePackages.map(\.platformProductIdentifier) })
-        guard !wanted.isEmpty else { return (offerings, []) }
-        guard let found = try? await storeKit.products(forIdentifiers: wanted) else { return (offerings, nil) }
-
-        var products: [StoreProduct] = []
-        for product in found {
-            products.append(await product.makeStoreProduct())
+    /// best-effort：无 StoreKit / 重试后仍抛错都不让 offerings 失败；能从缓存补上的照填，
+    /// 其余 `storeProduct` 为 nil（公开契约「查不到的为 nil」不变）。
+    private func resolveStoreProducts(in offerings: Offerings) async -> StoreProductsResolution {
+        guard let storeKit else {
+            return StoreProductsResolution(offerings: offerings, notFoundProductIDs: nil, lookup: .none)
         }
-        let notFound = wanted.subtracting(products.map(\.productIdentifier)).sorted()
-        return (offerings.fillingStoreProducts(products), notFound)
+        let wanted = Set(offerings.all.values.flatMap { $0.availablePackages.map(\.platformProductIdentifier) })
+        guard !wanted.isEmpty else {
+            return StoreProductsResolution(offerings: offerings, notFoundProductIDs: [], lookup: .none)
+        }
+
+        let lookup = await lookUpStoreProducts(wanted, storeKit: storeKit)
+        var storeProducts: [StoreProduct] = []
+        for product in lookup.products.values {
+            // 资格（`isEligible`）在这里现查，不随商品进缓存。
+            storeProducts.append(await product.makeStoreProduct())
+        }
+        // 只在最终 StoreKit 调用成功（或无需调用）时算 not_found；抛错时不算，throw 与 not-found 可分。
+        let notFound = lookup.error == nil ? wanted.subtracting(lookup.products.keys).sorted() : nil
+        return StoreProductsResolution(offerings: offerings.fillingStoreProducts(storeProducts),
+                                       notFoundProductIDs: notFound,
+                                       lookup: lookup)
+    }
+
+    /// **统一商品查找入口**（ADR 0155）：offerings 补商品与购买路径都走这里。
+    ///
+    /// storefront 校验（变了先整体失效）→ 进程内缓存 → 缺的 id 交给 StoreKit（同一缺失集合并发合并、抛错重试）
+    /// → 用「自己的缓存快照 ∪ 本次查到」组装。合并进别人请求的调用方也用自己的快照，不吃发起者的（避开 RC 缺陷 F-1）。
+    private func lookUpStoreProducts(_ wanted: Set<String>,
+                                     storeKit: any StoreKitProvider) async -> StoreProductsLookup {
+        // storefront 变了 → 缓存整体失效；在途的旧请求不再接新等待者（它们回来时代号不等，也不会写回）。
+        // 读不到 storefront（nil）视为未知，不触发失效（`StoreProductCache.validate`）。
+        let storefrontID = await storeKit.storefrontCountryCode()
+        if storeProductCache.validate(storefrontID: storefrontID) {
+            inFlightStoreProductFetches.removeAll()
+            Log.info("storefront 变化，进程内商品缓存失效", category: "offerings")
+        }
+
+        let cached = storeProductCache.products(for: wanted)
+        let missing = wanted.subtracting(cached.keys)
+        guard !missing.isEmpty else {
+            return StoreProductsLookup(products: cached, attempts: 0, fromCache: cached.count, fetched: 0, error: nil)
+        }
+
+        let (result, initiated) = await fetchStoreProductsCoalesced(missing, storeKit: storeKit)
+        var fetched: [String: any StoreProductType] = [:]
+        for product in result.products where missing.contains(product.productIdentifier) {
+            fetched[product.productIdentifier] = product
+        }
+        return StoreProductsLookup(products: cached.merging(fetched) { _, new in new },
+                                   attempts: initiated ? result.attempts : 0,
+                                   fromCache: cached.count,
+                                   fetched: fetched.count,
+                                   error: result.error)
+    }
+
+    /// 同一缺失集合同一时刻只发一次 StoreKit 请求（ADR 0155 第 3 条）。返回结果与「是否本调用方发起」。
+    ///
+    /// 只合并**未超龄**（< `storeProductsInFlightMaxAge`，默认 10 s）的在途请求：卡住的请求不该把后来者
+    /// 一起拖住。超龄就自己发一个新请求并替换登记（旧发起者照常等自己的，不取消）。
+    private func fetchStoreProductsCoalesced(
+        _ identifiers: Set<String>,
+        storeKit: any StoreKitProvider,
+    ) async -> (result: StoreProductsFetchResult, initiated: Bool) {
+        let key = identifiers.sorted().joined(separator: ",")
+        if let existing = inFlightStoreProductFetches[key],
+           ContinuousClock.now - existing.startedAt < storeProductsInFlightMaxAge {
+            storeProductFetchJoinCount += 1
+            return (await existing.task.value, false)
+        }
+        let generation = storeProductCache.generation
+        let id = UUID()
+        let task = Task {
+            await self.fetchStoreProductsWithRetry(identifiers, storeKit: storeKit, generation: generation)
+        }
+        inFlightStoreProductFetches[key] = InFlightStoreProductFetch(id: id, startedAt: .now, task: task)
+        let result = await task.value
+        // 期间可能被超龄替换或被 storefront 失效清掉 —— 只摘自己那一条登记。
+        if inFlightStoreProductFetches[key]?.id == id {
+            inFlightStoreProductFetches[key] = nil
+        }
+        return (result, true)
+    }
+
+    /// 一次 StoreKit 商品请求（含重试）。只对**抛错**重试：最多 3 次尝试，退避 1 s、2 s；
+    /// 返回成功但不全 / 为空不重试（缺商品是配置事实，不是抖动）。成功即按发请求时的代号写缓存。
+    /// 重试后仍抛错记一条 `sdk_warning{products_fetch_failed}`（每次真实失败一条，合并进来的等待者不重复记）。
+    private func fetchStoreProductsWithRetry(_ identifiers: Set<String>,
+                                             storeKit: any StoreKitProvider,
+                                             generation: Int) async -> StoreProductsFetchResult {
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                let found = try await storeKit.products(forIdentifiers: identifiers)
+                if !storeProductCache.store(found, generation: generation) {
+                    Log.info("商品请求期间 storefront 已变，本次结果不写缓存", category: "offerings")
+                }
+                return StoreProductsFetchResult(products: found, attempts: attempt, error: nil)
+            } catch {
+                let code = Self.errorCodeName(error)
+                guard attempt < Self.storeProductsMaxAttempts else {
+                    let underlying = Self.storeKitUnderlyingName(error)
+                    Log.warn("StoreKit 拉取商品 \(attempt) 次均失败（\(code) / \(underlying)），缺 \(identifiers.count) 个商品详情",
+                             category: "offerings")
+                    await diagnostics.warn(
+                        DiagnosticsWarningCode.productsFetchFailed,
+                        detail: "attempts=\(attempt) error=\(code) missing=\(identifiers.count) underlying=\(underlying)")
+                    return StoreProductsFetchResult(products: [], attempts: attempt, error: error)
+                }
+                let delay = Self.storeProductsBackoffs[attempt - 1]
+                Log.debug("StoreKit 拉取商品第 \(attempt) 次抛错（\(code)），\(delay) 后重试", category: "offerings")
+                await storeProductsBackoff(delay)
+            }
+        }
+    }
+
+    /// SDK 自己的错误码名（`diagnosticsErrorCode` 同一口径的字符串形态，供 `sdk_warning.detail` 拼接）。
+    static func errorCodeName(_ error: any Error) -> String {
+        (error as? PurchasesError)?.code.name ?? PurchasesErrorCode.unknownError.name
+    }
+
+    /// `products_fetch_failed.detail` 的 `underlying=`（ADR 0155）：只取**类别名**，绝不带 message（契约 §1.3）。
+    ///
+    /// 先剥一层 `PurchasesError.underlyingError`（SK2Provider 把 StoreKit 的错包成 `storeProblemError`）；
+    /// `StoreKitError` 取 case 名（`networkError` 带 URLError code，如 `networkError(-1009)`；`systemError` 不带内层），
+    /// 其它错误取类型名。
+    static func storeKitUnderlyingName(_ error: any Error) -> String {
+        let inner: any Error = (error as? PurchasesError)?.underlyingError ?? error
+        #if canImport(StoreKit)
+        if let storeKitError = inner as? StoreKitError {
+            // 不用 switch：SDK 里有按系统版本才出现的 case（`unsupported` / `invalidPresentationContext`），
+            // 新系统还会再加。带关联值的两个显式处理（关联值里可能有 message），其余取 case 名。
+            if case .networkError(let urlError) = storeKitError {
+                return "networkError(\(urlError.code.rawValue))"
+            }
+            if case .systemError = storeKitError { return "systemError" }
+            return String(String(describing: storeKitError).prefix { $0 != "(" })
+        }
+        #endif
+        return String(describing: type(of: inner))
     }
 
     // MARK: - 事件多播
@@ -795,8 +1000,11 @@ actor PurchasesOrchestrator {
             guard let storeKit else {
                 throw PurchasesError(code: .configurationError, message: "当前平台无 StoreKit 能力")
             }
-            let products = try await storeKit.products(forIdentifiers: [productIdentifier])
-            guard let product = products.first else {
+            // ADR 0155：与 offerings 同一个商品查找入口（进程内缓存 → 缺的走合并 + 抛错重试），查到即写缓存。
+            // 错误映射不变：重试后仍抛错 → 原样抛 StoreKit 层的错误；成功但没有 → productNotAvailableForPurchaseError。
+            let lookup = await lookUpStoreProducts([productIdentifier], storeKit: storeKit)
+            guard let product = lookup.products[productIdentifier] else {
+                if let error = lookup.error { throw error }
                 throw PurchasesError(code: .productNotAvailableForPurchaseError,
                                      message: "商店无此商品：\(productIdentifier)")
             }

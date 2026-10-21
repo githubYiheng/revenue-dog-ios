@@ -297,6 +297,10 @@ public final class Purchases {
         var adServicesTokenProvider: any AdServicesTokenProvider = SystemAdServicesTokenProvider()
         /// 客户端诊断管线的可注入面（测试用；生产全走默认值）。
         var diagnostics = DiagnosticsDependencies()
+        /// StoreKit 拉商品抛错重试的退避等待（ADR 0155：1 s、2 s）。测试注入记录型实现，不真睡。
+        var storeProductsBackoff: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+        /// 在途 StoreKit 商品请求的合并时限（ADR 0155：默认 10 s，超龄的不再接新等待者）。测试注入短值。
+        var storeProductsInFlightMaxAge: Duration = PurchasesOrchestrator.storeProductsInFlightMaxAgeDefault
 
         /// 诊断管线的注入点。默认即生产配置。
         struct DiagnosticsDependencies: Sendable {
@@ -454,7 +458,9 @@ public final class Purchases {
                                                   attributesDirectory: attributesDirectory,
                                                   attributionState: dependencies.attributionState,
                                                   adServicesTokenProvider: dependencies.adServicesTokenProvider,
-                                                  diagnostics: self.diagnostics)
+                                                  diagnostics: self.diagnostics,
+                                                  storeProductsBackoff: dependencies.storeProductsBackoff,
+                                                  storeProductsInFlightMaxAge: dependencies.storeProductsInFlightMaxAge)
         self.orchestrator = orchestrator
         self.attribution = Attribution(orchestrator: orchestrator)
 
@@ -857,6 +863,11 @@ public final class Purchases {
 
     /// 诊断记录器（内部读视图：测试断言事件序列用）。
     var diagnosticsRecorder: DiagnosticsRecorder { diagnostics }
+
+    /// 并发 `offerings()` 合并进同一次 StoreKit 商品请求的次数（内部读视图：测试确认合并真的发生，ADR 0155）。
+    func storeProductFetchJoinCount() async -> Int {
+        await orchestrator.storeProductFetchJoinCount
+    }
 
     /// 当前身份下**待同步**的属性缓冲（诊断/测试读视图，不对外公开）。
     /// 先等属性写入链排空，读到的才是「所有已调用的 setter 都落盘之后」的状态。

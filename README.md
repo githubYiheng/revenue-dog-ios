@@ -90,6 +90,9 @@ if let offer = product.introductoryOffer, offer.isEligible {
 
 > `storeProduct == nil` = 后端 offerings 里配了、但 App Store 查不到（ASC 没建 / 没过审 / 地区不售）。
 > 这一条同时会进诊断事件 `offerings_fetch.not_found_product_ids`，后台可直接查到是哪几个 id。
+> 0.4.4 起：StoreKit 拉商品**抛错**最多重试 2 次（最坏多等约 3 s），查到的商品在本进程内缓存（storefront 变了才重查），
+> 购买路径同样走这份缓存与重试。所以 `storeProduct == nil` 也可能是「StoreKit 重试后仍抛错」——
+> 这时诊断里 `offerings_fetch.products_error_code` 有值、`not_found_product_ids` 不写，两种原因可分。
 > `introductoryOffer.isEligible` 是**订阅组级**且端上不可信的判定（坑 #91 / 裁决 #124）——
 > 只用来决定 UI 上显不显示优惠文案，**计费与权益一律以服务端为准**。
 

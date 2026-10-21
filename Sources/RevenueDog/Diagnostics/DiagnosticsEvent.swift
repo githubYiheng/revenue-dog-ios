@@ -172,6 +172,10 @@ enum DiagnosticsWarningCode {
     /// ADR 0046 第 4 条：身份待确认期间 purchase / restore / sync 等确认超时（10 秒），已抛 configurationError。
     /// detail 带操作名（`op=purchase` / `op=restore_purchases` / `op=sync_purchases`）。
     static let identityPendingTimeout = "identity_pending_timeout"
+    /// ADR 0155：StoreKit 拉商品重试到上限（3 次）仍抛错，付费墙会缺价格。
+    /// detail 形如 `attempts=3 error=storeProblemError missing=3 underlying=networkError(-1009)`
+    /// （missing = 这次没补上的商品数；underlying = StoreKitError 的 case 名或错误类型名，不带 message）。
+    static let productsFetchFailed = "products_fetch_failed"
 }
 
 /// `receipt_post` / `http_error` 的 `error_class`（契约 §1.3）。

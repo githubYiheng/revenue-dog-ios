@@ -491,9 +491,33 @@ actor FakeStoreKitProvider: StoreKitProvider {
 
     /// `products(forIdentifiers:)` 的调用次数（A 项断言「补 storeProduct 与算 not_found 只查一次商店」）。
     private(set) var productsCallCount = 0
+    /// 每次调用请求的 id 集合（ADR 0155：断言「只把缺的 id 交给 StoreKit」）。
+    private(set) var productsRequests: [Set<String>] = []
+    /// 测试脚本：接下来还要抛错的次数与错误（ADR 0155 重试用例：前 N 次抛错、之后成功）。
+    private var productsFailuresRemaining = 0
+    private var productsFailureError: any Error = PurchasesError(code: .storeProblemError,
+                                                                 message: "FakeStoreKitProvider：编排的商品请求失败")
+    /// 测试脚本：每次调用返回前先等它（编排「请求在途」的时序，如并发合并用例）。
+    private var productsHook: (@Sendable (Set<String>) async -> Void)?
+
+    /// 让接下来 `count` 次 `products(forIdentifiers:)` 抛 `error`（默认 `storeProblemError`），之后照常返回。
+    func scriptProductsFailures(_ count: Int, error: (any Error)? = nil) {
+        productsFailuresRemaining = count
+        if let error { productsFailureError = error }
+    }
+
+    func setProductsHook(_ hook: (@Sendable (Set<String>) async -> Void)?) {
+        productsHook = hook
+    }
 
     func products(forIdentifiers identifiers: Set<String>) async throws -> [any StoreProductType] {
         productsCallCount += 1
+        productsRequests.append(identifiers)
+        if let productsHook { await productsHook(identifiers) }
+        if productsFailuresRemaining > 0 {
+            productsFailuresRemaining -= 1
+            throw productsFailureError
+        }
         return identifiers.compactMap { productsByIdentifier[$0] }
     }
 

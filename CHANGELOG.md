@@ -5,6 +5,48 @@
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-10-21
+
+**修订号**（公开 API 基线无差异）。**破坏性变更：无**。宿主无需改代码，升级即可。ADR 0155。
+
+### 修复：StoreKit 拉商品偶发抛错不再让付费墙空白
+
+- 现象：I am 的 TestFlight 包在一台沙盒设备上 `Product.products(for:)` 偶发抛错。0.4.3 只调一次、抛错即放弃，
+  offerings 照常返回但所有 `storeProduct == nil`，付费墙空白；诊断里也看不出来（抛错时不写 `not_found_product_ids`，
+  与「全部查到」长得一样；offerings 命中磁盘缓存的路径根本不记事件）。
+- 修法：
+  - **只对抛错重试**：最多 3 次尝试（首试 + 2 次重试），退避 1 s、2 s。返回成功但不全 / 为空**不重试**（缺商品是配置事实，不是抖动）。
+  - **进程内商品缓存**：键 = 商品 id，只存查到的（部分查到也存），查不到的不存，无过期，进程内有效；storefront 变化即整体失效
+    （每次查找前读取比对；读不到 storefront 不算变化，不清缓存）。
+    `offerings()` 不论 offerings 来自后端还是磁盘缓存，都先取缓存，只把缺的 id 交给 StoreKit。
+    缓存的是商店商品本身，介绍性优惠资格（`IntroductoryOffer.isEligible`）仍每次现查，买过之后不会显示过期的「可免费试用」。
+  - **购买路径走同一入口**：`purchase(package:)` / `purchase(product:)` 取商品同样先读缓存、缺了才查商店并按上面的规则重试，查到即写缓存。
+    错误不变：重试后仍抛错原样抛出（`storeProblemError`）；商店里没有仍是 `productNotAvailableForPurchaseError`。
+  - **并发合并**：同一时刻对同一组缺失商品只发一次 StoreKit 请求（只合并发出不到 10 s 的请求，卡住的请求不拖住后来者）；
+    每个调用方用自己的缓存快照组装；storefront 失效之后，在途的旧请求回来不写回缓存。
+  - 重试后仍抛错：offerings 照常返回，能从缓存补上的 package 照填，其余 `storeProduct` 为 nil（「查不到为 nil」的契约不变）。
+- 对照 RC（purchases-ios 5.96.1）：缓存规则与并发合并同 RC `CachingProductsManager`，并避开它的两处已知并发缺陷
+  （RC PR #8084 在修、未合入）；RC 的 SK2 路径不重试，我方因有实证而加了抛错重试；RC 商品全拿不到时 `getOfferings` 整体报错，
+  我方不改公开契约。核实报告 `docs/research/verify/2026-10-21-rc-products-fetch-retry-cache.md`。
+
+### 诊断
+
+- `offerings_fetch` 三条路径都记一条：远端拉取成功 / 远端失败回落磁盘缓存 / **磁盘缓存命中（新增）**。新增字段：
+  `cache_hit`（offerings 本身来自磁盘缓存）、`products_attempts`（本次调 StoreKit 的次数，0 = 全部命中进程内缓存或合并进别人的请求）、
+  `products_from_cache`、`products_fetched`、`products_error_code`（重试后仍抛错时的错误码名）。
+- `not_found_product_ids` 只在最终 StoreKit 调用**成功**时写；抛错时不写 —— 「StoreKit 抛错」与「商店查不到」从此分得开。
+- 三条路径的 `duration_ms` 都含补商品的 StoreKit 时间（含重试退避）；`products_fetch_failed` 总排在 `offerings_fetch` 之前；
+  回落磁盘缓存那条以前在补商品之前就记了，现在改到之后。
+- 远端失败且没有磁盘缓存的那条 `offerings_fetch` 不带 `cache_hit`（与 Android 同口径）。
+- 重试后仍抛错另记一条 `sdk_warning`，code `products_fetch_failed`，detail 如
+  `attempts=3 error=storeProblemError missing=3 underlying=networkError(-1009)`
+  （`underlying` 是 StoreKitError 的 case 名或错误类型名，不带错误文案）。
+- 不新增事件类型，服务端不改。
+
+### 内部
+
+- `X-Version` 变为 `0.4.4`（出站请求快照同步）。
+
 ## [0.4.3] - 2026-10-10
 
 **只修一处兼容**：订阅周期归一化（ADR 0135）。公开 API **只增**一个方法，运行时行为只在 StoreKit 报「7 day / 12 month」时有别。
