@@ -72,6 +72,12 @@ enum SubscriberAttributeKeys {
     static let keyword = "$keyword"
     static let creative = "$creative"
 
+    // 广告平台转发（Meta Conversions API）由服务端读取的键 —— 我方新增，不在上面的契约 §2.4 清单里
+    // （`docs/plan/ad-forwarding-design.md` §3.3 / §3.4，需求 R5.1 / R5.5 / R5.9）
+    static let adMeasurementConsent = "$adMeasurementConsent"
+    static let timezone = "$timezone"
+    static let fbCampaignIDs = "$fbCampaignIds"
+
     /// 前缀判定：`$` 开头即保留键（与服务端 `attributes.ts` 的判定逐字一致）。
     static func isReserved(_ key: String) -> Bool { key.hasPrefix("$") }
 }

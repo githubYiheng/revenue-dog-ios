@@ -327,6 +327,101 @@ extension PurchasesSingletonDomain {
             #expect(Set(attributes.keys) == ["favorite_food"]) // `$email` 被挡在门面外
         }
 
+        // MARK: 广告平台转发的三个保留键（Meta Conversions API，ad-forwarding-design §3.3 / §3.4）
+
+        @Test("广告转发 setter：三个专用 setter 写对键与值，随 /attributes 原样上行")
+        func adForwardingSettersWriteReservedKeys() async throws {
+            let transport = AttrTransport()
+            let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
+            purchases.setAdMeasurementConsent(true)
+            purchases.setTimezone("America/New_York")
+            purchases.setFBCampaignIDs("AbC123xyz,DeF456uvw")
+            #expect(await waitForBuffered(purchases, count: 3))
+
+            let buffered = Dictionary(uniqueKeysWithValues:
+                await purchases.unsyncedAttributes().map { ($0.key, $0.value) })
+            #expect(buffered == ["$adMeasurementConsent": "true",
+                                 "$timezone": "America/New_York",
+                                 "$fbCampaignIds": "AbC123xyz,DeF456uvw"])
+
+            await purchases.syncAttributesIfNeeded()
+            let attributes = try #require(
+                attrBody(await transport.requests(pathSuffix: "/attributes").first)["attributes"] as? [String: Any])
+            #expect(Set(attributes.keys) == ["$adMeasurementConsent", "$timezone", "$fbCampaignIds"])
+            #expect((attributes["$adMeasurementConsent"] as? [String: Any])?["value"] as? String == "true")
+            #expect((attributes["$timezone"] as? [String: Any])?["value"] as? String == "America/New_York")
+            #expect((attributes["$fbCampaignIds"] as? [String: Any])?["value"] as? String == "AbC123xyz,DeF456uvw")
+        }
+
+        @Test("广告转发 setter：同意开关只写 \"true\" / \"false\" 两个串（服务端只认 \"true\" 为同意）")
+        func adMeasurementConsentWritesOnlyTrueOrFalse() async throws {
+            let transport = AttrTransport()
+            let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
+
+            purchases.setAdMeasurementConsent(true)
+            #expect(await purchases.unsyncedAttributes().map(\.value) == ["true"])
+
+            purchases.setAdMeasurementConsent(false)
+            let refused = await purchases.unsyncedAttributes()
+            #expect(refused.map(\.key) == ["$adMeasurementConsent"])
+            #expect(refused.map(\.value) == ["false"])
+
+            await purchases.syncAttributesIfNeeded()
+            let attributes = try #require(
+                attrBody(await transport.requests(pathSuffix: "/attributes").first)["attributes"] as? [String: Any])
+            #expect((attributes["$adMeasurementConsent"] as? [String: Any])?["value"] as? String == "false")
+
+            // 已同步的值再写一遍不白发请求（与其它 setter 同一条去重规则）
+            purchases.setAdMeasurementConsent(false)
+            #expect(await purchases.unsyncedAttributes().isEmpty)
+        }
+
+        @Test("广告转发 setter：nil = 删除（墓碑，上行为空串），同步后本地清除")
+        func adForwardingSettersNilDeletes() async throws {
+            let transport = AttrTransport()
+            let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
+            purchases.setAdMeasurementConsent(true)
+            purchases.setTimezone("Asia/Shanghai")
+            purchases.setFBCampaignIDs("AbC123xyz")
+            #expect(await waitForBuffered(purchases, count: 3))
+            await purchases.syncAttributesIfNeeded()
+            #expect(await purchases.unsyncedAttributes().isEmpty)
+
+            purchases.setAdMeasurementConsent(nil)
+            purchases.setTimezone(nil)
+            purchases.setFBCampaignIDs(nil)
+            let tombstones = await purchases.unsyncedAttributes()
+            #expect(tombstones.map(\.key) == ["$adMeasurementConsent", "$fbCampaignIds", "$timezone"])
+            #expect(tombstones.allSatisfy { $0.isTombstone })
+
+            await purchases.syncAttributesIfNeeded()
+            let requests = await transport.requests(pathSuffix: "/attributes")
+            #expect(requests.count == 2)
+            let deleted = try #require(attrBody(requests.last)["attributes"] as? [String: Any])
+            #expect(Set(deleted.keys) == ["$adMeasurementConsent", "$timezone", "$fbCampaignIds"])
+            for key in ["$adMeasurementConsent", "$timezone", "$fbCampaignIds"] {
+                #expect((deleted[key] as? [String: Any])?["value"] as? String == "") // 删除 = 空串，不是 JSON null
+            }
+            #expect(await purchases.unsyncedAttributes().isEmpty)
+        }
+
+        @Test("setAttributes 同样拒绝三个广告转发保留键，只能走专用 setter")
+        func customSetterRejectsAdForwardingKeys() async throws {
+            let transport = AttrTransport()
+            let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
+            purchases.setAttributes(["$adMeasurementConsent": "true",
+                                     "$timezone": "America/New_York",
+                                     "$fbCampaignIds": "AbC123xyz",
+                                     "favorite_food": "pizza"])
+            #expect(await waitForBuffered(purchases, count: 1))
+            #expect(await purchases.unsyncedAttributes().map(\.key) == ["favorite_food"])
+
+            await purchases.syncAttributesIfNeeded()
+            let attributes = try #require(
+                attrBody(await transport.requests(pathSuffix: "/attributes").first)["attributes"] as? [String: Any])
+            #expect(Set(attributes.keys) == ["favorite_food"])
+        }
+
         @Test("同步时机 —— 进入后台通知触发一次属性同步")
         func appDidEnterBackgroundTriggersSync() async throws {
             let transport = AttrTransport()

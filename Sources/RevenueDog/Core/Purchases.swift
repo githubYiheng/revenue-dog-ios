@@ -928,6 +928,19 @@ public final class Purchases {
     public func setKeyword(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.keyword, value) }
     public func setCreative(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.creative, value) }
 
+    // 广告平台转发（Meta Conversions API，服务端读取；`docs/plan/ad-forwarding-design.md` §3.3 / §3.4）
+
+    /// 宿主 App 内「分享使用 / 广告衡量数据」开关的当前值（`$adMeasurementConsent`）。
+    ///
+    /// 只会写 `"true"` / `"false"` 两个串；`nil` = 删除。服务端只把 `"true"` 当作同意，其余值一律按拒绝处理。
+    public func setAdMeasurementConsent(_ granted: Bool?) {
+        setReservedAttribute(SubscriberAttributeKeys.adMeasurementConsent, granted.map { $0 ? "true" : "false" })
+    }
+    /// IANA 时区标识（`$timezone`），如 `America/New_York`。宿主传 `TimeZone.current.identifier`，原样写入。
+    public func setTimezone(_ identifier: String?) { setReservedAttribute(SubscriberAttributeKeys.timezone, identifier) }
+    /// Facebook 回流深链里的 `campaign_ids` 原串（`$fbCampaignIds`），原样写入。
+    public func setFBCampaignIDs(_ value: String?) { setReservedAttribute(SubscriberAttributeKeys.fbCampaignIDs, value) }
+
     private func setReservedAttribute(_ key: String, _ value: String?) {
         enqueueAttributeWrite([key: value])
     }

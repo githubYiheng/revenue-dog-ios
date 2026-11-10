@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+公开 API 基线**只增** 3 个方法，无减无改。**破坏性变更：无**。宿主不调新方法则行为不变。
+
+### 新增：Meta Conversions API 转发用的三个保留属性 setter
+
+服务端转发购买事件给 Meta 时读这三个订阅者属性（`docs/plan/ad-forwarding-design.md` §3.3 / §3.4）。
+与其它保留键 setter 同一套语义：只落本地缓冲、随既有同步时机上行，`nil` = 删除；`setAttributes` 仍拒收 `$` 键。
+SDK 不自动采集其中任何一项。
+
+- `setAdMeasurementConsent(_ granted: Bool?)` → `$adMeasurementConsent`：只写 `"true"` / `"false"`；服务端只把 `"true"` 当作同意。
+- `setTimezone(_ identifier: String?)` → `$timezone`：IANA 时区标识原样写入（宿主传 `TimeZone.current.identifier`）。
+- `setFBCampaignIDs(_ value: String?)` → `$fbCampaignIds`：Facebook 回流深链里 `campaign_ids` 的原串。
+
+宿主接线（要同步哪些属性、手动事件的 `event_id`、关闭 Facebook SDK 自动内购记录、IP 披露）见 README「Meta Conversions API 转发（服务端）」。
+
 ## [0.4.4] - 2026-10-21
 
 **修订号**（公开 API 基线无差异）。**破坏性变更：无**。宿主无需改代码，升级即可。ADR 0155。

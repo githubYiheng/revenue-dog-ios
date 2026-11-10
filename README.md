@@ -144,6 +144,44 @@ info.entitlements["pro"]?.productPlanIdentifier            // Play base plan；A
 > `SubscriptionInfo.isActive` 与 `activeSubscriptionProductIdentifiers` 同一规则、同一参照时间；
 > 从 0.3.x 升级后第一次读到的**旧缓存**里这些明细为空，下一次拉取（前台 5 分钟 TTL / 回前台刷新）即补齐。
 
+### Meta Conversions API 转发（服务端）
+
+项目在后台开了 Meta 转发后，服务端把购买事件发给 Meta，发送时读该客户**最后一次同步**的订阅者属性。宿主要做下面四件事。
+
+**1. 同步这些属性**（保留键只能走专用 setter，`setAttributes` 拒收 `$` 键；值没变时不会多发请求）
+
+| setter | 属性 | 写什么、何时写 |
+|---|---|---|
+| `setATTConsentStatus` + `setIDFA` | `$attConsentStatus` / `$idfa` | **两个总在同一处紧挨着一起写**，不要只写其一。启动时与**每次回前台**都重读 ATT 状态再写（用户可能在系统设置里撤销，App 收不到通知）。服务端只把 `authorized` 当作已授权；未授权或已撤销时 `$idfa` 写空（`setIDFA(nil)`） |
+| `setIDFV` | `$idfv` | IDFV，与上一行同一时机 |
+| `setFBAnonymousID` | `$fbAnonId` | Facebook SDK 的匿名 ID，与上一行同一时机 |
+| `setTimezone` | `$timezone` | `TimeZone.current.identifier`，与上一行同一时机 |
+| `setAdMeasurementConsent` | `$adMeasurementConsent` | App 内「分享使用 / 广告衡量数据」开关的当前值，启动时与开关变化时写。只会写 `true` / `false`，服务端只把 `true` 当作同意；没写过的客户按项目配置处理 |
+| `setFBCampaignIDs` | `$fbCampaignIds` | 处理 Facebook 回流深链时，链接里 `campaign_ids` 的原串。服务端只给写入后 7 天内发生的事件带上 |
+
+**2. App 自己用 Facebook SDK 记的购买事件要带 `event_id`**，与服务端那条相同，Meta 才会只计一次：
+
+- 开始免费试用的那次购买：`StartTrial:{transactionId}`
+- 付费首购、一次性购买：`Purchase:{transactionId}`
+
+`transactionId` 是**这笔购买**的 StoreKit 交易 id（`Transaction.id`；经本 SDK 购买时就是 `PurchaseResult.transactionIdentifier`），
+**不是** `originalID`。前缀是固定写法，不随 Facebook 事件名变。Meta 去重要求事件名与 `event_id` 都相同，
+所以 App 记的事件名要与项目后台为该行配置的 Meta 事件名一致。
+
+```swift
+let parameters: [AppEvents.ParameterName: Any] = [
+    AppEvents.ParameterName(rawValue: "event_id"): "Purchase:\(transactionIdentifier)",
+]
+```
+
+**3. 先关掉 Facebook SDK 的自动内购记录。** Facebook SDK 默认自动记录 StoreKit 购买（非消耗型、自动续期订阅、非续期订阅），
+自动事件不带上面的 `event_id`，服务端再发一条就会重复计数。所以服务端发开始试用、首购、一次性购买这三类事件之前，
+必须在 Meta App 后台关闭自动内购记录，并让手动事件按第 2 条带 `event_id`。
+项目配置 `client_dedup_min_version` 就是这个声明：填了表示自动记录已关、从该 App 版本起手动事件带 `event_id`；
+没填时这三类事件打不开；App 版本低于它的客户，服务端不发这三类事件。
+
+**4. IP 披露。** 服务端会保存 SDK 请求的来源 IP（只留最近一次）用作 Meta 匹配键，请在 App 的隐私披露里写上「IP 地址」。
+
 ### 集成测试：把假后端接进来（仅测试用）
 
 ```swift
