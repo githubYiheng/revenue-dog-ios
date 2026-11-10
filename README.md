@@ -159,6 +159,17 @@ info.entitlements["pro"]?.productPlanIdentifier            // Play base plan；A
 | `setAdMeasurementConsent` | `$adMeasurementConsent` | App 内「分享使用 / 广告衡量数据」开关的当前值，启动时与开关变化时写。只会写 `true` / `false`，服务端只把 `true` 当作同意；没写过的客户按项目配置处理 |
 | `setFBCampaignIDs` | `$fbCampaignIds` | 处理 Facebook 回流深链时，链接里 `campaign_ids` 的原串。服务端只给写入后 7 天内发生的事件带上 |
 
+**用户 ID 的匹配（可选，但建议做）。** 服务端每条事件都带 `external_id` = App User ID 的 SHA-256。要让 Meta 把它和 App 里的事件对上，
+客户端要把**同一个 App User ID**通过 Facebook SDK 的高级匹配接口交给 SDK，**传原值，不用自己哈希**：
+
+```swift
+AppEvents.shared.setUserData(appUserID, forType: .externalId)   // 登录后设置；登出时清除
+```
+
+Facebook SDK 会自己做 SHA-256，且对这一项不改大小写、不去空白（已经是 64 位十六进制的值则原样发送），所以与服务端算出的哈希一致。
+注意两点：传的必须与本 SDK `logIn` 用的 App User ID 逐字相同；`AppEvents.shared.userID` 是另一个字段（原值上报），不能替代上面这一行。
+以上行为取自 facebook-ios-sdk 源码（`FBSDKUserDataStore.m`），Meta 官方文档只要求「各渠道的 external ID 格式一致」。
+
 **2. App 自己用 Facebook SDK 记的购买事件要带 `event_id`**，与服务端那条相同，Meta 才会只计一次：
 
 - 开始免费试用的那次购买：`StartTrial:{transactionId}`
