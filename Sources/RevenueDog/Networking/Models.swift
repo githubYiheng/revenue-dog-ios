@@ -599,6 +599,12 @@ public struct EntitlementInfo: Sendable, Hashable, Codable {
     public let store: Store
     public let periodType: PeriodType
     public let ownershipType: OwnershipType
+    /// **当前授予该权益的那个商品**的环境，不是「刚完成的这笔购买」的环境。
+    ///
+    /// 权益取到期最晚的来源：可能是另一笔订阅，也可能是后台授予（授予恒为 `false`）；
+    /// 关联不到商品记录时同样是 `false`（契约 §2.2「缺失按 false」）。
+    /// 要判断某笔购买是不是沙盒，读 `CustomerInfo.subscriptionsByProductIdentifier[productID]?.isSandbox`
+    /// （一次性商品读 `nonSubscriptionTransactions` 里那笔交易的 `isSandbox`），取不到按沙盒处理。
     public let isSandbox: Bool
     public let unsubscribeDetectedAt: Date?
     public let billingIssueDetectedAt: Date?

@@ -185,6 +185,17 @@ let parameters: [AppEvents.ParameterName: Any] = [
 ]
 ```
 
+**沙盒 / TestFlight 的购买不要发给广告平台。** 判断「这笔购买」的环境，读这笔商品自己的记录，取不到按沙盒、不发：
+
+```swift
+let isSandbox = result.productIdentifier
+    .flatMap { result.customerInfo.subscriptionsByProductIdentifier[$0]?.isSandbox } ?? true
+```
+
+不要读 `entitlements["pro"]?.isSandbox`：它描述的是**当前授予该权益的商品**（到期最晚的来源），不一定是这笔购买。
+例如测试账号本来就有后台授予的权益时，它是 `false`，沙盒里买的那一笔就会被当成正式购买发出去。
+一次性商品读 `nonSubscriptionTransactions` 里那笔交易的 `isSandbox`。
+
 **3. 先关掉 Facebook SDK 的自动内购记录。** Facebook SDK 默认自动记录 StoreKit 购买（非消耗型、自动续期订阅、非续期订阅），
 自动事件不带上面的 `event_id`，服务端再发一条就会重复计数。所以服务端发开始试用、首购、一次性购买这三类事件之前，
 必须在 Meta App 后台关闭自动内购记录，并让手动事件按第 2 条带 `event_id`。

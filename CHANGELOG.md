@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+- 文档（无 API 变化）：`EntitlementInfo.isSandbox` 说明它是「当前授予该权益的商品」的环境；README 补「判断某笔购买是不是沙盒」的读法
+  （读 `subscriptionsByProductIdentifier[productID]`，取不到按沙盒）。起因：宿主拿权益上的值判断首购事件发不发。
+
 ## [0.5.0] - 2026-11-12
 
 **次版本：公开 API 只「增」3 个方法**（基线 501 → 504 符号，diff 只有 `+` 行）。**破坏性变更：无**。宿主不调新方法则行为与 0.4.4 一致，升级无需改代码。
