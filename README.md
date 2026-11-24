@@ -159,7 +159,7 @@ info.entitlements["pro"]?.productPlanIdentifier            // Play base plan；A
 | `setAdMeasurementConsent` | `$adMeasurementConsent` | App 内「分享使用 / 广告衡量数据」开关的当前值，启动时与开关变化时写。只会写 `true` / `false`，服务端只把 `true` 当作同意；没写过的客户按项目配置处理 |
 | `setFBCampaignIDs` | `$fbCampaignIds` | 处理 Facebook 回流深链时，链接里 `campaign_ids` 的原串。服务端只给写入后 7 天内发生的事件带上 |
 
-**用户 ID 的匹配（可选，但建议做）。** 服务端每条事件都带 `external_id` = App User ID 的 SHA-256。要让 Meta 把它和 App 里的事件对上，
+**用户 ID 的匹配（可选，但建议做）。** 项目端点的「用户 id」配成哈希后发时，服务端给具名用户的每条事件带 `external_id` = App User ID 的 SHA-256。要让 Meta 把它和 App 里的事件对上，
 客户端要把**同一个 App User ID**通过 Facebook SDK 的高级匹配接口交给 SDK，**传原值，不用自己哈希**：
 
 ```swift
