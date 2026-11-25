@@ -5,12 +5,11 @@
 //  M1 实现范围（设计 §9）：configure / 身份 / GET subscribers / offerings 展示。
 //  M2 起：购买链路 P1–P8、receipts 上报、finish 语义。
 //
+//  不 import StoreKit：StoreKit 的类型（含错误类型）只出现在 StoreKit 层（设计 §2 协议隔离；
+//  错误映射 / 类别名 / 取消判定见 `StoreKitErrorMapping`，ADR 0243）。
+//
 
 import Foundation
-
-#if canImport(StoreKit)
-import StoreKit
-#endif
 
 /// `POST /v1/subscribers/identify` 请求体（M3；服务端形状我方定义）。
 private struct IdentifyBody: Encodable {
@@ -568,19 +567,12 @@ actor PurchasesOrchestrator {
             "status": trace.last?.statusCode.map { .int($0) },
             "request_id": trace.last?.requestID.map { .string($0) },
             "duration_ms": .int(Self.elapsedMs(since: startedAt)),
-            "error_code": Self.diagnosticsErrorCode(error),
         ]
         for (key, value) in extra { fields[key] = value }
+        // 失败原因字段（error_code / error_class / underlying …）只有一处实现（ADR 0243）；调用点字段优先。
         await diagnostics.record(type,
                                  level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
-                                 fields: fields)
-    }
-
-    /// SDK 自己的错误码名（**绝不带 message**，契约 §1.3 末段）。
-    static func diagnosticsErrorCode(_ error: (any Error)?) -> DiagnosticsFieldValue? {
-        guard let error else { return nil }
-        if let purchases = error as? PurchasesError { return .string(purchases.code.name) }
-        return .string(PurchasesErrorCode.unknownError.name)
+                                 fields: DiagnosticsErrorFields.merging(fields, error: error))
     }
 
     static func elapsedMs(since startedAt: Date) -> Int {
@@ -617,19 +609,22 @@ actor PurchasesOrchestrator {
             await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: false,
                                           trace: trace, startedAt: startedAt, error: nil)
             return response.info
-        } catch let error as PurchasesError {
-            // 设计 §4：后端 5xx 时忽略 TTL 直接供给 stale 缓存。
-            let isServerError = (error.httpStatusCode.map { (500...599).contains($0) } ?? false)
-                || error.code == .networkError
-            if isServerError, fetchPolicy != .fetchCurrent,
-               let cached = await deviceCache.cachedCustomerInfo(appUserID: appUserID) {
-                Log.warn("后端不可用（\(error.description)），回落 stale 缓存", category: "customer-info")
-                await diagnostics.warn(DiagnosticsWarningCode.staleCustomerInfoFallback,
-                                       detail: "policy=\(fetchPolicy.rawValue)")
-                await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: true,
-                                              trace: trace, startedAt: startedAt, error: error)
-                return cached
+        } catch {
+            // 设计 §4：后端 5xx 时忽略 TTL 直接供给 stale 缓存（只对 `PurchasesError`，口径不变）。
+            if let purchasesError = error as? PurchasesError {
+                let isServerError = (purchasesError.httpStatusCode.map { (500...599).contains($0) } ?? false)
+                    || purchasesError.code == .networkError
+                if isServerError, fetchPolicy != .fetchCurrent,
+                   let cached = await deviceCache.cachedCustomerInfo(appUserID: appUserID) {
+                    Log.warn("后端不可用（\(purchasesError.description)），回落 stale 缓存", category: "customer-info")
+                    await diagnostics.warn(DiagnosticsWarningCode.staleCustomerInfoFallback,
+                                           detail: "policy=\(fetchPolicy.rawValue)")
+                    await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: true,
+                                                  trace: trace, startedAt: startedAt, error: purchasesError)
+                    return cached
+                }
             }
+            // ADR 0243：任何错误都记失败事件（0.5.0 只在 `PurchasesError` 时记，任务取消的 `CancellationError` 没有记录）。
             await recordCustomerInfoFetch(policy: fetchPolicy, cacheHit: false,
                                           trace: trace, startedAt: startedAt, error: error)
             throw error
@@ -643,14 +638,13 @@ actor PurchasesOrchestrator {
                                          error: (any Error)?) async {
         await diagnostics.record(DiagnosticsEventType.customerInfoFetch,
                                  level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
-                                 fields: [
+                                 fields: DiagnosticsErrorFields.merging([
                                      "policy": .string(policy.rawValue),
                                      "cache_hit": .bool(cacheHit),
                                      "status": trace.last?.statusCode.map { .int($0) },
                                      "request_id": trace.last?.requestID.map { .string($0) },
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
-                                     "error_code": Self.diagnosticsErrorCode(error),
-                                 ])
+                                 ], error: error))
     }
 
     func cachedCustomerInfo() async -> CustomerInfo? {
@@ -727,7 +721,7 @@ actor PurchasesOrchestrator {
                                       error: (any Error)?) async {
         await diagnostics.record(DiagnosticsEventType.offeringsFetch,
                                  level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
-                                 fields: [
+                                 fields: DiagnosticsErrorFields.merging([
                                      "status": trace.last?.statusCode.map { .int($0) },
                                      "request_id": trace.last?.requestID.map { .string($0) },
                                      "count": count.map { .int($0) },
@@ -735,13 +729,15 @@ actor PurchasesOrchestrator {
                                      "products_attempts": products.map { .int($0.lookup.attempts) },
                                      "products_from_cache": products.map { .int($0.lookup.fromCache) },
                                      "products_fetched": products.map { .int($0.lookup.fetched) },
-                                     "products_error_code": Self.diagnosticsErrorCode(products?.lookup.error),
+                                     // 商品补齐自己的错误码（ADR 0155），与 offerings 本身的失败字段无关。
+                                     "products_error_code": products?.lookup.error.map {
+                                         .string(DiagnosticsErrorFields.errorCodeName($0))
+                                     },
                                      "not_found_product_ids": products?.notFoundProductIDs.flatMap {
                                          $0.isEmpty ? nil : .strings(Array($0.prefix(50)))
                                      },
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
-                                     "error_code": Self.diagnosticsErrorCode(error),
-                                 ])
+                                 ], error: error))
     }
 
     /// 补齐 offerings 里全部 `platform_product_identifier` 的 `Package.storeProduct`，
@@ -847,9 +843,9 @@ actor PurchasesOrchestrator {
                 }
                 return StoreProductsFetchResult(products: found, attempts: attempt, error: nil)
             } catch {
-                let code = Self.errorCodeName(error)
+                let code = DiagnosticsErrorFields.errorCodeName(error)
                 guard attempt < Self.storeProductsMaxAttempts else {
-                    let underlying = Self.storeKitUnderlyingName(error)
+                    let underlying = Self.productsFetchUnderlyingName(error)
                     Log.warn("StoreKit 拉取商品 \(attempt) 次均失败（\(code) / \(underlying)），缺 \(identifiers.count) 个商品详情",
                              category: "offerings")
                     await diagnostics.warn(
@@ -864,30 +860,12 @@ actor PurchasesOrchestrator {
         }
     }
 
-    /// SDK 自己的错误码名（`diagnosticsErrorCode` 同一口径的字符串形态，供 `sdk_warning.detail` 拼接）。
-    static func errorCodeName(_ error: any Error) -> String {
-        (error as? PurchasesError)?.code.name ?? PurchasesErrorCode.unknownError.name
-    }
-
     /// `products_fetch_failed.detail` 的 `underlying=`（ADR 0155）：只取**类别名**，绝不带 message（契约 §1.3）。
     ///
-    /// 先剥一层 `PurchasesError.underlyingError`（SK2Provider 把 StoreKit 的错包成 `storeProblemError`）；
-    /// `StoreKitError` 取 case 名（`networkError` 带 URLError code，如 `networkError(-1009)`；`systemError` 不带内层），
-    /// 其它错误取类型名。
-    static func storeKitUnderlyingName(_ error: any Error) -> String {
-        let inner: any Error = (error as? PurchasesError)?.underlyingError ?? error
-        #if canImport(StoreKit)
-        if let storeKitError = inner as? StoreKitError {
-            // 不用 switch：SDK 里有按系统版本才出现的 case（`unsupported` / `invalidPresentationContext`），
-            // 新系统还会再加。带关联值的两个显式处理（关联值里可能有 message），其余取 case 名。
-            if case .networkError(let urlError) = storeKitError {
-                return "networkError(\(urlError.code.rawValue))"
-            }
-            if case .systemError = storeKitError { return "systemError" }
-            return String(String(describing: storeKitError).prefix { $0 != "(" })
-        }
-        #endif
-        return String(describing: type(of: inner))
+    /// 类别名与诊断 `underlying` 同一实现（`StoreKitErrorMapping.underlyingName`，ADR 0243）。
+    /// 链上没有原错误时 detail 沿用 0.4.4 起的写法，取外层错误的类型名（如 `PurchasesError`），这一段从不缺省。
+    static func productsFetchUnderlyingName(_ error: any Error) -> String {
+        StoreKitErrorMapping.underlyingName(of: error) ?? String(describing: type(of: error))
     }
 
     // MARK: - 事件多播
@@ -1102,7 +1080,7 @@ actor PurchasesOrchestrator {
             // `purchase()` 抛出（含商品不存在 / 弹窗前失败 / StoreKit 取消）：一律留一条 error 级事件。
             if failureRecorded { throw error }
             await recordPurchaseResult(productIdentifier: productIdentifier,
-                                       outcome: Self.isUserCancelledOutcome(error)
+                                       outcome: StoreKitErrorMapping.isUserCancelled(error)
                                            ? DiagnosticsPurchaseOutcome.cancelled
                                            : DiagnosticsPurchaseOutcome.error,
                                        transactionID: nil, startedAt: purchaseStartedAt, error: error)
@@ -1158,21 +1136,12 @@ actor PurchasesOrchestrator {
         let isError = outcome == DiagnosticsPurchaseOutcome.error
         await diagnostics.record(DiagnosticsEventType.purchaseResult,
                                  level: isError ? DiagnosticsLevel.error : DiagnosticsLevel.info,
-                                 fields: [
+                                 fields: DiagnosticsErrorFields.merging([
                                      "product_id": .string(productIdentifier),
                                      "outcome": .string(outcome),
                                      "transaction_id": transactionID.map { .string($0) },
-                                     "error_code": Self.diagnosticsErrorCode(error),
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
-                                 ])
-    }
-
-    /// 坑 #18：`StoreKitError.userCancelled` 这种 throw 形态的取消没有 `PurchaseResult` 可交。
-    static func isUserCancelledOutcome(_ error: any Error) -> Bool {
-        #if canImport(StoreKit)
-        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
-        #endif
-        return (error as? PurchasesError)?.code == .purchaseCancelledError
+                                 ], error: error))
     }
 
     /// restore（用户显式动作，会弹 Apple ID 框）。契约 C（裁决 C2-C）：
@@ -1211,13 +1180,12 @@ actor PurchasesOrchestrator {
                                  error: (any Error)?) async {
         await diagnostics.record(type,
                                  level: error == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
-                                 fields: [
+                                 fields: DiagnosticsErrorFields.merging([
                                      "status": trace.last?.statusCode.map { .int($0) },
                                      "request_id": trace.last?.requestID.map { .string($0) },
                                      "count": count.map { .int($0) },
                                      "duration_ms": .int(Self.elapsedMs(since: startedAt)),
-                                     "error_code": Self.diagnosticsErrorCode(error),
-                                 ])
+                                 ], error: error))
     }
 
     private func syncInternalBody(userInitiated: Bool,
@@ -1232,7 +1200,7 @@ actor PurchasesOrchestrator {
             do {
                 try await storeKit.syncStoreAccount() // AppStore.sync()：弹框
             } catch {
-                if isUserCancelled(error) {
+                if StoreKitErrorMapping.isUserCancelled(error) {
                     throw PurchasesError(code: .purchaseCancelledError, message: "用户取消了恢复购买", underlyingError: error)
                 }
                 // 其余 sync 失败 best-effort 继续：本地已有的交易仍可上报
@@ -1294,13 +1262,6 @@ actor PurchasesOrchestrator {
         case .failure(.finishable(let error)), .failure(.retryable(let error)):
             throw error
         }
-    }
-
-    private func isUserCancelled(_ error: any Error) -> Bool {
-        #if canImport(StoreKit)
-        if let skError = error as? StoreKitError, case .userCancelled = skError { return true }
-        #endif
-        return (error as? PurchasesError)?.code == .purchaseCancelledError
     }
 
     // MARK: - 属性（M3，设计 §1 / §5；契约 §2.4）

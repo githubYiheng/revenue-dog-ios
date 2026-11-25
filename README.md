@@ -98,6 +98,10 @@ if let offer = product.introductoryOffer, offer.isEligible {
 
 ### 购买结果：`isPending` 与扣款后的两个错误码
 
+**规则：除 901 / 902 外，`purchase` 抛错 = 这次购买没有成交，可以让用户重试。** 0.5.1 起 StoreKit 抛的错误一律映射成 `PurchasesError`
+（原错误在 `underlyingError`，ADR 0243）；任务被取消时抛的是 `CancellationError`，原样抛出，同样没有成交。
+一个边角：StoreKit 本地验签不过（`unverified`）的交易会被 SDK 丢弃并抛 `storeProblemError`，这时 Apple 一侧可能已经有一笔交易（见「做不到」表里的 `unverified` 一行）。
+
 ```swift
 do {
     let result = try await Purchases.shared.purchase(package: package)
@@ -113,18 +117,27 @@ do {
 } catch let error as PurchasesError {
     switch error.code {
     case .purchasePendingServerConfirmation:
-        // 钱扣了、后端暂时没确认（5xx / 断网 / 401 / 403 / 408 / 429）。
+        // 901：钱扣了、后端暂时没确认（5xx / 断网 / 401 / 403 / 408 / 429）。
         // 交易**未 finish**、上下文已落盘，SDK 会自动重放。
         // 提示「支付已收到，权益稍后到账」，**绝不要**引导用户再买一次。
     case .purchaseRejectedByServer:
-        // 钱扣了、后端确定性拒绝（确定性 4xx）。交易**已 finish**，不会再有权益。
+        // 902：钱扣了、后端确定性拒绝（确定性 4xx）。交易**已 finish**，不会再有权益。
         // 这是要人看的状态：走客服 / 退款路径，别静默吞掉。
         // (error.underlyingError as? PurchasesError)?.backendCode 带后端错误体码。
-    case .purchaseCancelledError, .purchaseNotAllowedError, .storeProblemError:
-        // 商店侧失败，钱没扣
     default:
+        // 其余所有码位：这次购买没有成交，可以让用户重试。常见的几个（码位与 RC 相同）：
+        //   .networkError（10）                        StoreKit 网络错误
+        //   .productNotAvailableForPurchaseError（5）  商品在当前地区不售 / 商店里没有
+        //   .purchaseNotAllowedError（3）              设备或账户不允许购买（家长控制等）
+        //   .purchaseInvalidError（4）                 当前系统不支持这次购买
+        //   .storeProblemError（2）                    其余 App Store 侧失败（含 InvalidRequestError）
+        // StoreKit 的原错误在 error.underlyingError（如 StoreKitError / Product.PurchaseError）。
+        // error.message 是给开发者看的文案（StoreKit 映射出的与 901 / 902 是英文），
+        // 不要直接给用户看；按 error.code 自己出本地化文案。
         break
     }
+} catch is CancellationError {
+    // 发起购买的 Task 被取消（宿主自己取消的）。没有成交。
 }
 ```
 
@@ -283,9 +296,10 @@ Purchases.configure(with: Configuration(apiKey: "pk_…")
 **上传什么**：事件类型与等级（info / warn / error）、设备时间戳与会话内序号、
 `app_user_id`（当前身份，可能是匿名 `$RDAnonymousID:…`）、`install_id`（与这次安装同生命周期的随机标识）、
 商品 id / 交易 id、HTTP 状态码与 `X-Request-Id`、尝试次数、耗时、错误分类与我方错误码、
+失败时原错误的**类别名**（如 `InvalidRequestError`、`networkError(-1009)`，0.5.1 起）与商店给的**整数错误码**（如 1002，0.5.1 起）、
 finish 判定结果与理由、当前生效的权益 id。系统信息走既有请求头（平台 / OS 版本 / 机型 / SDK 与宿主版本）。
 
-**不上传**：任何 token 或密钥、StoreKit JWS 原文、请求或响应 body、错误消息文本、日志文本、
+**不上传**：任何 token 或密钥、StoreKit JWS 原文、请求或响应 body、错误消息文本（SDK 的与 Apple 的都不上传）、日志文本、
 邮箱 / 姓名 / 设备名。`http_error` 的 `path` 会把 app_user_id 段替换成 `*`。
 
 **行为**：事件先落 `<Application Support>/RevenueDog/diagnostics/queue.jsonl`（上限 500 条 / 256 KB，
@@ -411,7 +425,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 可覆盖变量：`SK_OS` / `SK_DEVICE` / `SK_DESTINATION` / `SK_SCHEME` / `SK_TEST_PLAN` /
 `SK_FILTER` / `SK_DERIVED_DATA` / `XCODEGEN`。
 
-### 场景表（24 条，iOS 18.5 全绿）
+### 场景表（28 条，iOS 18.5 全绿；`unsupported` 那条按设计记 1 个已知问题）
 
 | # | 场景 | 对照编号 | 关键断言 |
 |:-:|---|---|---|
@@ -427,7 +441,9 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 | ⑥ | Ask-to-Buy：pending → approve → **配对**上报 | 坑 #19 / #104 | `initiation_source == "purchase"` 证明配对回了原发起上下文 |
 | ⑥ | Ask-to-Buy decline → 零上报、无权益 | 坑 #19 | — |
 | ⑦ | 注入 `purchaseNotAllowed` → 映射 `purchaseNotAllowedError` | 坑 #18 | 无上报、无残留上下文、无未 finish 交易 |
-| ⑦ | 注入通用 `StoreKitError` → 映射 `storeProblemError` | 坑 #43 | 同上 |
+| ⑦ | 注入通用 `StoreKitError`（`.unknown`）→ 映射 `storeProblemError` | 坑 #43 | 无上报、无残留上下文；原错误在 `underlyingError` |
+| ⑦ | 注入 `networkError` / `notAvailableInStorefront` / `productUnavailable` → 映射 10 / 5 / 5 | ADR 0243 | 同上 |
+| ⑦ | 注入 `unsupported`：StoreKitTest **交付不到**这个 case（18.5 实测成 `unknown`）→ 按规则 2 | ADR 0243 | 警戒线：哪天交付到了必须是 4（4 的映射由单测锁） |
 | ⑦ | `failTransactionsEnabled` 在 iOS 17+ 已是 no-op | **矩阵修正** | 警戒线：拿它造失败 = 假绿 |
 | ⑦ | `interruptedPurchasesEnabled` → 不误报、不误 finish | 坑 #18 | 没有交易时绝不凭空上报 |
 | ⑧ | 新 `Purchases` 实例扫描 `Transaction.unfinished` 并补报 | 坑 #132 / 裁决 #2 | 补投路径 `initiation_source == "queue"` |
@@ -446,6 +462,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 |---|---|
 | promo offer 资格（`promotionalOffer(_:compactJWS:)`） | 需要 ASC 签名密钥，`.storekit` 的 `adHocOffers` 为空；且 **SDK 当前根本没用这个 API**（属 R6 范围）。只做了「读得到、且为空」的特征化断言 |
 | `unverified` 交易（篡改签名） | `VerificationResult.unverified` 无法用 `SKTestSession` 构造。留在**真机核验清单**（补充场景 · 坑 20） |
+| `StoreKitError.unsupported` → 4、`InvalidRequestError` → 2 在真 StoreKit 上的映射 | `setSimulatedError(.generic(.unsupported))` 交付成别的 case（iOS 18.5 → `unknown`，27.2 → `systemError`，2026-11-25 实测）；`InvalidRequestError` 没有公开构造器、也不能注入。两者只由单测锁（后者按内存布局造真实例，布局不符即跳过） |
 | `@backDeployed` 三件套在 iOS 16 上的返回 | 模拟器给不出结论，必须最低版**真机**。留在真机清单 #122 |
 | 真机 CI | 真机 entitlement 情况与模拟器不同，本批全部结论基于模拟器 |
 | iOS 26.6 是否修好 `SKTestSession` | 本机只有 26.5 / 18.5，**未验证**。在拿到 26.6 运行时之前 CI 一律钉 18.x |

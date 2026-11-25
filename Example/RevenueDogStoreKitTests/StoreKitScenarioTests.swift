@@ -549,8 +549,81 @@ extension StoreKitScenarioDomain {
             }
             let error = try #require(captured)
             #expect(error.code == .storeProblemError, "实得 \(error.code)")
+            #expect(error.underlyingError is StoreKitError, "0.5.1 起原错误保留在 underlyingError")
             #expect(await sdk.receiptCallCount() == 0)
             #expect(sdk.pendingContextCount() == 0)
+        }
+
+        // MARK: ADR 0243：映射表里 0.5.1 变了的几行（真 StoreKit 注入，走 SK2Provider 的同一条映射）
+
+        @Test("模拟 StoreKitError.networkError → 映射成 networkError（10），且无残留")
+        func simulatedNetworkErrorMapsToNetworkError() async throws {
+            let error = try await Self.purchaseFailing(with: .generic(.networkError(URLError(.notConnectedToInternet))))
+            #expect(error.code == .networkError, "实得 \(error.code)，原错误 \(StoreKitErrorMapping.underlyingName(of: error) ?? "nil")")
+            #expect(error.underlyingError is StoreKitError)
+        }
+
+        @Test("模拟 StoreKitError.notAvailableInStorefront → 映射成 productNotAvailableForPurchaseError（5），且无残留")
+        func simulatedNotAvailableInStorefrontMapsToFive() async throws {
+            let error = try await Self.purchaseFailing(with: .generic(.notAvailableInStorefront))
+            #expect(error.code == .productNotAvailableForPurchaseError, "实得 \(error.code)，原错误 \(StoreKitErrorMapping.underlyingName(of: error) ?? "nil")")
+            #expect(error.underlyingError is StoreKitError)
+        }
+
+        @Test("模拟 Product.PurchaseError.productUnavailable → 映射成 productNotAvailableForPurchaseError（5），且无残留")
+        func simulatedProductUnavailableMapsToFive() async throws {
+            let error = try await Self.purchaseFailing(with: .purchase(.productUnavailable))
+            #expect(error.code == .productNotAvailableForPurchaseError, "实得 \(error.code)，原错误 \(StoreKitErrorMapping.underlyingName(of: error) ?? "nil")")
+            #expect(error.underlyingError is Product.PurchaseError)
+        }
+
+        #if compiler(>=6.1)
+        /// **实测（2026-11-25）**：StoreKitTest 注入 `.generic(.unsupported)` 交付不到 `.unsupported` ——
+        /// iOS 18.5 模拟器上 `Product.purchase` 抛的是 `StoreKitError.unknown`，iOS 27.2 上是 `.systemError`。
+        /// 所以「`unsupported` → 4」在真 StoreKit 上验不到，只由单测锁（`V051PurchaseErrorMappingTests.unsupportedMapsToFour`）。
+        /// 本条是警戒线：交付成别的 case 时按「其余 case → 2」落（记为已知问题）；哪天交付到了 `.unsupported`，必须是 4 ——
+        /// 届时把本条改成直接断言 4，README 场景表同步。
+        @Test("特征：注入 StoreKitError.unsupported —— StoreKitTest 实际交付成别的 case（→ 2）；交付到了则必须是 4",
+              .enabled(if: unsupportedCaseIsAvailable(), "StoreKitError.unsupported 需要 iOS 18.4+ 运行时"))
+        func simulatedUnsupportedCharacterization() async throws {
+            guard #available(iOS 18.4, *) else { return }   // trait 已保证可用
+            let error = try await Self.purchaseFailing(with: .generic(.unsupported))
+            let delivered = StoreKitErrorMapping.underlyingName(of: error)
+            #expect(error.underlyingError is StoreKitError, "原错误 \(delivered ?? "nil")")
+            if delivered == "unsupported" {
+                #expect(error.code == .purchaseInvalidError, "实得 \(error.code)")
+            } else {
+                #expect(error.code == .storeProblemError, "实得 \(error.code)，原错误 \(delivered ?? "nil")")
+                withKnownIssue("StoreKitTest 把注入的 .unsupported 交付成了 \(delivered ?? "nil")（18.5 实测 unknown、27.2 实测 systemError）") {
+                    Issue.record("注入的 StoreKitError.unsupported 没有原样交付")
+                }
+            }
+        }
+        #endif
+
+        /// 注入一次购买失败 → 断言宿主拿到的是 `PurchasesError`、无上报、无残留上下文，返回该错误供逐行断言码位。
+        private static func purchaseFailing(with failure: SKTestFailures.Purchase) async throws -> PurchasesError {
+            let session = try await SKTestHarness.makeSession()
+            try await SKTestHarness.requireSessionIsLive()
+            let directory = try TempDirectory.make()
+            defer { TempDirectory.remove(directory); SDKSession.tearDown() }
+
+            try await session.setSimulatedError(failure, forAPI: .purchase)
+            defer { Task { try? await session.setSimulatedError(nil, forAPI: .purchase) } }
+
+            let sdk = await SDKSession.start(directory: directory,
+                                             receipts: [.json(FakeBackend.empty())])
+            var thrown: (any Error)?
+            do {
+                _ = try await sdk.purchases.purchase(product: SDKSession.productShell(DemoProduct.monthly))
+            } catch {
+                thrown = error
+            }
+            let error = try #require(thrown as? PurchasesError,
+                                     "注入 \(failure) 后必须抛 PurchasesError，实得 \(String(describing: thrown))")
+            #expect(await sdk.receiptCallCount() == 0)
+            #expect(sdk.pendingContextCount() == 0, "弹窗前失败必须清掉发起键")
+            return error
         }
 
         /// **实测修正**：坑矩阵没记这一条 —— `failTransactionsEnabled` 自 **iOS 17.0 起
@@ -918,5 +991,11 @@ extension StoreKitScenarioDomain {
             #expect(current["ghost"]?.storeProduct == nil)
         }
     }
+}
+
+/// `StoreKitError.unsupported` 只在 iOS 18.4+ 运行时存在（⑦ 的 ADR 0243 行用它决定跑不跑）。
+private func unsupportedCaseIsAvailable() -> Bool {
+    if #available(iOS 18.4, *) { return true }
+    return false
 }
 #endif

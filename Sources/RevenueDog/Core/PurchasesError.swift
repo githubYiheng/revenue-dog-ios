@@ -86,6 +86,11 @@ public struct PurchasesError: Error, Sendable, CustomStringConvertible {
     public let httpStatusCode: Int?
     public let userInfo: [String: String]
     public let underlyingError: (any Error)?
+    /// 商店错误值自带的整数码（ADR 0243 决定 3；今天只有 StoreKit `InvalidRequestError.code`，如 1002）。
+    /// **internal**：不进公开面（与 Android 把 `billingResponseCode` 留作 internal 一致），
+    /// 宿主要原值读 `underlyingError`；诊断的 `store_error_code` 取的就是它。
+    /// 只由 `StoreKitErrorMapping` 填写。
+    let storeErrorCode: Int64?
 
     public init(code: PurchasesErrorCode,
                 message: String,
@@ -93,12 +98,31 @@ public struct PurchasesError: Error, Sendable, CustomStringConvertible {
                 httpStatusCode: Int? = nil,
                 userInfo: [String: String] = [:],
                 underlyingError: (any Error)? = nil) {
+        self.init(code: code,
+                  message: message,
+                  backendCode: backendCode,
+                  httpStatusCode: httpStatusCode,
+                  userInfo: userInfo,
+                  underlyingError: underlyingError,
+                  storeErrorCode: nil)
+    }
+
+    /// 带商店错误码的内部构造。`storeErrorCode` 没有默认值：不带它的调用一律落到上面的公开构造，
+    /// 两者不会有重载歧义；公开构造的签名因此一个字不变（API 基线）。
+    init(code: PurchasesErrorCode,
+         message: String,
+         backendCode: Int? = nil,
+         httpStatusCode: Int? = nil,
+         userInfo: [String: String] = [:],
+         underlyingError: (any Error)? = nil,
+         storeErrorCode: Int64?) {
         self.code = code
         self.message = message
         self.backendCode = backendCode
         self.httpStatusCode = httpStatusCode
         self.userInfo = userInfo
         self.underlyingError = underlyingError
+        self.storeErrorCode = storeErrorCode
     }
 
     public var description: String {

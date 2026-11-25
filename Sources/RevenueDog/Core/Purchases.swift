@@ -505,8 +505,9 @@ public final class Purchases {
     /// RC 收下之后 **finish 仍由 Dog 负责**（同上 判断 5）。
     ///
     /// 时序保证：回调在 SDK 上报后端之前、`finish()` 之前发生 —— 有单测上锁。
-    /// **不回调的唯一情形**：`StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18），
-    /// 它根本没有 `Product.PurchaseResult` 可交。
+    /// **不回调的情形**：`Product.purchase()` 抛错时根本没有 `Product.PurchaseResult` 可交 ——
+    /// 含 `StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18，`purchase` 照常返回 `userCancelled`），
+    /// 以及其余映射成 `PurchasesError` 抛给宿主的购买失败（0.5.1，ADR 0243）。
     ///
     /// 回调在发起购买的那条 Task 上**同步**执行，请只做转交、别做重活（RC 的
     /// `recordPurchase` 是 async，宿主自行起 Task；见 dual-sdk-integration.md §4）。

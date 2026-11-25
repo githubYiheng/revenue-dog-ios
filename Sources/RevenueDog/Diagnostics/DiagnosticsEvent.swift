@@ -7,7 +7,9 @@
 //  内部 enum 照常使用（同 `Endpoint` / `AuthScope`）。
 //
 //  禁止进 fields（契约 §1.3 末段）：邮箱、姓名、设备名、任何 token/密钥、
-//  请求/响应 body、JWS 原文；错误只取 SDK 自己的 `error_code` / `error_class`，绝不带 message。
+//  请求/响应 body、JWS 原文；错误只取 SDK 自己的 `error_code` / `error_class` 与不带文案的原因字段
+//  （0.5.1 起：`underlying` 是原错误的类别名、`store_error_code` 是整数，见 `DiagnosticsErrorFields`），
+//  绝不带 message（SDK 的、Apple 的都不带）。
 //
 
 import Foundation
@@ -174,11 +176,15 @@ enum DiagnosticsWarningCode {
     static let identityPendingTimeout = "identity_pending_timeout"
     /// ADR 0155：StoreKit 拉商品重试到上限（3 次）仍抛错，付费墙会缺价格。
     /// detail 形如 `attempts=3 error=storeProblemError missing=3 underlying=networkError(-1009)`
-    /// （missing = 这次没补上的商品数；underlying = StoreKitError 的 case 名或错误类型名，不带 message）。
+    /// （missing = 这次没补上的商品数；underlying = 原错误的类别名，与诊断 `underlying` 同一实现
+    /// `StoreKitErrorMapping.underlyingName`，不带 message；链上没有原错误时取外层类型名，如 `PurchasesError`）。
     static let productsFetchFailed = "products_fetch_failed"
 }
 
-/// `receipt_post` / `http_error` 的 `error_class`（契约 §1.3）。
+/// HTTP 状态码 → `error_class` 的三档（契约 §1.3）。`receipt_post` / `http_error` 直接用它
+/// （只会取到 `network` / `auth` / `client` / `server` 四值，巡检 18 / 19 与 `launch-sync` 逐字依赖，不许改）；
+/// 其余五个失败事件经 `DiagnosticsErrorFields.classify` 的「有 HTTP 状态码」一档委派到这里 ——
+/// 同一个状态码在任何事件上给同一个答案。完整词汇见 `DiagnosticsErrorFields`。
 enum DiagnosticsErrorClass {
     static let network = "network"
     static let server = "server"

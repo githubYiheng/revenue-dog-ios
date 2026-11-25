@@ -149,8 +149,12 @@ protocol StoreKitProvider: Sendable {
     ///   （verify/rc-sdk-observer-mode.md §8.1 判断 5）。
     ///   载荷用 `any Sendable` 承运：StoreKit 类型不许渗进业务层（设计 §2 协议隔离），
     ///   还原成 `Product.PurchaseResult` 在 `RuntimeSettings.dispatchPurchaseResult` 里做。
-    ///   **例外**：`StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18）根本没有
-    ///   `Product.PurchaseResult` 可交，不回调 —— RC 侧同样无从记录，语义一致。
+    ///   **例外**：`Product.purchase()` 抛错时根本没有 `Product.PurchaseResult` 可交，不回调 ——
+    ///   含 `StoreKitError.userCancelled` 这种 throw 形态的取消（坑 #18，返回 `.userCancelled`）
+    ///   与其余经 `StoreKitErrorMapping` 映射成 `PurchasesError` 抛出的失败。RC 侧同样无从记录，语义一致。
+    ///
+    /// - Throws: `SK2Provider` 抛的一律是 `PurchasesError`（ADR 0243：StoreKit 的原错误在 `underlyingError`）；
+    ///   测试替身可以编排任意错误（`FakeStoreKitProvider.scriptPurchaseError`）。
     func purchase(product: any StoreProductType,
                   appAccountToken: UUID?,
                   onPurchaseResult: (@Sendable (any Sendable) -> Void)?) async throws -> StorePurchaseOutcome
@@ -381,11 +385,12 @@ struct SK2Provider: StoreKitProvider {
         let result: Product.PurchaseResult
         do {
             result = try await Self.performPurchase(sk2Product, options: options)
-        } catch StoreKit.Product.PurchaseError.purchaseNotAllowed {
-            throw PurchasesError(code: .purchaseNotAllowedError, message: "设备不允许购买")
-        } catch let error as StoreKitError {
-            if case .userCancelled = error { return .userCancelled } // 坑 #18：throw 形态的取消
-            throw PurchasesError(code: .storeProblemError, message: "StoreKit 购买失败", underlyingError: error)
+        } catch {
+            // 坑 #18：throw 形态的取消仍按取消返回，不抛。
+            if StoreKitErrorMapping.isUserCancelled(error) { return .userCancelled }
+            // 其余经唯一映射转成 `PurchasesError`（ADR 0243），原错误留在 `underlyingError`；
+            // 任务取消的 `CancellationError` 原样透出（决定 7）。
+            throw StoreKitErrorMapping.thrownError(fromPurchaseFailure: error)
         }
 
         // M-4：原始结果一到手就交给宿主（**早于**验签丢弃、早于上报、早于 finish）。
@@ -424,8 +429,10 @@ struct SK2Provider: StoreKitProvider {
     // 事实核对（2026-08-28 对照 iOS 26.5 SDK swiftinterface）：
     // - `purchase(confirmIn: some UIScene)` = iOS 17.0+/tvOS 17.0+/visionOS 1.0+，@MainActor；
     // - `purchase(confirmIn: NSWindow)` = macOS 侧变体；
-    // - 矩阵 #23 提到的 `StoreKitError.invalidPresentationContext` **不存在于任何现行 SDK**
-    //   （已在矩阵附录记裁决修正）：无 scene 场景走自动探测尽力，探测不到回落无参形态。
+    // - 矩阵 #23 提到的 `StoreKitError.invalidPresentationContext` 在 26.5 SDK 里还没有；
+    //   2026-11-25 复核 iPhoneOS 27.2 SDK：它从 iOS 27.0 起才有（`@available(iOS 27.0, …)`）。
+    //   映射表不点名它（按「StoreKitError 其余 case → storeProblemError」处理，ADR 0243），
+    //   这里的 UI 策略不变：无 scene 场景走自动探测尽力，探测不到回落无参形态。
     @MainActor
     private static func performPurchase(_ product: Product,
                                         options: Set<Product.PurchaseOption>) async throws -> Product.PurchaseResult {
@@ -462,6 +469,215 @@ struct SK2Provider: StoreKitProvider {
 }
 
 #endif
+
+// MARK: - StoreKit 错误的唯一映射（ADR 0243）
+
+/// SDK 里**唯一**认识 StoreKit 错误类型的地方（ADR 0243 决定 1–3、5）：
+/// 购买错误的码位映射、类别名（诊断 `underlying`）、商店错误码的读取、取消判定。
+/// orchestrator 与诊断只调这里，不再出现任何 StoreKit 错误类型。
+///
+/// 放在 `#if canImport(StoreKit)` 之外：调用方不必为它加平台门控；
+/// 没有 StoreKit 的平台上，StoreKit 相关分支编译期消失，其余规则照常。
+enum StoreKitErrorMapping {
+
+    /// 「类型所在模块是 StoreKit」的判定前缀（`String(reflecting:)` 带模块名）。
+    /// 带点号：`StoreKitTest.` 之类的模块不算。
+    static let storeKitModulePrefix = "StoreKit."
+
+    /// 沿 `PurchasesError.underlyingError` 往里拆的层数上限。901 / 902 是两层包装
+    /// （外层 901 → 上报失败的 `PurchasesError` → 原错误），4 层足够；封顶是防御，链再深就当没有原错误。
+    static let maxUnwrapDepth = 4
+
+    // MARK: 购买错误 → PurchasesError
+
+    /// `Product.purchase` 抛出的错误 → `PurchasesError`。一条规则（ADR 0243 决定 1）：
+    /// **StoreKit 抛的错误 → 表里的具体码位，表里没有的一律 `storeProblemError`；不是 StoreKit 的类型 → `unknownError`。**
+    ///
+    /// | 原错误 | 码位 |
+    /// |---|---|
+    /// | 已经是 `PurchasesError` | 原样返回 |
+    /// | `StoreKitError.networkError` | `networkError`（10） |
+    /// | `StoreKitError.notAvailableInStorefront` | `productNotAvailableForPurchaseError`（5） |
+    /// | `StoreKitError.unsupported`（Swift 6.1 起的 SDK 才有） | `purchaseInvalidError`（4） |
+    /// | `StoreKitError` 其余 case（含将来新增的） | `storeProblemError`（2） |
+    /// | `Product.PurchaseError.purchaseNotAllowed` | `purchaseNotAllowedError`（3） |
+    /// | `Product.PurchaseError.productUnavailable` | `productNotAvailableForPurchaseError`（5） |
+    /// | `Product.PurchaseError` 其余 case（含将来新增的） | `storeProblemError`（2） |
+    /// | StoreKit 模块里的其它错误类型（今天是 `InvalidRequestError`） | `storeProblemError`（2） |
+    /// | 其它类型 | `unknownError`（0） |
+    ///
+    /// 取消（`StoreKitError.userCancelled`）由调用方先用 `isUserCancelled` 接走、返回 `.userCancelled`，不走这里。
+    /// 产出的错误 `underlyingError` 一律是原错误；文案是中性英文（会被宿主直接显示），带类别名与商店错误码，
+    /// **绝不带 Apple 给的文案**。
+    ///
+    /// 未知 case 归 2 而不是 RC 的 0：否则码位随宿主用哪个 Xcode 编译而变（新 case 在旧工具链里就是「未知」）。
+    /// 用 `if case` 而不是穷举 `switch`：不需要 `@unknown default`，也不必为每个新 case 写编译器门控。
+    ///
+    /// 生产路径不直接调它，调 `thrownError(fromPurchaseFailure:)`（多一条任务取消的例外）。
+    static func purchasesError(fromPurchaseFailure error: any Error) -> PurchasesError {
+        if let purchasesError = error as? PurchasesError { return purchasesError }
+        let code = purchaseFailureCode(error)
+        let storeCode = storeErrorCode(of: error)
+        return PurchasesError(code: code,
+                              message: purchaseFailureMessage(code: code,
+                                                              name: leafName(error),
+                                                              storeErrorCode: storeCode),
+                              underlyingError: error,
+                              storeErrorCode: storeCode)
+    }
+
+    /// `SK2Provider.purchase` 实际抛出的错误：映射表之外只有一条例外 ——
+    /// **任务取消的 `CancellationError` 原样透出**（ADR 0243 决定 7：SDK 任何路径都不把它包成 `PurchasesError`，
+    /// 包了只会让写了 `catch is CancellationError` 的宿主开始弹错）。其余走 `purchasesError(fromPurchaseFailure:)`。
+    static func thrownError(fromPurchaseFailure error: any Error) -> any Error {
+        if error is CancellationError { return error }
+        return purchasesError(fromPurchaseFailure: error)
+    }
+
+    private static func purchaseFailureCode(_ error: any Error) -> PurchasesErrorCode {
+        #if canImport(StoreKit)
+        if let storeKitError = error as? StoreKitError {
+            if case .networkError = storeKitError { return .networkError }
+            if case .notAvailableInStorefront = storeKitError { return .productNotAvailableForPurchaseError }
+            #if compiler(>=6.1)
+            // `.unsupported` 随 iOS 18.4 SDK（Xcode 16.3 / Swift 6.1）出现，门控照 RC。
+            // 旧工具链里这一行不存在，它落到下一行的 2。
+            if case .unsupported = storeKitError { return .purchaseInvalidError }
+            #endif
+            return .storeProblemError
+        }
+        if let purchaseError = error as? Product.PurchaseError {
+            if case .purchaseNotAllowed = purchaseError { return .purchaseNotAllowedError }
+            if case .productUnavailable = purchaseError { return .productNotAvailableForPurchaseError }
+            return .storeProblemError
+        }
+        #endif
+        // 不点名具体类型（`InvalidRequestError` 只在新 SDK 里有，引用错了就是宿主编译失败）：按模块判。
+        return isStoreKitModuleError(error) ? .storeProblemError : .unknownError
+    }
+
+    /// 映射出的错误文案（中性英文，与 901 / 902 同一条规则）。例：
+    /// `The App Store could not complete the purchase (InvalidRequestError, code 1002).`
+    private static func purchaseFailureMessage(code: PurchasesErrorCode,
+                                               name: String,
+                                               storeErrorCode: Int64?) -> String {
+        let lead: String
+        switch code {
+        case .networkError:
+            lead = "The App Store purchase failed because of a network error"
+        case .productNotAvailableForPurchaseError:
+            lead = "The product is not available for purchase in the App Store"
+        case .purchaseInvalidError:
+            lead = "The App Store does not support this purchase"
+        case .purchaseNotAllowedError:
+            lead = "Purchases are not allowed on this device or account"
+        case .storeProblemError:
+            lead = "The App Store could not complete the purchase"
+        default:
+            lead = "The purchase failed with an unexpected error"
+        }
+        let detail = storeErrorCode.map { "\(name), code \($0)" } ?? name
+        return "\(lead) (\(detail))."
+    }
+
+    // MARK: 取消
+
+    /// 取消的唯一判定：`StoreKitError.userCancelled`（坑 #18：throw 形态的取消）或已映射的 `purchaseCancelledError`。
+    /// 购买（`SK2Provider.purchase`）与恢复（`AppStore.sync()` 抛的是原始 StoreKit 错误）共用。
+    static func isUserCancelled(_ error: any Error) -> Bool {
+        #if canImport(StoreKit)
+        if let storeKitError = error as? StoreKitError, case .userCancelled = storeKitError { return true }
+        #endif
+        return (error as? PurchasesError)?.code == .purchaseCancelledError
+    }
+
+    // MARK: 模块判定与商店错误码
+
+    /// 错误类型是否定义在 StoreKit 模块里（今天的实例：`StoreKitError`、`Product.PurchaseError`、`InvalidRequestError`）。
+    static func isStoreKitModuleError(_ error: any Error) -> Bool {
+        String(reflecting: type(of: error)).hasPrefix(storeKitModulePrefix)
+    }
+
+    /// StoreKit 错误值自带的整数码（ADR 0243 决定 3）。只认 StoreKit 模块里的类型，
+    /// 读名为 `code` 的整数成员（今天就是 `InvalidRequestError.code`）；读不到就是 nil，不影响映射。
+    /// 不用类型化取值：那要引用 `InvalidRequestError`，而它从哪版 SDK 开始有无法逐版核实。
+    /// **只读码，不读 `message`**（README 对宿主的承诺：不上传错误消息文本）。
+    static func storeErrorCode(of error: any Error) -> Int64? {
+        guard isStoreKitModuleError(error) else { return nil }
+        return integerCodeMember(of: error)
+    }
+
+    /// 纯反射读取：名为 `code` 的子成员是 `Int64`（或 `Int`）就返回。单独拆出来，单测用本地同形结构体验证。
+    /// 宿主日志里 `InvalidRequestError(code: 1002, message: "null")` 就是反射打印出来的，读得到这个成员有生产证据。
+    static func integerCodeMember(of value: Any) -> Int64? {
+        for child in Mirror(reflecting: value).children where child.label == "code" {
+            if let code = child.value as? Int64 { return code }
+            if let code = child.value as? Int { return Int64(code) }
+            return nil
+        }
+        return nil
+    }
+
+    // MARK: 包装链与类别名（诊断 `underlying`）
+
+    /// 顺着 `PurchasesError.underlyingError` 拆开的一条错误链：外层到内层的各层 `PurchasesError`，
+    /// 以及最里层的**非** `PurchasesError` 原错误（没有就是 nil）。类别名、超时判定、商店错误码都顺着它找。
+    struct ErrorChain {
+        let layers: [PurchasesError]
+        let root: (any Error)?
+    }
+
+    static func chain(of error: any Error) -> ErrorChain {
+        var layers: [PurchasesError] = []
+        var current: any Error = error
+        while let purchasesError = current as? PurchasesError {
+            layers.append(purchasesError)
+            // 到顶或链断了：没有原错误（深度封顶时不猜）。
+            guard layers.count <= maxUnwrapDepth, let next = purchasesError.underlyingError else {
+                return ErrorChain(layers: layers, root: nil)
+            }
+            current = next
+        }
+        return ErrorChain(layers: layers, root: current)
+    }
+
+    /// 诊断 `underlying` 的取值（ADR 0243 决定 5，沿用并扩展 ADR 0155 的类别名）：最里层原错误的**类别名，不带文案**。
+    /// 链上没有非 `PurchasesError` 的原错误就是 nil。
+    static func underlyingName(of error: any Error) -> String? {
+        chain(of: error).root.map(leafName)
+    }
+
+    /// 单个原错误的类别名：
+    /// - `StoreKitError` 取 case 名；`networkError` 带 URLError 码（`networkError(-1009)`），`systemError` 不带内层；
+    /// - `Product.PurchaseError` 取 case 名；
+    /// - `URLError` 带码（`URLError(-1001)`）。存进 `any Error` 的 URLError 在 Darwin 上的动态类型是 `NSError`，
+    ///   所以按转型判，不按类型名判；
+    /// - 其它取类型名（`InvalidRequestError`、`CancellationError`、`NSError`…）。
+    static func leafName(_ error: any Error) -> String {
+        #if canImport(StoreKit)
+        if let storeKitError = error as? StoreKitError {
+            // 带关联值的两个显式处理（`systemError` 的关联值里可能有 message），其余取 case 名。
+            if case .networkError(let urlError) = storeKitError {
+                return "networkError(\(urlError.code.rawValue))"
+            }
+            if case .systemError = storeKitError { return "systemError" }
+            return caseName(storeKitError)
+        }
+        if let purchaseError = error as? Product.PurchaseError {
+            return caseName(purchaseError)
+        }
+        #endif
+        if let urlError = error as? URLError {
+            return "URLError(\(urlError.code.rawValue))"
+        }
+        return String(describing: type(of: error))
+    }
+
+    /// 枚举值的 case 名：取描述里第一个 `(` 之前的部分，关联值（可能含文案）一律不带。
+    private static func caseName(_ value: Any) -> String {
+        String(String(describing: value).prefix { $0 != "(" })
+    }
+}
 
 // MARK: - 测试替身（无 StoreKit 依赖）
 
@@ -573,6 +789,15 @@ actor FakeStoreKitProvider: StoreKitProvider {
         scriptedRawPurchaseResult = value
     }
 
+    /// 测试脚本：purchase() 抛的错误（nil = 不抛）。优先级高于两种结果脚本，抛错时不回调钩子（与 SK2Provider 同）。
+    /// **原样抛出、不经 `StoreKitErrorMapping`**：用来验证 orchestrator 对任意错误的处置
+    /// （如 `CancellationError` 原样透出）。要模拟 SK2Provider 的产出，就把映射后的 `PurchasesError` 交进来。
+    private var purchaseError: (any Error)?
+
+    func scriptPurchaseError(_ error: (any Error)?) {
+        purchaseError = error
+    }
+
     func unfinishedTransactions() async -> [any StoreTransactionType] {
         unfinishedCallCount += 1
         if var sequence = unfinishedSequence {
@@ -604,6 +829,7 @@ actor FakeStoreKitProvider: StoreKitProvider {
                   appAccountToken: UUID?,
                   onPurchaseResult: (@Sendable (any Sendable) -> Void)?) async throws -> StorePurchaseOutcome {
         capturedAppAccountTokens.append(appAccountToken)
+        if let purchaseError { throw purchaseError }
         let outcome: StorePurchaseOutcome
         if let asyncScript = nextPurchaseOutcomeAsync {
             outcome = await asyncScript(product.productIdentifier)

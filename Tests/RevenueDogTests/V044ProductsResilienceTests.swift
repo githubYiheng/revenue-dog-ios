@@ -732,19 +732,19 @@ struct V044StoreProductCacheTests {
         #expect(sameStorefront == false)
     }
 
-    @Test("products_fetch_failed 的 underlying：StoreKitError 取 case 名（networkError 带码、systemError 不带内层），其余取类型名，不带 message")
+    @Test("products_fetch_failed 的 underlying：StoreKitError 取 case 名（networkError 带码、systemError 不带内层），URLError 带码，其余取类型名，不带 message")
     func underlyingNames() {
         #if canImport(StoreKit)
         let network = storeProblem(underlying: StoreKitError.networkError(URLError(.notConnectedToInternet)))
-        #expect(PurchasesOrchestrator.storeKitUnderlyingName(network) == "networkError(-1009)")
+        #expect(PurchasesOrchestrator.productsFetchUnderlyingName(network) == "networkError(-1009)")
         let system = storeProblem(underlying: StoreKitError.systemError(
             NSError(domain: "x", code: 1, userInfo: [NSLocalizedDescriptionKey: "secret message"])))
-        #expect(PurchasesOrchestrator.storeKitUnderlyingName(system) == "systemError")
-        #expect(PurchasesOrchestrator.storeKitUnderlyingName(StoreKitError.notEntitled) == "notEntitled")
+        #expect(PurchasesOrchestrator.productsFetchUnderlyingName(system) == "systemError")
+        #expect(PurchasesOrchestrator.productsFetchUnderlyingName(StoreKitError.notEntitled) == "notEntitled")
         #endif
-        #expect(PurchasesOrchestrator.storeKitUnderlyingName(storeProblem()) == "PurchasesError")
-        // 存进 `PurchasesError.underlyingError` 的 Foundation 错误已桥接成 NSError：类型名就是 NSError（口径字面）
-        #expect(PurchasesOrchestrator.storeKitUnderlyingName(storeProblem(underlying: URLError(.timedOut)))
-                == "NSError")
+        #expect(PurchasesOrchestrator.productsFetchUnderlyingName(storeProblem()) == "PurchasesError")
+        // 0.5.1（ADR 0243）：URLError 带码。存进 `underlyingError` 后动态类型是 NSError，0.4.4–0.5.0 这里取到的是 "NSError"。
+        #expect(PurchasesOrchestrator.productsFetchUnderlyingName(storeProblem(underlying: URLError(.timedOut)))
+                == "URLError(-1001)")
     }
 }

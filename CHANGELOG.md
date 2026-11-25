@@ -5,8 +5,72 @@
 
 ## [Unreleased]
 
-- 文档（无 API 变化）：`EntitlementInfo.isSandbox` 说明它是「当前授予该权益的商品」的环境；README 补「判断某笔购买是不是沙盒」的读法
+## [0.5.1] - 2026-11-25
+
+**修订号**（公开 API 基线无差异）。**行为变化**：`purchase` 抛出的错误变了（见下表），按原始 StoreKit 类型 `catch` 的宿主要改代码；
+只按 `PurchasesError.code` 分支的宿主不用改代码，但网络错误与不在售地区两种情况的码位变了。ADR 0243。
+
+### 行为变化：`purchase` 抛出的 StoreKit 错误一律是 `PurchasesError`
+
+- 现象：生产告警 353（bff，2026-11-25）：近 30 天 8 次 / 7 个用户购买失败，宿主拿到的是原始的 `StoreKit.InvalidRequestError`（code 1002），
+  不是 `PurchasesError`，直接把系统原文显示给了用户；我方诊断里只有 `error_code = unknownError`。
+  0.5.0 只接 `Product.PurchaseError.purchaseNotAllowed` 与 `StoreKitError`，其余错误原样抛出。
+- 修法：`Product.purchase` 抛出的错误经唯一一个映射转成 `PurchasesError`，**原错误放在 `underlyingError`**。
+  规则：StoreKit 抛的错误 → 表里的码位，表里没有的一律 `storeProblemError`；不是 StoreKit 的类型 → `unknownError`。
+
+| 原错误 | 0.5.0 | 0.5.1 |
+|---|---|---|
+| `StoreKitError.userCancelled` | 返回 `userCancelled == true`，不抛 | 不变 |
+| `StoreKitError.networkError` | `storeProblemError`（2） | **`networkError`（10）** |
+| `StoreKitError.notAvailableInStorefront` | 2 | **`productNotAvailableForPurchaseError`（5）** |
+| `StoreKitError.unsupported`（Xcode 16.3 / Swift 6.1 起的 SDK 才有） | 2 | **`purchaseInvalidError`（4）** |
+| `StoreKitError` 其余 case（含将来新增的） | 2 | 2（不变） |
+| `Product.PurchaseError.purchaseNotAllowed` | `purchaseNotAllowedError`（3） | 3（不变；`underlyingError` 带原错误） |
+| `Product.PurchaseError.productUnavailable` | 原样抛出 | **`productNotAvailableForPurchaseError`（5）** |
+| `Product.PurchaseError` 其余 case（含将来新增的） | 原样抛出 | **`storeProblemError`（2）** |
+| StoreKit 模块里的其它错误类型（今天是 `InvalidRequestError`） | 原样抛出 | **`storeProblemError`（2）**，文案带商店错误码 |
+| 其它类型 | 原样抛出 | **`unknownError`（0）** |
+
+- 对照 RC（purchases-ios 5.103.2）：10 / 5 / 4 与 `productUnavailable` 和 RC 同码。偏离三处：未知 case 归 2（RC 归 0，那样码位会随宿主用哪个 Xcode 编译而变）；
+  `InvalidRequestError` 归 2（RC 没有这个分支，落到 0）；促销类 case 归 2（我方没有对应码位，SDK 也不传促销参数）。
+- 文案（`message` / `localizedDescription`）改为中性英文，带原错误的类别名与商店错误码，例如
+  `The App Store could not complete the purchase (InvalidRequestError, code 1002).`；**不带 Apple 给的文案**。
+  原来的两条中文文案（「设备不允许购买」「StoreKit 购买失败」）一并改掉。
+- 不变：取消仍返回 `userCancelled == true`；恢复购买的取消仍抛 `purchaseCancelledError`；901 / 902 的语义与文案不变；
+  拉商品（`offerings()` 与购买前取商品）重试后仍抛错仍是 `storeProblemError`；
+  **任务被取消时抛出的 `CancellationError` 仍原样抛给宿主**（SDK 不把它包成 `PurchasesError`）。
+
+### 迁移说明（宿主）
+
+- 按 `error.code` 分支：除 901 / 902（扣款之后的两个码位）外，`purchase` 抛错就是这次购买没有成交。示例见 README「购买结果」。
+- 按原始 StoreKit 类型 `catch` 的代码（`catch let error as StoreKitError` / `as Product.PurchaseError` / `as InvalidRequestError`）不会再命中，
+  改读 `(error as? PurchasesError)?.underlyingError`。
+- 以前网络错误、不在售地区拿到的是 2，现在是 10 / 5。照 RC 写过这两个码位分支的宿主，这两个分支开始生效。
+- 直接显示 `localizedDescription` 的宿主：文案由中文 / 系统原文变成英文。要本地化的，按 `error.code` 自己出文案。
+
+### 诊断
+
+- 五个失败事件（`identity_login` / `identity_logout`、`customer_info_fetch`、`offerings_fetch`、`purchase_result`、`restore` / `sync`）
+  统一新增原因字段，口径与 Android 0.1.3 起相同（`docs/plan/sdk-diagnostics.md` §1.3 / §8）：
+  - `error_class`：`network | timeout | auth | client | server | billing | parse | config | unknown`；
+  - `underlying`：最里层原错误的类别名，不带文案，如 `InvalidRequestError` / `networkError(-1009)` / `URLError(-1001)` / `CancellationError`；
+  - `store_error_code`（iOS 专属）：StoreKit 错误值自带的整数码，如 1002；
+  - 能取到时还有 `status` / `backend_code`。
+  调用点原有字段（`status` / `request_id` / `count` / `products_error_code` 等）取值不变，`error_code` 口径不变。
+- `InvalidRequestError` 的 `error_code` 由 `unknownError` 变为 `storeProblemError`，靠 `underlying` 与 `store_error_code` 分辨；老版本仍记 `unknownError`，按 `sdk_version` 区分。
+- `customer_info_fetch` 以前只在抛 `PurchasesError` 时记失败事件，现在任何错误都记（如任务取消的 `CancellationError`）。
+- `products_fetch_failed` 的 detail 里 `underlying=` 与上面同一实现：原错误是 `URLError` 时由 `NSError` 变为 `URLError(<code>)`，其余写法不变。
+- `receipt_post` / `http_error` 不变（`error_class` 仍只有 `network` / `auth` / `client` / `server` 四值）。
+- 仍然**不上传任何错误文案**（SDK 的、Apple 的都不上传）。服务端不改，无迁移。
+
+### 文档
+
+- （原 Unreleased 条目）`EntitlementInfo.isSandbox` 说明它是「当前授予该权益的商品」的环境；README 补「判断某笔购买是不是沙盒」的读法
   （读 `subscriptionsByProductIdentifier[productID]`，取不到按沙盒）。起因：宿主拿权益上的值判断首购事件发不发。
+
+### 内部
+
+- `X-Version` 变为 `0.5.1`（出站请求快照同步）。
 
 ## [0.5.0] - 2026-11-12
 
