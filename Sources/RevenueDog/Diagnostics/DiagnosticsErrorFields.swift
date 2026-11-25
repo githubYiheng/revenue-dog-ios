@@ -4,7 +4,7 @@
 //  `error_class` 的词汇与判定顺序见 §1.3）。与 Android `DiagnosticsErrorFields` 同名、同键、同判定顺序。
 //
 //  起因：0.5.0 及以前五个失败事件各自只写 `error_code`，不是 `PurchasesError` 的错误一律落 `unknownError`；
-//  告警 353 那 8 次购买失败在诊断里只剩一个 `unknownError`，原错误（`InvalidRequestError` 1002）只能去宿主日志里找。
+//  生产上一类购买失败在诊断里只剩一个 `unknownError`，原错误（`InvalidRequestError` 1002）只能去宿主日志里找。
 //
 //  走这里的五个事件：`identity_login` / `identity_logout`、`customer_info_fetch`、`offerings_fetch`、
 //  `purchase_result`、`restore` / `sync`。**`receipt_post` / `http_error` 不经这里**

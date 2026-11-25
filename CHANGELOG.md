@@ -12,7 +12,7 @@
 
 ### 行为变化：`purchase` 抛出的 StoreKit 错误一律是 `PurchasesError`
 
-- 现象：生产告警 353（bff，2026-11-25）：近 30 天 8 次 / 7 个用户购买失败，宿主拿到的是原始的 `StoreKit.InvalidRequestError`（code 1002），
+- 现象：一个宿主在生产上出现一类购买失败，宿主拿到的是原始的 `StoreKit.InvalidRequestError`（code 1002），
   不是 `PurchasesError`，直接把系统原文显示给了用户；我方诊断里只有 `error_code = unknownError`。
   0.5.0 只接 `Product.PurchaseError.purchaseNotAllowed` 与 `StoreKitError`，其余错误原样抛出。
 - 修法：`Product.purchase` 抛出的错误经唯一一个映射转成 `PurchasesError`，**原错误放在 `underlyingError`**。
