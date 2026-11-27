@@ -141,6 +141,9 @@ enum DiagnosticsEventType {
     static let offeringsFetch = "offerings_fetch"
     static let httpError = "http_error"
     static let sdkWarning = "sdk_warning"
+    /// 0.5.2（ADR 0248 决定 7）：每一遍属性同步**真正发了请求**就记一条（与 Android 同名）。排查用，不是发布核对口径：
+    /// info 会被采样，被系统回收的那一遍一条都不记。
+    static let attributesSync = "attributes_sync"
 }
 
 enum DiagnosticsLevel {
@@ -219,6 +222,32 @@ enum DiagnosticsCustomerInfoSource: String, Sendable {
     case sync
     case stream
     case login
+}
+
+/// `attributes_sync.outcome`（与 Android 同值域）。
+enum DiagnosticsAttributesSyncOutcome {
+    /// 2xx：服务端已落库，标记已同步。
+    static let success = "success"
+    /// 确定性 4xx（404 / 408 / 429 除外，坑 #127）：标记已同步、不再重试。
+    static let rejected = "rejected"
+    /// 其余失败（5xx / 网络 / 404 / 408 / 429）：保留待发，等下一个时机。
+    static let retryable = "retryable"
+}
+
+/// `attributes_sync.trigger`：开始这一遍的那次调用（ADR 0248 决定 7）。并进这一遍的其它调用只计入 `joined`。
+enum DiagnosticsAttributesSyncTrigger: String, Sendable {
+    /// `willResignActiveNotification`（macOS 单测：`NSApplication.didResignActiveNotification`）。
+    case resignActive = "resign_active"
+    /// `didEnterBackgroundNotification`。
+    case background
+    /// 回前台（`didBecomeActive`，含 configure 时应用已经活跃的那一次）。
+    case foreground
+    /// `logIn` 切换身份前后的两次。
+    case login
+    /// `logOut` 切换身份前。
+    case logout
+    /// 宿主显式调用 `syncAttributesIfNeeded()`。
+    case explicit
 }
 
 /// `purchase_result.outcome`。

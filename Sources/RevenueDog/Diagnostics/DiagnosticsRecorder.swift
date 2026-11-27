@@ -5,7 +5,7 @@
 //  触发上传（四条，任一命中即发）：
 //    1. 队列 ≥ 20 条
 //    2. 前台每 30s 定时（**有事件才发**）
-//    3. 进后台时（走既有前后台抽象，见 Purchases.applicationDidEnterBackground）
+//    3. 离开前台时：失活与进后台各一次，包在后台活动里（0.5.2 / ADR 0248，见 `Purchases.leaveForeground`）
 //    4. 任一 `warn` / `error` 级事件入队后 2s 防抖（§6-8：`finish_decision{kept}` 是 warn，
 //       「付了钱确认不了」必须和 error 一样快地到后端，不能等下一个 30s）
 //
@@ -225,7 +225,7 @@ actor DiagnosticsRecorder {
         return result
     }
 
-    /// 进后台：把攒着的事件冲出去（`Purchases.applicationDidEnterBackground`）。
+    /// 离开前台（失活 / 进后台）：把攒着的事件冲出去（`Purchases.leaveForeground`，调用方已包好后台活动）。
     func flushForBackground() async {
         guard enabled, await queue.count > 0 else { return }
         await flush()
@@ -253,7 +253,7 @@ actor DiagnosticsRecorder {
             while !Task.isCancelled {
                 try? await scheduler.sleep(seconds: Self.periodicInterval)
                 guard !Task.isCancelled else { return }
-                // 前台才发（后台由 didEnterBackground 那一次负责），且**有事件才发**。
+                // 前台才发（后台由离开前台那一次负责），且**有事件才发**。
                 guard !AppStateProvider.isBackgrounded else { continue }
                 await self?.flushIfNonEmpty()
             }

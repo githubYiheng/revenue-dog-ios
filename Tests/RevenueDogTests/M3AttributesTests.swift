@@ -1,7 +1,8 @@
 //
 //  M3AttributesTests.swift
 //  Subscriber attributes：本地缓冲（按 appUserID 分桶 / 持久化 / 未同步标记）、LWW、
-//  50 上限与墓碑删除、同步时机（进入后台 / 购买搭车 / logIn 合并前后 / 显式）。
+//  50 上限与墓碑、同步时机（离开前台 / 购买搭车 / logIn 合并前后 / 显式）。
+//  0.5.2（ADR 0248）的失活 / 回前台 / 按遍合并 / attributes_sync 见 `V052AttributeSyncTests`。
 //
 //  契约 §2.4 + 服务端 `workers/api/src/attributes.ts`（以服务端为准）。
 //  坑矩阵：#51（一属性一 key，消灭 RMW）、#52（logIn 前 sync + 只有旧身份匿名才迁移）、
@@ -161,7 +162,7 @@ struct SubscriberAttributesStoreTests {
         #expect(second.updatedAtMs > first.updatedAtMs)
     }
 
-    @Test("墓碑：空串与 nil 同义 = 删除；上行编码为空串（receipts 通道只认 string）")
+    @Test("墓碑：空串与 nil 同义 = 删除；上行编码为空串（receipts 通道只认 string）；同步后保留为已同步墓碑（ADR 0248）")
     func tombstoneEncodesAsEmptyString() async throws {
         let store = makeStore()
         _ = await store.set(["favorite": "pizza"], appUserID: "alice")
@@ -179,9 +180,18 @@ struct SubscriberAttributesStoreTests {
         _ = await store.set(["other": nil], appUserID: "alice")
         #expect(await store.attribute(forKey: "other", appUserID: "alice")?.isTombstone == true)
 
-        // 同步完成后墓碑本地清除（服务端已存 NULL）
+        // 0.5.2（ADR 0248 决定 6）：同步完成后墓碑**保留**、标成已同步（0.5.1 是删文件，
+        // 宿主再写空值就又是一条未同步墓碑，每个前台周期多发一次请求）
         await store.markSynced(await store.unsynced(appUserID: "alice"), appUserID: "alice")
-        #expect(await store.attribute(forKey: "favorite", appUserID: "alice") == nil)
+        let synced = try #require(await store.attribute(forKey: "favorite", appUserID: "alice"))
+        #expect(synced.isTombstone)
+        #expect(synced.isSynced)
+        #expect(await store.unsynced(appUserID: "alice").isEmpty)
+
+        // 再写空值：值与同步状态都没变 → 不重写、不产生新的待发
+        _ = await store.set(["favorite": nil, "other": ""], appUserID: "alice")
+        #expect(await store.unsynced(appUserID: "alice").isEmpty)
+        #expect(await store.attribute(forKey: "favorite", appUserID: "alice")?.updatedAtMs == synced.updatedAtMs)
     }
 
     @Test("50 个自定义属性上限：超出的键被拒绝；保留键与墓碑不计入配额")
@@ -376,7 +386,7 @@ extension PurchasesSingletonDomain {
             #expect(await purchases.unsyncedAttributes().isEmpty)
         }
 
-        @Test("广告转发 setter：nil = 删除（墓碑，上行为空串），同步后本地清除")
+        @Test("广告转发 setter：nil = 删除（墓碑，上行为空串），同步后保留为已同步墓碑、再写 nil 不再待发（ADR 0248）")
         func adForwardingSettersNilDeletes() async throws {
             let transport = AttrTransport()
             let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
@@ -403,6 +413,14 @@ extension PurchasesSingletonDomain {
                 #expect((deleted[key] as? [String: Any])?["value"] as? String == "") // 删除 = 空串，不是 JSON null
             }
             #expect(await purchases.unsyncedAttributes().isEmpty)
+
+            // 宿主按接入约定反复写空值：已同步的墓碑不再变成待发，不白发请求
+            purchases.setAdMeasurementConsent(nil)
+            purchases.setTimezone(nil)
+            purchases.setFBCampaignIDs(nil)
+            #expect(await purchases.unsyncedAttributes().isEmpty)
+            await purchases.syncAttributesIfNeeded()
+            #expect(await transport.requests(pathSuffix: "/attributes").count == 2)
         }
 
         @Test("setAttributes 同样拒绝三个广告转发保留键，只能走专用 setter")
@@ -422,7 +440,7 @@ extension PurchasesSingletonDomain {
             #expect(Set(attributes.keys) == ["favorite_food"])
         }
 
-        @Test("同步时机 —— 进入后台通知触发一次属性同步")
+        @Test("同步时机 —— 离开前台（UIKit 进后台；macOS 失活通知兼做进后台）触发一次属性同步并翻后台标志")
         func appDidEnterBackgroundTriggersSync() async throws {
             let transport = AttrTransport()
             let (purchases, _) = makeAttrPurchases(transport: transport, appUserID: "alice")
@@ -431,7 +449,7 @@ extension PurchasesSingletonDomain {
             #expect(await transport.requests(pathSuffix: "/attributes").isEmpty)
 
             #if canImport(AppKit) && !canImport(UIKit)
-            // 真实通知链路（macOS 侧对应 UIApplication.didEnterBackgroundNotification）
+            // 真实通知链路。macOS 没有「进后台」：失活一个通知做「翻标志 + 离开前台」（ADR 0248 决定 1）
             NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
             #else
             purchases.applicationDidEnterBackground()

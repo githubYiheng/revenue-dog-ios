@@ -14,6 +14,7 @@ import Testing
 #if canImport(StoreKitTest) && canImport(StoreKit)
 import StoreKit
 import StoreKitTest
+import UIKit
 @testable import RevenueDog
 
 extension StoreKitScenarioDomain {
@@ -989,6 +990,93 @@ extension StoreKitScenarioDomain {
             // 商店里没有的商品：storeProduct 保持 nil，offerings 本身照常返回
             #expect(current["ghost"] != nil)
             #expect(current["ghost"]?.storeProduct == nil)
+        }
+    }
+}
+
+// MARK: - ⑭ 离开前台 / 回前台的属性上传：真实 UIKit 通知与后台任务（ADR 0248）
+
+extension StoreKitScenarioDomain {
+
+    /// SDK 单测在 macOS 上跑，UIKit 那条路径（`willResignActive` / `didEnterBackground` 观察、
+    /// `UIApplication.beginBackgroundTask` / `endBackgroundTask`）只编译不执行。这里在 iOS 运行时、宿主 app 里
+    /// 用**生产的申请面**（`SystemAppLifecycleProvider`）把这条路径真跑一遍：通知名接对了、申请与结束不崩、请求发得出去。
+    /// 验证不了的：进程真被挂起时请求能否发完（要真机 / 手动走，见 ADR 0248 后果里的发版前验收）。
+    @MainActor
+    @Suite("⑭ 离开前台 / 回前台的属性上传：真实 UIKit 通知与后台任务（ADR 0248）")
+    struct LifecycleAttributeSyncTests {
+
+        private static let attributesPath = "/v1/subscribers/storekit-test/attributes"
+
+        /// 全部 `attributes_sync` 的 `trigger`（还在队列里的 + 已随诊断上传发走的），按出现顺序去重。
+        /// iOS 上「哪个通知对应哪个 trigger」只有这里跑得到（macOS 单测只有失活一个通知）。
+        private static func syncTriggers(_ sdk: SDKSession) async -> [String] {
+            var triggers: [String] = []
+            for request in await sdk.transport.requests(forPath: "/v1/diagnostics/events") {
+                guard let body = request.httpBody,
+                      let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                      let events = object["events"] as? [[String: Any]] else { continue }
+                for event in events where event["type"] as? String == DiagnosticsEventType.attributesSync {
+                    if let trigger = (event["fields"] as? [String: Any])?["trigger"] as? String { triggers.append(trigger) }
+                }
+            }
+            for event in await sdk.purchases.diagnosticsRecorder.queuedEvents()
+            where event.type == DiagnosticsEventType.attributesSync {
+                if case .string(let trigger)? = event.fields["trigger"] { triggers.append(trigger) }
+            }
+            var seen: Set<String> = []
+            return triggers.filter { seen.insert($0).inserted }
+        }
+
+        @Test("失活通知发一次 /attributes；进后台通知翻后台标志、有新待发才再发；回前台通知复位标志并补传")
+        func lifecycleNotificationsDriveAttributeSync() async throws {
+            let directory = try TempDirectory.make()
+            defer {
+                TempDirectory.remove(directory)
+                SDKSession.tearDown()
+                AppStateProvider.setBackgrounded(false)
+            }
+            let sdk = await SDKSession.start(directory: directory, receipts: [], diagnosticsEnabled: true)
+
+            // 宿主 app 已经在前台跑着（测试在启动完成之后执行）：生产的判定应当为「活跃」—— 晚 configure 的宿主靠它追平。
+            // 反面（`App.init` 时没有 scene、判定为不活跃）单测跑不到，见 pitfalls P106 的实测。
+            #expect(SystemAppLifecycleProvider().isApplicationActive)
+            // 所以 configure 时已经补跑了一次回前台处理（刷新 → 补传 → 重扫）。等它收尾再往下走：
+            // 否则它那一遍补传可能抢在下面的失活之前带走刚写的属性，事件的 trigger 就成了 foreground（不是缺陷，只是这里要逐个对通知）。
+            #expect(await SKObserve.wait { await sdk.transport.callCount(forPath: "/v1/subscribers/storekit-test") >= 1 })
+            try await Task.sleep(nanoseconds: 300_000_000)
+
+            // ① 失活：主触发。失活不翻「在后台」标志。
+            sdk.purchases.setAttributes(["favorite": "pizza"])
+            NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+            #expect(await SKObserve.wait { await sdk.transport.callCount(forPath: Self.attributesPath) == 1 })
+            #expect(await SKObserve.wait { await sdk.purchases.unsyncedAttributes().isEmpty })
+            #expect(AppStateProvider.isBackgrounded == false)
+            _ = await SKObserve.wait(timeout: 5) { await Self.syncTriggers(sdk).contains("resign_active") }
+            #expect(await Self.syncTriggers(sdk) == ["resign_active"])
+
+            // ② 进后台：没有待发 → 不重复发；翻标志（同步完成，不等任务）。
+            NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+            #expect(AppStateProvider.isBackgrounded)
+            try await Task.sleep(nanoseconds: 300_000_000)
+            #expect(await sdk.transport.callCount(forPath: Self.attributesPath) == 1)
+
+            // ③ 已经失活之后才写的属性，由进后台那一次带走。
+            sdk.purchases.setAttributes(["late": "x"])
+            NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+            #expect(await SKObserve.wait { await sdk.transport.callCount(forPath: Self.attributesPath) == 2 })
+            _ = await SKObserve.wait(timeout: 5) { await Self.syncTriggers(sdk).contains("background") }
+            #expect(await Self.syncTriggers(sdk) == ["resign_active", "background"])
+
+            // ④ 回前台：复位标志；离开时没发出去的在这里补传（这里用一条新写入模拟）。
+            sdk.purchases.setAttributes(["after": "y"])
+            #expect(await SKObserve.wait { await sdk.purchases.unsyncedAttributes().count == 1 })
+            NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+            #expect(await SKObserve.wait { AppStateProvider.isBackgrounded == false })
+            #expect(await SKObserve.wait { await sdk.transport.callCount(forPath: Self.attributesPath) == 3 })
+            _ = await SKObserve.wait(timeout: 5) { await Self.syncTriggers(sdk).contains("foreground") }
+            #expect(await Self.syncTriggers(sdk) == ["resign_active", "background", "foreground"])
+            #expect(await SKObserve.wait { await sdk.purchases.unsyncedAttributes().isEmpty })
         }
     }
 }

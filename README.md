@@ -172,6 +172,15 @@ info.entitlements["pro"]?.productPlanIdentifier            // Play base plan；A
 | `setAdMeasurementConsent` | `$adMeasurementConsent` | App 内「分享使用 / 广告衡量数据」开关的当前值，启动时与开关变化时写。只会写 `true` / `false`，服务端只把 `true` 当作同意；没写过的客户按项目配置处理 |
 | `setFBCampaignIDs` | `$fbCampaignIds` | 处理 Facebook 回流深链时，链接里 `campaign_ids` 的原串。服务端只给写入后 7 天内发生的事件带上 |
 
+**这些属性什么时候上传（0.5.2 起）。** setter 只写本地缓冲，SDK 在下面几个时刻把待发的属性发出去：
+
+- App 离开前台（失活、进后台各一次，SDK 自己申请后台时间把请求发完）；
+- App 回到前台（configure 时 App 已经在前台也算一次），用来补上一次没发出去的；
+- 购买上报时随收据一起带上；`logIn` 切换前后与 `logOut` 之前；
+- 宿主调 `await Purchases.shared.syncAttributesIfNeeded()`：写完马上要生效时用。调用返回时，调用前写入的属性都已经尝试过一次上传。
+
+所以正常情况下不需要显式调用。0.5.1 及更早版本只在进后台时发、且没有后台时间保护，可能发不出去；这些版本上请在写完属性后显式调一次。
+
 **用户 ID 的匹配（可选，但建议做）。** 项目端点的「用户 id」配成哈希后发时，服务端给具名用户的每条事件带 `external_id` = App User ID 的 SHA-256。要让 Meta 把它和 App 里的事件对上，
 客户端要把**同一个 App User ID**通过 Facebook SDK 的高级匹配接口交给 SDK，**传原值，不用自己哈希**：
 
@@ -208,6 +217,15 @@ let isSandbox = result.productIdentifier
 不要读 `entitlements["pro"]?.isSandbox`：它描述的是**当前授予该权益的商品**（到期最晚的来源），不一定是这笔购买。
 例如测试账号本来就有后台授予的权益时，它是 `false`，沙盒里买的那一笔就会被当成正式购买发出去。
 一次性商品读 `nonSubscriptionTransactions` 里那笔交易的 `isSandbox`。
+
+**`purchase` 返回成功不等于「刚成交了一笔新交易」，App 自己发购买事件前要过三道门。** 已有订阅的人再点购买、试用期内换套餐时，
+Apple 会把原来那笔交易交回来，SDK 照常上报并返回成功。直接按用户点的套餐发事件，就会多报一次试用开始或按标价的购买。
+
+- 同一个 `transactionIdentifier` 只发一次，记录要落盘（重启后还在）；
+- `purchaseDate` 为空或距现在超过 1 小时不发（重装后本地记录是空的，第一道门挡不住）；
+- `productIdentifier` 与用户点的商品不一致不发。
+
+三个字段都在 `purchase` 的返回值 `PurchaseResult` 上。这三道门对 Meta、TikTok、GA4 的客户端事件同样适用。
 
 **3. 先关掉 Facebook SDK 的自动内购记录。** Facebook SDK 默认自动记录 StoreKit 购买（非消耗型、自动续期订阅、非续期订阅），
 自动事件不带上面的 `event_id`，服务端再发一条就会重复计数。所以服务端发开始试用、首购、一次性购买这三类事件之前，
@@ -303,7 +321,7 @@ finish 判定结果与理由、当前生效的权益 id。系统信息走既有�
 邮箱 / 姓名 / 设备名。`http_error` 的 `path` 会把 app_user_id 段替换成 `*`。
 
 **行为**：事件先落 `<Application Support>/RevenueDog/diagnostics/queue.jsonl`（上限 500 条 / 256 KB，
-超限丢最旧）；队列攒够 20 条、前台每 30s、进后台、或任一 warn/error 事件 2s 防抖后上传；
+超限丢最旧）；队列攒够 20 条、前台每 30s、离开前台（失活与进后台）、或任一 warn/error 事件 2s 防抖后上传；
 失败按 30s→1h 指数退避并**保留事件**，恢复后补发；鉴权失败停 1 小时。同一时刻只有一个上传在飞。
 
 > **宿主需要自己做的两件事**：
@@ -425,7 +443,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 可覆盖变量：`SK_OS` / `SK_DEVICE` / `SK_DESTINATION` / `SK_SCHEME` / `SK_TEST_PLAN` /
 `SK_FILTER` / `SK_DERIVED_DATA` / `XCODEGEN`。
 
-### 场景表（28 条，iOS 18.5 全绿；`unsupported` 那条按设计记 1 个已知问题）
+### 场景表（29 条，iOS 18.5 全绿；`unsupported` 那条按设计记 1 个已知问题）
 
 | # | 场景 | 对照编号 | 关键断言 |
 |:-:|---|---|---|
@@ -455,6 +473,7 @@ SK_FILTER='StoreKitScenarioDomain/ConsumableTests' sdk/ios/scripts/storekit-test
 | ⑪ | 一次购买产出 `purchase_started → transaction_observed → receipt_post → finish_decision` | ADR 0028 | 事件字段合规、无 JWS/密钥外泄 |
 | ⑫ | `Package.storeProduct` 来自真 StoreKit | v0.2.0 A | 价格 / `subscriptionPeriod` 映射正确；消耗型无周期；商店没有的仍为 nil |
 | ⑬ | 持久化旧具名身份 C + 现役订阅（已 finish）→ 开关 `waitsForLogInBeforeSync` 开 → 宿主 `logIn(D)` | ADR 0046 / 0047（C5 剧本 1 事故形态） | 冷启动 1.5s 零上报；identify 先于收据；收据 `app_user_id == D`、`initiation_source == "queue"` |
+| ⑭ | 真实的失活 / 进后台 / 回前台通知驱动属性上传，用生产的后台任务申请面（v0.5.2） | ADR 0248 | 失活发一次 `/attributes` 且不翻后台标志；进后台翻标志、有新待发才再发；回前台复位标志并补传。SDK 单测在 macOS 上跑，UIKit 这条路径只有这里真执行；进程真被挂起时能否发完仍要真机走 |
 
 ### 做不到 / 没做的场景（写明理由，不硬凑）
 

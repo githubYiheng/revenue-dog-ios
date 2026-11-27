@@ -266,7 +266,8 @@ actor SubscriberAttributesStore {
 
         for item in toWrite {
             let previous = attribute(forKey: item.key, appUserID: appUserID)
-            // 值与同步状态都没变 → 不重写文件，也不重置 isSynced（避免每次前后台都白发一次请求）
+            // 值与同步状态都没变 → 不重写文件，也不重置 isSynced（避免每次前后台都白发一次请求）。
+            // 已同步的墓碑同样适用（0.5.2 起墓碑同步后保留）：宿主反复 `setIDFA(nil)` 不再产生新的待发。
             if let previous, previous.value == item.value, previous.isSynced { continue }
             let updatedAtMs = max(nowMs, (previous?.updatedAtMs ?? 0) + 1)
             write(SubscriberAttribute(key: item.key,
@@ -287,15 +288,15 @@ actor SubscriberAttributesStore {
     ///
     /// 只对「时间戳与上行时一致」的条目生效 —— 上行途中被新的 setter 覆盖过的属性
     /// 必须保持未同步，否则那次更新会永远发不出去。
-    /// 已同步的**墓碑**直接删文件：服务端已存 NULL，本地不必再留（也让 50 上限计数干净）。
+    ///
+    /// 已同步的**墓碑**与值一样标成 `isSynced = true` 保留（0.5.2，ADR 0248 决定 6）。0.5.1 及以前是删文件，
+    /// 宿主下次再写空值时找不到旧条目，又是一条未同步墓碑 —— 按接入约定每次回前台写一遍、ATT 未授权时 `setIDFA(nil)` 的宿主，
+    /// 每个前台周期都会多发一次 `POST /attributes`。保留之后由 `set` 里「值与同步状态都没变就不重写」一条规则同时管住值和墓碑。
+    /// 50 个自定义属性的上限本来就不数墓碑（`set` 的计数口径），保留不占配额。
     func markSynced(_ attributes: [SubscriberAttribute], appUserID: String) {
         for sent in attributes {
             guard let current = attribute(forKey: sent.key, appUserID: appUserID),
                   current.updatedAtMs == sent.updatedAtMs else { continue }
-            if current.isTombstone {
-                try? FileManager.default.removeItem(at: url(appUserID: appUserID, key: sent.key))
-                continue
-            }
             var synced = current
             synced.isSynced = true
             write(synced, appUserID: appUserID)

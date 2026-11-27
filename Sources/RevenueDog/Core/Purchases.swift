@@ -269,7 +269,11 @@ public final class Purchases {
     }
 
     /// 仅用于测试：拆掉单例。
+    ///
+    /// 先**显式**摘掉旧实例的前后台观察者（审查 S6）：旧实例会被启动 Task、属性写入链 Task 延迟释放，
+    /// 只靠盒子析构摘除的话，下一个用例发的前后台通知还会被它响应（多出后台活动申请、多出请求）。
     static func resetForTesting() {
+        instance?.lifecycleObservers.removeAll()
         instance = nil
     }
 
@@ -301,6 +305,9 @@ public final class Purchases {
         var storeProductsBackoff: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
         /// 在途 StoreKit 商品请求的合并时限（ADR 0155：默认 10 s，超龄的不再接新等待者）。测试注入短值。
         var storeProductsInFlightMaxAge: Duration = PurchasesOrchestrator.storeProductsInFlightMaxAgeDefault
+        /// 后台活动的申请面与「应用当前是否活跃」（0.5.2，ADR 0248 决定 2）。configure 时在主线程调用**一次** ——
+        /// 生产实现要在主线程取 `UIApplication` 实例；测试注入记录型实现。
+        var makeAppLifecycle: @MainActor @Sendable () -> any AppLifecycleProvider = { SystemAppLifecycleProvider() }
 
         /// 诊断管线的注入点。默认即生产配置。
         struct DiagnosticsDependencies: Sendable {
@@ -373,6 +380,8 @@ public final class Purchases {
     /// 前后台通知观察者。装在独立盒子里：Purchases 释放时盒子随之析构并摘掉观察者
     /// （Swift 6 下 @MainActor 类的 deinit 不能安全触碰隔离状态，所以不写在 deinit 里）。
     private let lifecycleObservers = NotificationObserverBox()
+    /// 后台活动申请面 + 「应用当前是否活跃」（ADR 0248 决定 2）。
+    private let appLifecycle: any AppLifecycleProvider
     /// 属性写入的串行链。setter 是 fire-and-forget，若各自起一个 Task，
     /// **同一个键连写两次时执行顺序不保证** —— 后调用的可能先落盘，用户看到的就是「改回去了」。
     /// 串成一条链后「调用顺序 = 落盘顺序」（LWW 的语义前提）。
@@ -463,6 +472,7 @@ public final class Purchases {
                                                   storeProductsInFlightMaxAge: dependencies.storeProductsInFlightMaxAge)
         self.orchestrator = orchestrator
         self.attribution = Attribution(orchestrator: orchestrator)
+        self.appLifecycle = dependencies.makeAppLifecycle()
 
         // 同步可读的 appUserID：显式传入就用它，否则先给一个匿名 ID，
         // 启动 Task 里再与持久化结果对齐（避免 configure 之后立刻读到空值）。
@@ -615,61 +625,90 @@ public final class Purchases {
             // `logIn` / `logOut` 等它不会再排在补投后面。不门控时与 0.2.1 逐字一致。
             await orchestrator.replayPendingPurchases()
         }
+        // 0.5.2（ADR 0248 决定 3）：观察者在这里才挂上。晚 configure 的宿主（Flutter 插件经 method channel 调到）
+        // 冷启动那次 `didBecomeActive` 早已发过 —— 应用此刻已经活跃就补跑一次回前台处理（刷新 + 补传 + 重扫，同一个入口），
+        // 与 Android 注册生命周期观察者时追平当前状态同一条规则。启动期 configure（`App.init` / `didFinishLaunching`）时还没有
+        // 前台活跃的 scene，判定为不活跃、不会多跑 —— 判定看 scene 而不是 `applicationState`，原因见 `SystemAppLifecycleProvider`。
+        if appLifecycle.isApplicationActive {
+            applicationDidBecomeActive()
+        }
     }
 
-    /// 前后台切换观察（设计 §5「属性同步时机：前后台切换 + 购买时」）。
+    /// 离开前台那两件工作的后台活动名（ADR 0248 决定 2：属性与诊断各用自己的）。
+    nonisolated static let attributesBackgroundActivityName = "com.revenuedog.sdk.attributes"
+    nonisolated static let diagnosticsBackgroundActivityName = "com.revenuedog.sdk.diagnostics"
+
+    /// 前后台切换观察（设计 §5「属性同步时机：前后台切换 + 购买时」；0.5.2 起按 ADR 0248 决定 1）。
     ///
-    /// 用 `queue: nil` 同步派发再自行跳 MainActor —— `OperationQueue.main` 的 block
-    /// 要主 run loop 转起来才执行，SPM 单测进程里不保证有。
+    /// - iOS / tvOS / visionOS：失活（`willResignActive`）与进后台（`didEnterBackground`）都做「离开前台」处理 ——
+    ///   失活是主触发；进后台补一次（已经失活之后再进后台不会再发失活，这期间写的属性与失活那一遍记下的诊断事件靠它带走）。
+    ///   进后台另外翻「在后台」标志。回前台 = `didBecomeActive`。
+    /// - macOS（只为本机单测）没有「进后台」：`NSApplication.didResignActiveNotification` 一个通知做「翻标志 + 离开前台」。
+    /// - watchOS 不挂。
+    ///
+    /// 用 `queue: nil` 在发帖线程同步派发：离开前台的后台活动必须在这个线程上同步申请（`leaveForeground`）；
+    /// 回前台自行跳 MainActor —— `OperationQueue.main` 的 block 要主 run loop 转起来才执行，SPM 单测进程里不保证有。
     private func observeAppLifecycle() {
         #if canImport(UIKit) && !os(watchOS)
-        let background: Notification.Name? = UIApplication.didEnterBackgroundNotification
-        let foreground: Notification.Name? = UIApplication.didBecomeActiveNotification
+        observeLeavingForeground(UIApplication.willResignActiveNotification, trigger: .resignActive, entersBackground: false)
+        observeLeavingForeground(UIApplication.didEnterBackgroundNotification, trigger: .background, entersBackground: true)
+        observeBecomingActive(UIApplication.didBecomeActiveNotification)
         #elseif canImport(AppKit)
-        let background: Notification.Name? = NSApplication.didResignActiveNotification
-        let foreground: Notification.Name? = NSApplication.didBecomeActiveNotification
-        #else
-        let background: Notification.Name? = nil
-        let foreground: Notification.Name? = nil
+        observeLeavingForeground(NSApplication.didResignActiveNotification, trigger: .resignActive, entersBackground: true)
+        observeBecomingActive(NSApplication.didBecomeActiveNotification)
         #endif
-        guard let background, let foreground else { return }
-        lifecycleObservers.observe(background) { [weak self] in
-            Task { @MainActor in self?.applicationDidEnterBackground() }
+    }
+
+    private func observeLeavingForeground(_ name: Notification.Name,
+                                          trigger: DiagnosticsAttributesSyncTrigger,
+                                          entersBackground: Bool) {
+        lifecycleObservers.observe(name) { [weak self, appLifecycle, diagnostics] in
+            Self.leaveForeground(self, trigger: trigger, entersBackground: entersBackground,
+                                 appLifecycle: appLifecycle, diagnostics: diagnostics)
         }
-        lifecycleObservers.observe(foreground) { [weak self] in
+    }
+
+    private func observeBecomingActive(_ name: Notification.Name) {
+        lifecycleObservers.observe(name) { [weak self] in
             Task { @MainActor in self?.applicationDidBecomeActive() }
         }
     }
 
-    /// 进入后台：刷新 `X-Is-Backgrounded` 快照 + 冲一次属性缓冲（设计 §5）
-    /// + 把攒着的诊断事件发出去（sdk-diagnostics §2 的第三个触发条件）。
-    ///
-    /// 平台抽象走 `observeAppLifecycle()` 里既有的那套：
-    /// iOS/tvOS/visionOS = `UIApplication.didEnterBackgroundNotification`，
-    /// macOS = `NSApplication.didResignActiveNotification`，watchOS 无对应通知（不触发，编译照过）。
+    /// 进入后台（UIKit 的 `didEnterBackground` 处理；单测在 UIKit 平台上直接调它）。
     func applicationDidEnterBackground() {
-        AppStateProvider.setBackgrounded(true)
-        Task { [orchestrator] in await orchestrator.syncAttributesIfNeeded() }
-        flushDiagnosticsInBackgroundTask()
+        Self.leaveForeground(self, trigger: .background, entersBackground: true,
+                             appLifecycle: appLifecycle, diagnostics: diagnostics)
     }
 
-    /// §6-8：进后台的那一发要包在 `beginBackgroundTask` 里。
-    /// 不包的话系统会在几百毫秒内把进程挂起，这一批事件要等下次启动才发得出去 ——
-    /// 而「用户按了 home 就再也没回来」恰恰是最需要这批事件的场景。
-    private func flushDiagnosticsInBackgroundTask() {
-        #if canImport(UIKit) && !os(watchOS)
-        let application = UIApplication.shared
-        let box = BackgroundTaskBox()
-        box.begin(application)
-        Task { [diagnostics] in
-            await diagnostics.flushForBackground()
-            await MainActor.run { box.end(application) }
+    /// **离开前台**（失活 / 进后台）的唯一实现（0.5.2，ADR 0248 决定 1、2）：属性同步 + 诊断上传（sdk-diagnostics §2 的第三个触发条件、§6-8），
+    /// 每件工作各包一个后台活动。不包的话系统会在几百毫秒内把进程挂起，而「用户按了 home 就再也没回来」恰恰是最需要这一发的场景。
+    ///
+    /// `nonisolated` 且同步：通知在哪个线程到达，就在哪个线程上**先**申请两个后台活动，之后才起任务。Apple：断言是异步授予的，
+    /// 「as early as possible … preferably before your app actually enters the background」—— 先跳一次 `Task` / actor 再申请，
+    /// 进程可能已经被挂起（0.5.1 的诊断那一发就是先跳 MainActor 再申请，属性那一发干脆没包）。
+    /// 每件工作做完（不论成败）结束自己的那个活动；过期回调里也会结束，二者幂等。实例已释放时工作是空操作，活动照样结束。
+    nonisolated private static func leaveForeground(_ purchases: Purchases?,
+                                                    trigger: DiagnosticsAttributesSyncTrigger,
+                                                    entersBackground: Bool,
+                                                    appLifecycle: any AppLifecycleProvider,
+                                                    diagnostics: DiagnosticsRecorder) {
+        let attributesActivity = appLifecycle.beginBackgroundActivity(named: attributesBackgroundActivityName)
+        let diagnosticsActivity = appLifecycle.beginBackgroundActivity(named: diagnosticsBackgroundActivityName)
+        if entersBackground {
+            // `X-Is-Backgrounded` 快照（锁保护，任意线程可写）。失活时不翻：失活的请求带 `false`（服务端不读这个头）。
+            AppStateProvider.setBackgrounded(true)
         }
-        #else
-        Task { [diagnostics] in await diagnostics.flushForBackground() }
-        #endif
+        Task {
+            await purchases?.syncAttributes(trigger: trigger)
+            attributesActivity.end()
+        }
+        Task {
+            await diagnostics.flushForBackground()
+            diagnosticsActivity.end()
+        }
     }
 
+    /// 回前台（`didBecomeActive`；configure 时应用已经活跃也走这里，见 `start()`）。
     func applicationDidBecomeActive() {
         AppStateProvider.setBackgrounded(false)
         // M-2b（迁移方案 v2.1 §1 档 1）：观察者模式下前台激活重扫
@@ -684,6 +723,10 @@ public final class Purchases {
         Task { [weak self] in
             await self?.awaitStart()
             await self?.orchestrator.refreshCustomerInfoOnForeground()
+            // 0.5.2（ADR 0248 决定 3）：刷新**返回之后**另起一次属性补传（离开时没送达的那一遍在这里重试）。
+            // 不论刷新成败、是否被身份门控跳过（决定 8：门控不拦属性同步）；不等它，也不拦后面的重扫。
+            // 排在刷新之后只是让冷启动少一次与建档请求的并发，不是正确性前提（服务端建客户并发安全，ADR 0118）。
+            Task { [weak self] in await self?.syncAttributes(trigger: .foreground) }
             await self?.orchestrator.rescanOnForegroundIfObserving()
         }
     }
@@ -716,6 +759,10 @@ public final class Purchases {
 
     public func logIn(_ appUserID: String) async throws -> (customerInfo: CustomerInfo, created: Bool) {
         await awaitStart()
+        // ADR 0248 决定 4：切身份之前写的属性要先落盘，切换前那一遍才带得上它们。setter 是 fire-and-forget，
+        // 不等的话「写完立刻 logIn」的那条可能落在切换前那一遍读完待发之后 —— 进了旧身份的桶；旧身份是具名时不迁移，
+        // 而一次同步只发当前身份，这条就一直留在本机发不出去。
+        await attributeWriteChain.value
         let result = try await orchestrator.logIn(appUserID)
         self.appUserID = try await orchestrator.appUserID
         self.cachedCustomerInfo = result.customerInfo
@@ -731,6 +778,8 @@ public final class Purchases {
     /// 不会出现「门面还是旧用户、内部已经是新匿名 ID」（或反过来）这种两边各说各话的状态。
     public func logOut() async throws -> CustomerInfo {
         await awaitStart()
+        // 同 `logIn`：登出前写的属性（常见是 `setEmail(nil)` 之类的清除）先落盘，由登出前那一遍带给旧身份。
+        await attributeWriteChain.value
         let info = try await orchestrator.logOut()
         self.appUserID = try await orchestrator.appUserID
         self.cachedCustomerInfo = info
@@ -842,8 +891,8 @@ public final class Purchases {
     /// - 空串 = 删除该属性（墓碑，服务端存 NULL）。
     /// - `$` 前缀是保留键，这里一律拒绝并打日志 —— 保留键请走下面的专用 setter，
     ///   免得宿主拼错键名后整批 400（服务端 `attributes.ts` 对非法键整批拒绝）。
-    /// - 写入只落本地缓冲，**不立刻发请求**；同步时机 = 进入后台 / 购买上报（搭车）/
-    ///   logIn 合并前后 / `syncAttributesIfNeeded()`（设计 §5）。
+    /// - 写入只落本地缓冲，**不立刻发请求**；同步时机 = 离开前台（失活 / 进后台）/ 回前台 / 购买上报（搭车）/
+    ///   logIn 合并前后 / logOut 前 / `syncAttributesIfNeeded()`（设计 §5，0.5.2 起见 ADR 0248）。
     public func setAttributes(_ attributes: [String: String]) {
         let reserved = attributes.keys.filter { SubscriberAttributeKeys.isReserved($0) }
         if !reserved.isEmpty {
@@ -856,10 +905,27 @@ public final class Purchases {
     }
 
     /// 立刻把待同步属性冲到服务端（宿主显式触发点；设计 §5 同步时机之一）。
+    ///
+    /// 返回时，调用之前写入的属性都已经试过一次（成败看网络；失败的留在待发里，下一个时机再发）。
+    /// 0.5.2 起：已有一遍同步在途时，会等它结束、再跑一遍带上新写入的属性（0.5.1 在途时立刻返回）。
     public func syncAttributesIfNeeded() async {
+        await syncAttributes(trigger: .explicit)
+    }
+
+    /// 属性同步在门面上的**唯一入口**（0.5.2，ADR 0248 决定 4）：公开 API、失活、进后台、回前台都走这里。
+    /// 先等启动收敛，再等属性写入链落盘（setter 是 fire-and-forget，不等的话刚写的那条可能还没进缓冲，审查 M3；
+    /// 读的是启动收敛之后的链尾，只会比调用时更靠后），然后进编排层按「遍」合并。
+    /// `logIn` / `logOut` 在门面上同样先等写入链，再由编排层带各自的 trigger 调编排层入口。
+    @discardableResult
+    func syncAttributes(trigger: DiagnosticsAttributesSyncTrigger) async -> Bool {
         await awaitStart()
-        await attributeWriteChain.value   // 先把排队中的 setter 落盘，别把最后一条漏在队列里
-        await orchestrator.syncAttributesIfNeeded()
+        await attributeWriteChain.value
+        return await orchestrator.syncAttributes(trigger: trigger)
+    }
+
+    /// 属性同步的排队状态（内部读视图：测试确认调用已经并进排队的那一遍，ADR 0248 决定 4）。
+    func attributeSyncQueueState() async -> (inFlight: Bool, queuedJoined: Int?) {
+        await orchestrator.attributeSyncQueueState
     }
 
     /// 诊断记录器（内部读视图：测试断言事件序列用）。
@@ -992,30 +1058,6 @@ public final class Attribution: Sendable {
     }
 }
 
-// MARK: - 后台任务盒子（§6-8）
-
-#if canImport(UIKit) && !os(watchOS)
-/// `beginBackgroundTask` / `endBackgroundTask` 的配对容器。
-/// 过期回调由系统**在主线程同步**调用（Apple 官方原文），所以 `assumeIsolated` 是安全的。
-@MainActor
-final class BackgroundTaskBox {
-
-    private var identifier: UIBackgroundTaskIdentifier = .invalid
-
-    func begin(_ application: UIApplication) {
-        identifier = application.beginBackgroundTask(withName: "com.revenuedog.sdk.diagnostics") { [weak self] in
-            MainActor.assumeIsolated { self?.end(UIApplication.shared) }
-        }
-    }
-
-    func end(_ application: UIApplication) {
-        guard identifier != .invalid else { return }
-        application.endBackgroundTask(identifier)
-        identifier = .invalid
-    }
-}
-#endif
-
 // MARK: - 通知观察者盒子
 
 /// `NotificationCenter` 观察者的生命周期容器。持有者释放时自动摘除，
@@ -1026,7 +1068,7 @@ final class NotificationObserverBox: @unchecked Sendable {
     private var tokens: [any NSObjectProtocol] = []
 
     func observe(_ name: Notification.Name, handler: @escaping @Sendable () -> Void) {
-        // queue: nil = 在发帖线程同步派发；handler 自己跳到 MainActor。
+        // queue: nil = 在发帖线程同步派发；需要主 actor 的 handler 自己跳过去。
         let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in
             handler()
         }
@@ -1035,7 +1077,16 @@ final class NotificationObserverBox: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 摘掉全部观察者（`Purchases.resetForTesting()` 显式调；析构时也走这里）。
+    func removeAll() {
+        lock.lock()
+        let removed = tokens
+        tokens.removeAll()
+        lock.unlock()
+        for token in removed { NotificationCenter.default.removeObserver(token) }
+    }
+
     deinit {
-        for token in tokens { NotificationCenter.default.removeObserver(token) }
+        removeAll()
     }
 }

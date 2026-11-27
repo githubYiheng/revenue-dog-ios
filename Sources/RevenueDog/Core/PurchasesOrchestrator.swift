@@ -113,8 +113,10 @@ actor PurchasesOrchestrator {
     private let adServicesTokenProvider: any AdServicesTokenProvider
     /// 客户端诊断（ADR 0028 / sdk-diagnostics §1.3 的记录点大半在本文件）。
     private let diagnostics: DiagnosticsRecorder
-    /// 属性同步的单飞闸：同时只允许一次 POST /attributes 在途，避免前后台抖动打出重复请求。
-    private var isSyncingAttributes = false
+    /// 属性同步按「遍」合并（0.5.2，ADR 0248 决定 4）：任何时刻最多一遍在途、最多一遍排队。
+    /// 在途那遍结束时**同步**把排队的那遍提升为在途（`runAttributeSyncPass` 末尾，中间没有挂起点）。
+    private var inFlightAttributeSync: (pass: AttributeSyncPass, task: Task<Bool, Never>)?
+    private var queuedAttributeSync: (pass: AttributeSyncPass, task: Task<Bool, Never>)?
     /// ASA 采集在本进程内只启动一次（跨进程的一次性由 `attributionState` 持久化保证）。
     private var didStartAdServicesCollection = false
     /// 已同步台账（#10 / #2）：`.myApp` 用它防止宿主未 finish 的重投重复上报；
@@ -475,7 +477,8 @@ actor PurchasesOrchestrator {
             return (info, false)
         }
         // 坑 #52 前半：logIn 前先把旧身份的属性刷出去，保证旧用户的属性不丢。
-        await syncAttributesIfNeeded()
+        // 0.5.2：有在途的一遍时等它结束再跑自己的一遍（ADR 0248 决定 4），这一遍开始时读到的仍是旧身份。
+        await syncAttributes(trigger: .login)
         let installID = await attributionState.installID()
         let body = try JSONEncoder().encode(IdentifyBody(appUserID: previous, newAppUserID: newAppUserID, installID: installID))
         let fromAnonymous = previous.map { IdentityManager.isAnonymous($0) } ?? true
@@ -501,7 +504,7 @@ actor PurchasesOrchestrator {
         if let previous {
             await attributesStore.migrateIfOldIsAnonymous(from: previous, to: newAppUserID)
         }
-        await syncAttributesIfNeeded()
+        await syncAttributes(trigger: .login)
         await publish(info, source: .login, requestID: trace.last?.requestID)
         await recordIdentityEvent(DiagnosticsEventType.identityLogin,
                                   trace: trace, startedAt: startedAt,
@@ -520,7 +523,7 @@ actor PurchasesOrchestrator {
     /// 现在顺序钉死：
     ///   ① 匿名态直接抛 `invalidAppUserIdError`（语义不变），且发生在任何副作用之前；
     ///      同一步顺带生成**不落盘**的匿名候选（纯函数，不改任何状态）。
-    ///   ② 把**旧身份**的待发属性刷出去（与 logIn 同款处理：`syncAttributesIfNeeded()`
+    ///   ② 把**旧身份**的待发属性刷出去（与 logIn 同款处理：`syncAttributes(trigger:)`
     ///      自己吞错只记日志，失败不致命，继续往下走）。
     ///   ③ 拿候选 ID 打 `GET /v1/subscribers/{id}`（服务端 get-or-create）。
     ///   ④ **仅当 ③ 成功**：落盘身份切换（落的就是服务端刚认过的那个 ID）→ 摘掉旧身份内存缓存
@@ -535,7 +538,7 @@ actor PurchasesOrchestrator {
             // ①：匿名态守卫 + 候选生成。候选只是个局部变量，IdentityManager 里没有任何痕迹。
             let candidate = try await identity.candidateAnonymousAppUserID()
             // ②：坑 #52 同款 —— 切身份前先把旧身份的属性刷出去，保证旧用户的属性不丢。
-            await syncAttributesIfNeeded()
+            await syncAttributes(trigger: .logout)
             // ③：服务端确认候选身份。失败直接落 catch，此时本地什么都还没改。
             let response = try await httpClient.perform(.getCustomerInfo(appUserID: candidate),
                                                        as: CustomerInfoWireModel.self, trace: trace)
@@ -1266,8 +1269,8 @@ actor PurchasesOrchestrator {
 
     // MARK: - 属性（M3，设计 §1 / §5；契约 §2.4）
 
-    /// 写入属性缓冲（按当前 appUserID 分桶）。**不立刻发请求** —— 同步时机见
-    /// `syncAttributesIfNeeded()` 的调用点：进入后台 / 购买上报（搭车）/ logIn 合并前后 / 宿主显式调用。
+    /// 写入属性缓冲（按当前 appUserID 分桶）。**不立刻发请求** —— 同步时机见 `syncAttributes(trigger:)` 的调用点：
+    /// 失活 / 进后台 / 回前台 / 购买上报（搭车）/ logIn 合并前后 / logOut 前 / 宿主显式调用。
     /// 返回被拒绝的键（键名非法 / value 超 500 / 触及 50 自定义上限）。
     @discardableResult
     func setAttributes(_ attributes: [String: String?]) async -> [String] {
@@ -1284,25 +1287,75 @@ actor PurchasesOrchestrator {
         return await attributesStore.unsynced(appUserID: appUserID)
     }
 
-    /// 同步待发属性到 `POST /v1/subscribers/{id}/attributes`（契约 §2.4）。
+    /// 一遍属性同步的元数据（ADR 0248 决定 4、7）。只在本 actor 内读写，不跨隔离域。
+    private final class AttributeSyncPass {
+        /// 开始这一遍的那次调用。
+        let trigger: DiagnosticsAttributesSyncTrigger
+        /// 并进这一遍的其它调用数。只有排队中的那一遍会增长；提升为在途之后不再变。
+        var joined = 0
+
+        init(trigger: DiagnosticsAttributesSyncTrigger) {
+            self.trigger = trigger
+        }
+    }
+
+    /// 把待发属性同步到 `POST /v1/subscribers/{id}/attributes`（契约 §2.4）。返回「在这次调用**之后**才开始的那一遍」
+    /// 是否真的把属性落了库（发了请求且 2xx）。
     ///
-    /// - 单飞：同时只允许一次在途，重复触发直接返回（前后台抖动不会打出重复请求）。
+    /// **按「遍」合并**（0.5.2，ADR 0248 决定 4；0.5.1 的单飞在途时直接返回、结束后不复查，期间的触发被丢弃）：
+    /// - 每一遍跑在本 actor 自己持有的非结构化 `Task` 里，调用方只是 `await` 它的值 —— 调用方被取消不取消这一遍，
+    ///   也不连累同一遍的其它等待者（HTTP 层把取消当可重试错误，若跑在调用方的 task 里，一个被取消的 `logIn` 会让这一遍失败）。
+    /// - 没有在途的一遍：这次调用开始新的一遍。有在途的一遍：这次调用排到**下一遍** —— 下一遍在在途那遍结束后开始，
+    ///   期间到达的调用共用它。于是每次调用最多等两遍，没有循环。
+    /// - 每一遍开始时重新读当前身份与待发（`syncPendingAttributes`）；没有待发就不发请求。上一遍失败不妨碍排队的下一遍照常开始。
+    /// - 下面的判断与登记之间、以及 `runAttributeSyncPass` 末尾的提升之间都没有挂起点。
+    @discardableResult
+    func syncAttributes(trigger: DiagnosticsAttributesSyncTrigger) async -> Bool {
+        let task: Task<Bool, Never>
+        if let queued = queuedAttributeSync {
+            queued.pass.joined += 1
+            task = queued.task
+        } else if let inFlight = inFlightAttributeSync {
+            let pass = AttributeSyncPass(trigger: trigger)
+            let previous = inFlight.task
+            task = Task {
+                // 在途那遍结束时已经把本遍提升为在途（它的末尾同步完成），这里醒来时本遍就是在途的那一遍。
+                _ = await previous.value
+                return await self.runAttributeSyncPass(pass)
+            }
+            queuedAttributeSync = (pass, task)
+        } else {
+            let pass = AttributeSyncPass(trigger: trigger)
+            task = Task { await self.runAttributeSyncPass(pass) }
+            inFlightAttributeSync = (pass, task)
+        }
+        return await task.value
+    }
+
+    /// 跑一遍，结束时把排队的那一遍提升为在途（没有就清掉在途）。诊断事件在这一遍内部、提升之前记（决定 7）。
+    private func runAttributeSyncPass(_ pass: AttributeSyncPass) async -> Bool {
+        let succeeded = await syncPendingAttributes(trigger: pass.trigger, joined: pass.joined)
+        // 决定 4：这两行之间与之前的判断之间都没有 await —— 否则挂起点上到达的调用会排进一个已经没人负责启动的「下一遍」。
+        inFlightAttributeSync = queuedAttributeSync
+        queuedAttributeSync = nil
+        return succeeded
+    }
+
+    /// 一遍的内容：读当前身份与待发 → 发一次请求 → 按结果标记 → 记 `attributes_sync`。
+    ///
     /// - **坑 #127**：4xx（404/408/429 除外）一律视为「已同步」——RC 原文
     ///   「all 4xx (except 404) are considered as successfully synced … continuing to retry
     ///   won't yield any different results」。属性 400 多半是键名/值非法，重试永远不会变好，
     ///   继续挂在待发队列只会每次前后台都白发一遍。5xx / 网络错误保持未同步等下次时机。
     ///   （可重试性判定本身仍由 §5 的 `Is-Retryable` 协议在 HTTPClient 层说了算，
     ///   这里只处理「HTTPClient 已经放弃之后」的标记语义。）
-    /// - 返回是否真的成功落库。
-    @discardableResult
-    func syncAttributesIfNeeded() async -> Bool {
-        guard !isSyncingAttributes else { return false }
+    /// - 0.5.2（ADR 0248 决定 5）：成功后**不**用响应更新 CustomerInfo（不解码、不写缓存、不 publish）。
+    ///   响应里的 `request_date` 每次都不同，publish 的去重对它永远不命中，每次属性上传都会多一次宿主回调；
+    ///   身份门控待确认期间还会把旧身份的权益推给宿主。CustomerInfo 的新鲜度由回前台刷新与购买路径负责（RC 同样不用这个响应）。
+    private func syncPendingAttributes(trigger: DiagnosticsAttributesSyncTrigger, joined: Int) async -> Bool {
         guard let appUserID = try? await identity.appUserID else { return false }
         let pending = await attributesStore.unsynced(appUserID: appUserID)
         guard !pending.isEmpty else { return false }
-
-        isSyncingAttributes = true
-        defer { isSyncingAttributes = false }
 
         let data: Data
         do {
@@ -1312,32 +1365,52 @@ actor PurchasesOrchestrator {
             return false
         }
 
+        let startedAt = Date()
+        let trace = HTTPCallTrace()
+        let outcome: String
+        var failure: (any Error)?
         do {
-            // 用 performRaw：2xx 即代表服务端已落库；响应体（完整 Subscriber）解码失败
-            // 不该把「已经写成功的属性」退回待发队列。
-            let raw = try await httpClient.performRaw(.postAttributes(appUserID: appUserID), body: data)
+            // 用 performRaw：2xx 即代表服务端已落库；响应体（完整 Subscriber，老版本 SDK 还在用）不读。
+            _ = try await httpClient.performRaw(.postAttributes(appUserID: appUserID), body: data, trace: trace)
             await attributesStore.markSynced(pending, appUserID: appUserID)
-            if let wire = try? JSONDecoder().decode(CustomerInfoWireModel.self, from: raw.body) {
-                let info = CustomerInfo(wireModel: wire)
-                await deviceCache.cache(customerInfo: info, appUserID: appUserID)
-                await publish(info, source: .fetch)
-            }
-            return true
+            outcome = DiagnosticsAttributesSyncOutcome.success
         } catch let error as PurchasesError {
+            failure = error
             if let status = error.httpStatusCode,
                (400...499).contains(status), status != 404, status != 408, status != 429 {
                 Log.warn("属性同步被服务端确定性拒绝（HTTP \(status)）：\(error.description) —— 标记已同步不再重试（#127）",
                          category: "attributes")
                 await diagnostics.warn(DiagnosticsWarningCode.attributesRejected, detail: "status=\(status)")
                 await attributesStore.markSynced(pending, appUserID: appUserID)
-                return false
+                outcome = DiagnosticsAttributesSyncOutcome.rejected
+            } else {
+                Log.warn("属性同步暂时失败，保留待发：\(error.description)", category: "attributes")
+                outcome = DiagnosticsAttributesSyncOutcome.retryable
             }
-            Log.warn("属性同步暂时失败，保留待发：\(error.description)", category: "attributes")
-            return false
         } catch {
+            failure = error
             Log.warn("属性同步失败：\(error)", category: "attributes")
-            return false
+            outcome = DiagnosticsAttributesSyncOutcome.retryable
         }
+
+        // 决定 7：每遍真正发了请求就记一条。失败的原因字段只走 `DiagnosticsErrorFields` 一处实现，级别与其它失败事件一致。
+        await diagnostics.record(DiagnosticsEventType.attributesSync,
+                                 level: failure == nil ? DiagnosticsLevel.info : DiagnosticsLevel.error,
+                                 fields: DiagnosticsErrorFields.merging([
+                                     "count": .int(pending.count),
+                                     "outcome": .string(outcome),
+                                     "trigger": .string(trigger.rawValue),
+                                     "joined": .int(joined),
+                                     "duration_ms": .int(Self.elapsedMs(since: startedAt)),
+                                     "backgrounded": .bool(AppStateProvider.isBackgrounded),
+                                     "request_id": trace.last?.requestID.map { .string($0) },
+                                 ], error: failure))
+        return failure == nil
+    }
+
+    /// 属性同步的排队状态（测试读视图）：是否有在途的一遍；排队的下一遍并进了几个其它调用（nil = 没有排队的一遍）。
+    var attributeSyncQueueState: (inFlight: Bool, queuedJoined: Int?) {
+        (inFlightAttributeSync != nil, queuedAttributeSync?.pass.joined)
     }
 
     // MARK: - ASA 归因采集（M3，设计 §8；核实 asa-adservices.md）
